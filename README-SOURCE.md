@@ -1,0 +1,23 @@
+# 长篇连载插件源码
+
+版本 `0.1.26-serial.3`。这是从长篇连载工作台代码裁剪出的开发源码快照，保留原版系统提示词、多书导入、逐章生成、上下文关联、状态与书库队列。它不包含旧剧本、游戏、视频工作台或四套知识资产，也没有模型密钥、用户小说或本机设置。
+
+源码由构建入口的 TypeScript 依赖闭包选择；业务源码、样式和保留的测试均按原字节复制。只调整了包脚本与发行说明。`SOURCE_DISTRIBUTION.json` 记录保留文件哈希及排除测试的原因。本快照用于构建和审查，并不自动意味着真实模型写作验收通过。安装者请使用同次交付的预构建安装包与最终使用说明。
+
+## 开发
+
+需要 Node.js 24 及 pnpm 11.7.0。
+
+```sh
+pnpm install --frozen-lockfile
+pnpm verify
+pnpm pack:local
+```
+
+`verify` 运行代码检查、类型检查、保留单元测试与构建。`pnpm test:dsh:library` 是使用真实 Harness、浏览器及本地确定性模型的多书集成测试；需先设置 `SERIAL_PLUGIN_TARBALL` 为本次冻结安装包绝对路径，并提供 Playwright Chromium 与可用的 Harness 测试安装。测试默认离线安装宿主，开发者应预先缓存依赖或通过 `DSH_SMOKE_INSTALLATION` 指向测试安装，测试运行不使用付费模型。
+
+此源码快照没有 GitHub 自动发布工作流，包标记为 private，不向上游 npm 发布。根目录是开发 monorepo，不是供 Harness 直接安装的插件根。
+
+## 来源与许可
+
+基于 [zenstory-ai/oh-story-dsh](https://github.com/zenstory-ai/oh-story-dsh) 0.1.26（基线提交 `0bb6c02a194592fd550cf0989243f10cdc2d0d48`）的原生插件和文件工作台基础，保留 MIT 许可证。原生成器提示词是本插件要求保留的产品内容。该派生版本不是上游官方发行。

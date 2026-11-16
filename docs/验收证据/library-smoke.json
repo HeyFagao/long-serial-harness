@@ -1,0 +1,42 @@
+{
+  "ok": true,
+  "dshVersion": "0.2.2-rc.3",
+  "pluginSha256": "8a7a421fc51c103d770fbc7a6257b121d487fc0b8f4b0e53db86b0056cecb076",
+  "provider": "local-deterministic-text-fixture",
+  "realPaidModel": false,
+  "importedBooks": 10,
+  "registeredNativeWorkspaces": 10,
+  "separateProjectDirectories": 10,
+  "batches": [
+    {
+      "count": 10,
+      "accepted": 100
+    },
+    {
+      "count": 20,
+      "accepted": 48
+    },
+    {
+      "count": "all",
+      "accepted": 4
+    }
+  ],
+  "acceptedChapters": 152,
+  "freshNativeChapterSessions": 152,
+  "hostCommittedTextAndState": "passed",
+  "originalSystemSha256": "4e56881a6c2ac904dd50467eead4ada0e452e5d2c1d598701622a5b73cc4abf2",
+  "originalRewriteAndBackup": "passed",
+  "fullStyleAndPreviousTen": "passed",
+  "bookIsolation": "passed",
+  "exportedBooks": 10,
+  "failedBookIsolationAndRetry": "passed",
+  "pauseResume": "passed",
+  "stopResumeFixedTargets": "passed",
+  "duplicateStart": "passed",
+  "nativeHostRestart": "passed",
+  "browserCloseAndReopen": "passed",
+  "novelOnlyPackageAndUI": "passed",
+  "outsideSymlinkImport": "rejected-without-outside-writes",
+  "modelToolCalls": 0,
+  "literaryQuality": "not assessed"
+}

@@ -1,0 +1,34 @@
+{
+  "name": "oh-story-dsh",
+  "version": "0.1.26-serial.3",
+  "private": true,
+  "description": "原版提示词驱动的长篇连载工作台：多书导入、独立项目、跨项目续写队列",
+  "license": "MIT",
+  "type": "module",
+  "packageManager": "pnpm@11.7.0",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "dev": "pnpm build:dsh-plugin",
+    "build:dsh-plugin": "pnpm --filter @oh-story/dsh build",
+    "build": "pnpm -r --if-present build",
+    "typecheck": "pnpm -r --if-present typecheck",
+    "lint": "eslint . --max-warnings=0",
+    "test": "pnpm -r --if-present test",
+    "verify": "pnpm lint && pnpm typecheck && pnpm test && pnpm build",
+    "test:dsh:library": "tsx scripts/native-library-smoke.ts",
+    "pack:local": "pnpm --filter @oh-story/dsh pack --pack-destination release"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@playwright/test": "1.62.1",
+    "@types/node": "25.5.0",
+    "esbuild": "0.28.2",
+    "eslint": "10.8.1",
+    "tsx": "4.23.12",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.67.0",
+    "vitest": "4.1.11"
+  }
+}

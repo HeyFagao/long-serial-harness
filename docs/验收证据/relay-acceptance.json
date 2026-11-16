@@ -1,0 +1,97 @@
+{
+  "kind": "deterministic-native-relay-fixture",
+  "dshVersion": "0.2.2-rc.3",
+  "pluginSha256": "8a7a421fc51c103d770fbc7a6257b121d487fc0b8f4b0e53db86b0056cecb076",
+  "nativeHeaderInheritance": "verified-provider-model-parent-no-prefix",
+  "actualExternalRelayTested": false,
+  "writerContract": "plain-text-prose-and-state-change",
+  "modelTools": "none",
+  "persistence": "host-owned-original-output",
+  "routes": [
+    {
+      "id": "relay-openai-a",
+      "api": "openai-completions",
+      "model": "gpt-relay-fixture",
+      "ownerSessionId": "session-e24d092a-f2c7-4220-a8f2-e8f178b59e78",
+      "childSessionId": "e6422b21-076a-4063-929b-0c12310f08d9",
+      "expectedAuthenticationFailure": false,
+      "outputSha256": "e26877b17bcb957551ae12695fe28fd353dd155999a77fc8565a2d4ac0c64f3c",
+      "requests": [
+        {
+          "path": "/relay-a/v1/chat/completions",
+          "model": "gpt-relay-fixture",
+          "advertisedTools": 0,
+          "priorToolCalls": 0
+        }
+      ]
+    },
+    {
+      "id": "relay-anthropic-b",
+      "api": "anthropic-messages",
+      "model": "claude-relay-fixture",
+      "ownerSessionId": "session-7c44f5e0-e7a5-42b5-b3da-1411423e1ae4",
+      "childSessionId": "351d7067-6c94-4105-936c-0773a8dc911e",
+      "expectedAuthenticationFailure": false,
+      "outputSha256": "84d1a1281e8ef4742200799bea0e8e8aba327c34344d604237a1f1c082e1295d",
+      "requests": [
+        {
+          "path": "/relay-b/v1/messages?beta=true",
+          "model": "claude-relay-fixture",
+          "advertisedTools": 0,
+          "priorToolCalls": 0
+        }
+      ]
+    },
+    {
+      "id": "relay-gemini-c",
+      "api": "google-generative-ai",
+      "model": "gemini-relay-fixture",
+      "ownerSessionId": "session-8db75e69-2b20-46c1-8302-966c214ca246",
+      "childSessionId": "2bf14a6a-e8a9-47ac-b84c-2697da0e6526",
+      "expectedAuthenticationFailure": false,
+      "outputSha256": "f04db9fe70071746408409a9c0cae2d960a4e5ac7972362320fdcd2b84644950",
+      "requests": [
+        {
+          "path": "/relay-c/v1beta/models/gemini-relay-fixture:streamGenerateContent?alt=sse",
+          "model": "gemini-relay-fixture",
+          "advertisedTools": 0,
+          "priorToolCalls": 0
+        }
+      ]
+    },
+    {
+      "id": "relay-responses-d",
+      "api": "openai-responses",
+      "model": "gpt-relay-fixture",
+      "ownerSessionId": "session-f0df9701-8ae6-4278-bc3e-e8c238008163",
+      "childSessionId": "3894b100-041c-4d44-90b2-6bdd08ec2b6c",
+      "expectedAuthenticationFailure": false,
+      "outputSha256": "ef579104f0c3aa698b1369fb81e4729da8de86ad2f307eb5cbb8e81642db6707",
+      "requests": [
+        {
+          "path": "/relay-d/v1/responses",
+          "model": "gpt-relay-fixture",
+          "advertisedTools": 0,
+          "priorToolCalls": 0
+        }
+      ]
+    },
+    {
+      "id": "relay-denied",
+      "api": "openai-completions",
+      "model": "gpt-denied-fixture",
+      "ownerSessionId": "session-a0ae909a-f4c8-4bc0-8e70-d17920b199fc",
+      "childSessionId": "772c6bdd-0c75-4f1b-8c47-4991d08ef249",
+      "expectedAuthenticationFailure": true,
+      "requests": [
+        {
+          "path": "/relay-denied/v1/chat/completions",
+          "model": "gpt-denied-fixture",
+          "advertisedTools": 0,
+          "priorToolCalls": 0
+        }
+      ]
+    }
+  ],
+  "unexpectedRequests": []
+}

@@ -1,0 +1,349 @@
+import { describe, expect, it } from "vitest";
+import { SerialRuntime, assertSerialTask, type SerialActive, type SerialAdapter, type SerialObservation, type SerialTask } from "../src/serial-runtime.js";
+
+function fixture(count = 150) {
+  let disk: SerialTask | null = null;
+  let seq = 0;
+  let pending: SerialActive | undefined;
+  let observation: SerialObservation = { running: false, pendingInput: false, cursor: 0 };
+  let automatic = true;
+  const complete = new Set<number>();
+  const partial = new Set<number>();
+  const requests: string[] = [];
+  const childIds: string[] = [];
+  const cancellations: string[] = [];
+  const repairable = new Set<number>();
+  const backups: { chapter: number; attempt: number; issues: readonly string[]; path: string }[] = [];
+  const adapter: SerialAdapter = {
+    ownerSessionId: "owner", cwd: "/book", makeId: () => `id-${String(++seq)}`, now: () => "2026-11-16T00:00:00Z", pollMs: 1,
+    load: async () => structuredClone(disk),
+    save: async task => { disk = structuredClone(task); },
+    plan: async () => ({ nextChapter: complete.size + 1, chapters: Array.from({ length: count }, (_, index) => index + 1) }),
+    inspect: async chapter => ({ ok: complete.has(chapter), proseExists: complete.has(chapter) || partial.has(chapter), issues: complete.has(chapter) ? [] : ["tracking incomplete"], repairable: repairable.has(chapter) }),
+    prepareRepair: async (chapter, attempt, issues) => { const path = `追踪/连载修订/第${chapter}章/尝试${attempt}-正文.md`; if (!backups.some(item => item.path === path)) backups.push({ chapter, attempt, issues, path }); return path; },
+    state: async active => { if (active?.requestId === "" || active === undefined) { const value = { ...observation }; delete value.lastTurnReason; delete value.lastTurnError; return value; } return observation; },
+    dispatch: async active => {
+      if (!requests.includes(active.requestId)) requests.push(active.requestId);
+      if (!childIds.includes(active.sessionId)) childIds.push(active.sessionId);
+      pending = active;
+      if (automatic) { complete.add(active.chapter); observation = { running: false, pendingInput: false, lastTurnReason: "completed", requestKnown: true, cursor: seq }; }
+      else observation = { running: true, pendingInput: false, cursor: seq };
+    },
+    cancel: async active => { cancellations.push(active.sessionId); if (!observation.externalInput) observation = { running: false, pendingInput: false, lastTurnReason: "aborted" }; }
+  };
+  return {
+    adapter, complete, partial, requests, childIds, repairable, backups, cancellations,
+    disk: () => disk,
+    setDisk: (value: SerialTask) => { disk = structuredClone(value); },
+    hold: () => { automatic = false; },
+    state: (value: SerialObservation) => { observation = value; },
+    finish: () => { if (pending !== undefined) complete.add(pending.chapter); observation = { running: false, pendingInput: false, lastTurnReason: "completed", requestKnown: true, cursor: seq }; },
+    auto: () => { automatic = true; }
+  };
+}
+async function eventually(check: () => boolean): Promise<void> {
+  for (let i = 0; i < 500; i += 1) { if (check()) return; await new Promise(resolve => setTimeout(resolve, 2)); }
+  throw new Error("scheduler did not settle");
+}
+
+describe("native serial scheduler", () => {
+  it("settles native text through the host before accepting the chapter", async () => {
+    const f = fixture(1);
+    f.adapter.dispatch = async active => { f.requests.push(active.requestId); f.state({ running: false, pendingInput: false, lastTurnReason: "completed", requestKnown: true, finalText: "原版两块输出" }); };
+    let finalized = 0;
+    f.adapter.finalize = async (active, observation) => { expect(observation.finalText).toBe("原版两块输出"); finalized += 1; f.complete.add(active.chapter); };
+    const runtime = new SerialRuntime(f.adapter); await runtime.start({ count: 1, divergence: 2 });
+    await eventually(() => runtime.snapshot()?.status === "completed");
+    expect(finalized).toBe(1); expect(f.requests).toHaveLength(1); expect(runtime.snapshot()?.divergence).toBe(2); runtime.dispose();
+  });
+
+  it("rejects discussion-only divergence before starting a writing batch", async () => {
+    const f = fixture(1); const runtime = new SerialRuntime(f.adapter);
+    await expect(runtime.start({ count: 1, divergence: 3 })).rejects.toThrow("等级 3 仅讨论");
+    expect(f.requests).toHaveLength(0); runtime.dispose();
+  });
+
+  it("retries an interrupted local settlement without paying for a second model request", async () => {
+    const f = fixture(1);
+    f.adapter.dispatch = async active => { f.requests.push(active.requestId); f.state({ running: false, pendingInput: false, lastTurnReason: "completed", requestKnown: true, finalText: "完成的输出" }); };
+    let finalized = 0;
+    f.adapter.finalize = async active => { finalized += 1; if (finalized === 1) throw new Error("disk interrupted"); f.complete.add(active.chapter); };
+    const runtime = new SerialRuntime(f.adapter); await runtime.start({ count: 1 });
+    await eventually(() => runtime.snapshot()?.status === "blocked");
+    expect(f.requests).toHaveLength(1); expect(runtime.snapshot()?.completed).toEqual([]);
+    await runtime.resume(); expect(runtime.snapshot()?.status).toBe("completed");
+    expect(finalized).toBe(2); expect(f.requests).toHaveLength(1); runtime.dispose();
+  });
+  it("runs 50 then 100 chapters in 150 distinct fresh native child sessions", async () => {
+    const f = fixture(); const runtime = new SerialRuntime(f.adapter);
+    await runtime.start({ count: 50 });
+    await eventually(() => runtime.snapshot()?.status === "completed");
+    expect(runtime.snapshot()?.completed).toHaveLength(50);
+    await runtime.start({ count: 100 });
+    await eventually(() => runtime.snapshot()?.status === "completed");
+    expect(runtime.snapshot()?.completed).toEqual(Array.from({ length: 100 }, (_, i) => i + 51));
+    expect(new Set(f.requests).size).toBe(150);
+    expect(new Set(f.childIds).size).toBe(150);
+    expect(f.childIds).not.toContain("owner");
+    expect(Object.keys(runtime.snapshot()!.completedSessions)).toHaveLength(100);
+    expect(runtime.snapshot()).toMatchObject({ minChars: 2300, maxChars: 2500, maxAttempts: 3 });
+    runtime.dispose();
+  });
+
+  it("resumes a crash after tracking commit without generating the chapter twice", async () => {
+    const f = fixture(3); f.hold();
+    const first = new SerialRuntime(f.adapter); await first.start({ count: 3 });
+    await eventually(() => first.snapshot()?.active?.dispatched === true);
+    first.dispose(); f.finish(); f.auto();
+    const recovered = new SerialRuntime(f.adapter); await recovered.restore();
+    expect(recovered.snapshot()?.status).toBe("paused"); await recovered.resume();
+    await eventually(() => recovered.snapshot()?.status === "completed");
+    expect(f.requests).toHaveLength(3);
+    expect(recovered.snapshot()?.completed).toEqual([1, 2, 3]); recovered.dispose();
+  });
+
+  it("reconciles completed prose after a dispatch acknowledgement crash", async () => {
+    const f = fixture(1); f.hold();
+    const first = new SerialRuntime(f.adapter); await first.start({ count: 1 });
+    await eventually(() => first.snapshot()?.active?.dispatched === true);
+    first.dispose();
+    const saved = f.disk()!; saved.active!.dispatched = false; f.setDisk(saved);
+    f.finish(); f.auto();
+    const recovered = new SerialRuntime(f.adapter); await recovered.restore();
+    expect(recovered.snapshot()?.status).toBe("paused"); await recovered.resume();
+    await eventually(() => recovered.snapshot()?.status === "completed");
+    expect(f.requests).toHaveLength(1); recovered.dispose();
+  });
+
+  it("preserves partial prose and blocks instead of overwriting on recovery", async () => {
+    const f = fixture(2); f.hold(); const runtime = new SerialRuntime(f.adapter); await runtime.start({ count: 2 });
+    await eventually(() => runtime.snapshot()?.active?.dispatched === true);
+    f.partial.add(1); f.state({ running: false, pendingInput: false, lastTurnReason: "completed" });
+    await eventually(() => runtime.snapshot()?.status === "blocked");
+    await expect(runtime.resume()).rejects.toThrow("已有未通过验收的正文");
+    expect(f.requests).toHaveLength(1); runtime.dispose();
+  });
+
+  it("pauses at chapter boundary and continues only on explicit resume", async () => {
+    const f = fixture(3); f.hold(); const runtime = new SerialRuntime(f.adapter); await runtime.start({ count: 3 });
+    await eventually(() => runtime.snapshot()?.active?.dispatched === true);
+    expect((await runtime.pause()).status).toBe("pausing"); f.finish();
+    await eventually(() => runtime.snapshot()?.status === "paused");
+    expect(runtime.snapshot()?.completed).toEqual([1]); expect(f.requests).toHaveLength(1);
+    f.auto(); await runtime.resume(); await eventually(() => runtime.snapshot()?.status === "completed"); runtime.dispose();
+  });
+
+  it("honors native stop even if the chapter was already committed", async () => {
+    const f = fixture(3); f.hold(); const runtime = new SerialRuntime(f.adapter); await runtime.start({ count: 3 });
+    await eventually(() => runtime.snapshot()?.active?.dispatched === true);
+    f.complete.add(1); f.state({ running: false, pendingInput: false, lastTurnReason: "aborted" });
+    await eventually(() => runtime.snapshot()?.status === "paused");
+    expect(f.requests).toHaveLength(1); expect(runtime.snapshot()?.completed).toEqual([]);
+    f.state({ running: false, pendingInput: false }); f.auto(); await runtime.resume();
+    await eventually(() => runtime.snapshot()?.status === "completed"); runtime.dispose();
+  });
+
+  it("yields to foreign user input without cancelling it", async () => {
+    const f = fixture(3); f.hold(); const runtime = new SerialRuntime(f.adapter); await runtime.start({ count: 3 });
+    await eventually(() => runtime.snapshot()?.active?.dispatched === true);
+    f.state({ running: true, pendingInput: false, externalInput: true });
+    await eventually(() => runtime.snapshot()?.status === "paused");
+    expect((await f.adapter.state()).running).toBe(true); expect(f.requests).toHaveLength(1);
+    expect(f.cancellations).toEqual([runtime.snapshot()!.active!.sessionId]); expect(f.cancellations).not.toContain("owner"); runtime.dispose();
+  });
+
+  it("does not start a second writer from another owner", async () => {
+    const f = fixture(3); f.hold(); const first = new SerialRuntime(f.adapter); await first.start({ count: 3 });
+    await eventually(() => first.snapshot()?.active?.dispatched === true); first.dispose();
+    const second = new SerialRuntime({ ...f.adapter, ownerSessionId: "another" }); await second.restore();
+    await expect(second.resume()).rejects.toThrow("另一个 DSH 会话");
+    await expect(second.start({ count: 3 })).rejects.toThrow("已有连载任务");
+    expect(f.requests).toHaveLength(1); second.dispose();
+  });
+
+  it("blocks native failures and bounds explicit retries without prose", async () => {
+    const f = fixture(3);
+    f.adapter.dispatch = async active => { f.requests.push(active.requestId); f.state({ running: false, pendingInput: false, lastTurnError: "network unavailable", lastTurnReason: "error" }); };
+    const runtime = new SerialRuntime(f.adapter); await runtime.start({ count: 3, maxAttempts: 2 });
+    await eventually(() => runtime.snapshot()?.status === "blocked");
+    expect(f.requests).toHaveLength(1);
+    f.state({ running: false, pendingInput: false });
+    await runtime.resume(); await eventually(() => runtime.snapshot()?.status === "blocked");
+    expect(f.requests).toHaveLength(2);
+    await expect(runtime.resume()).rejects.toThrow("重试上限"); runtime.dispose();
+  });
+
+  it("waits for its own accepted queued request without duplicate dispatch", async () => {
+    const f = fixture(1); f.hold(); const runtime = new SerialRuntime(f.adapter);
+    await runtime.start({ count: 1 }); await eventually(() => runtime.snapshot()?.active?.dispatched === true);
+    f.state({ running: false, pendingInput: false, ownQueued: true, requestKnown: true });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(runtime.snapshot()?.status).toBe("running"); expect(f.requests).toHaveLength(1);
+    await runtime.pause();
+    f.finish(); await eventually(() => runtime.snapshot()?.status === "completed"); runtime.dispose();
+  });
+
+  it("stops its isolated child after foreign parent input without cancelling the parent", async () => {
+    const f = fixture(3); f.hold(); let cancellations = 0;
+    f.adapter.cancel = async active => { expect(active.sessionId).not.toBe("owner"); cancellations += 1; };
+    const runtime = new SerialRuntime(f.adapter); await runtime.start({ count: 3 });
+    await eventually(() => runtime.snapshot()?.active?.dispatched === true);
+    f.state({ running: true, pendingInput: false, externalInput: true });
+    await eventually(() => runtime.snapshot()?.status === "paused");
+    expect((await runtime.stop()).status).toBe("stopped"); expect(cancellations).toBe(2); expect((await f.adapter.state()).running).toBe(true); runtime.dispose();
+  });
+
+  it("preserves a stopped failed draft's task identity and resumes only on an explicit command", async () => {
+    const f = fixture(1); f.hold(); const first = new SerialRuntime(f.adapter);
+    await first.start({ count: 1 }); await eventually(() => first.snapshot()?.active?.dispatched === true);
+    await first.pause(); f.partial.add(1); f.repairable.add(1);
+    f.state({ running: false, pendingInput: false, lastTurnReason: "completed", requestKnown: true });
+    await eventually(() => first.snapshot()?.status === "paused");
+    const originalId = first.snapshot()!.id;
+    await first.stop(); expect(first.snapshot()?.status).toBe("stopped");
+    await expect(first.start({ count: 1 })).rejects.toThrow("恢复这批");
+    expect(first.snapshot()?.id).toBe(originalId); expect(f.requests).toHaveLength(1);
+    first.dispose();
+    const recovered = new SerialRuntime(f.adapter); await recovered.restore();
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(recovered.snapshot()?.status).toBe("stopped"); expect(f.requests).toHaveLength(1);
+    f.auto(); await recovered.resume(); await eventually(() => recovered.snapshot()?.status === "completed");
+    expect(recovered.snapshot()?.id).toBe(originalId); expect(recovered.snapshot()?.targetChapter).toBe(1);
+    expect(recovered.snapshot()?.attempts["1"]).toBe(2); expect(f.backups).toHaveLength(1); recovered.dispose();
+  });
+
+  it("retries a failed native cancellation even though the task is already marked stopped", async () => {
+    const f = fixture(1); f.hold(); const runtime = new SerialRuntime(f.adapter);
+    await runtime.start({ count: 1 }); await eventually(() => runtime.snapshot()?.active?.dispatched === true);
+    const originalId = runtime.snapshot()!.id; let calls = 0;
+    f.adapter.cancel = async active => {
+      expect(active.sessionId).not.toBe("owner"); calls += 1;
+      if (calls === 1) throw new Error("cancel unavailable");
+      f.state({ running: false, pendingInput: false, lastTurnReason: "aborted", requestKnown: true });
+    };
+    await expect(runtime.stop()).rejects.toThrow("cancel unavailable");
+    expect(runtime.snapshot()?.status).toBe("stopped"); expect(runtime.snapshot()?.error).toContain("停止请求尚未完成");
+    await expect(runtime.start({ count: 1 })).rejects.toThrow("正在处理其他工作");
+    await runtime.stop(); expect(calls).toBe(2); expect(runtime.snapshot()?.error).toBeUndefined();
+    await runtime.stop(); expect(calls).toBe(2); expect(runtime.snapshot()?.id).toBe(originalId); runtime.dispose();
+  });
+
+  it("can resume an owned draft after stopping an in-flight repair without changing batches", async () => {
+    const f = fixture(1); f.hold();
+    const nativeState = f.adapter.state;
+    f.adapter.state = async active => active !== undefined && active.requestId !== "" && !f.childIds.includes(active.sessionId)
+      ? { running: false, pendingInput: false, requestKnown: false } : nativeState(active);
+    const runtime = new SerialRuntime(f.adapter);
+    await runtime.start({ count: 1 }); await eventually(() => runtime.snapshot()?.active?.dispatched === true);
+    await runtime.pause(); f.partial.add(1); f.repairable.add(1);
+    f.state({ running: false, pendingInput: false, lastTurnReason: "completed", requestKnown: true });
+    await eventually(() => runtime.snapshot()?.status === "paused");
+    const id = runtime.snapshot()!.id;
+    await runtime.resume(); await eventually(() => runtime.snapshot()?.active?.attempt === 2 && runtime.snapshot()?.active?.dispatched === true);
+    await runtime.stop(); expect(runtime.snapshot()?.status).toBe("stopped");
+    f.auto(); await runtime.resume(); await eventually(() => runtime.snapshot()?.status === "completed");
+    expect(runtime.snapshot()?.id).toBe(id); expect(runtime.snapshot()?.attempts["1"]).toBe(3);
+    expect(f.backups.map(item => item.attempt)).toEqual([2, 3]); runtime.dispose();
+  });
+
+  it("rejects a non-completed native turn even with valid prose receipts", async () => {
+    const f = fixture(3); f.hold(); const runtime = new SerialRuntime(f.adapter); await runtime.start({ count: 3 });
+    await eventually(() => runtime.snapshot()?.active?.dispatched === true);
+    f.complete.add(1); f.state({ running: false, pendingInput: false, lastTurnReason: "max-tokens" });
+    await eventually(() => runtime.snapshot()?.status === "blocked");
+    expect(runtime.snapshot()?.completed).toEqual([]); expect(f.requests).toHaveLength(1); runtime.dispose();
+  });
+
+  it("backs up generated unaccepted prose before a fresh automatic repair succeeds", async () => {
+    const f = fixture(1); const dispatches: SerialActive[] = [];
+    f.adapter.dispatch = async (active, prompt) => {
+      dispatches.push(structuredClone(active));
+      if (active.attempt === 1) { f.partial.add(1); f.repairable.add(1); }
+      else {
+        expect(f.backups).toHaveLength(1); expect(active.backupPath).toBe(f.backups[0]!.path);
+        expect(prompt).toContain(f.backups[0]!.path); expect(prompt).toContain("tracking incomplete");
+        f.complete.add(1);
+      }
+      f.state({ running: false, pendingInput: false, lastTurnReason: "completed", requestKnown: true });
+    };
+    const runtime = new SerialRuntime(f.adapter); await runtime.start({ count: 1 });
+    await eventually(() => runtime.snapshot()?.status === "completed");
+    expect(dispatches).toHaveLength(2); expect(dispatches[0]!.sessionId).not.toBe(dispatches[1]!.sessionId);
+    expect(runtime.snapshot()?.completedSessions["1"]).toBe(dispatches[1]!.sessionId);
+    expect(f.backups[0]!.attempt).toBe(2); runtime.dispose();
+  });
+
+  it("stops after two backed-up quality repairs and preserves the last draft", async () => {
+    const f = fixture(1); const dispatches: SerialActive[] = [];
+    f.adapter.dispatch = async active => {
+      dispatches.push(structuredClone(active)); f.partial.add(1); f.repairable.add(1);
+      if (active.attempt > 1) expect(f.backups.some(backup => backup.attempt === active.attempt)).toBe(true);
+      f.state({ running: false, pendingInput: false, lastTurnReason: "completed", requestKnown: true });
+    };
+    const runtime = new SerialRuntime(f.adapter); await runtime.start({ count: 1 });
+    await eventually(() => runtime.snapshot()?.status === "blocked");
+    expect(dispatches).toHaveLength(3); expect(new Set(dispatches.map(active => active.sessionId)).size).toBe(3);
+    expect(f.backups.map(backup => backup.attempt)).toEqual([2, 3]); expect(f.partial.has(1)).toBe(true);
+    expect(runtime.snapshot()?.completed).toEqual([]); await expect(runtime.resume()).rejects.toThrow("重试上限"); runtime.dispose();
+  });
+
+  it("adds one bounded quality-repair window only for an explicit retry while preserving every attempt", async () => {
+    const f = fixture(1); const dispatches: SerialActive[] = [];
+    f.adapter.dispatch = async active => {
+      dispatches.push(structuredClone(active)); f.partial.add(1); f.repairable.add(1);
+      f.state({ running: false, pendingInput: false, lastTurnReason: "completed", requestKnown: true });
+    };
+    const runtime = new SerialRuntime(f.adapter); await runtime.start({ count: 1 });
+    await eventually(() => runtime.snapshot()?.status === "blocked");
+    const taskId = runtime.snapshot()!.id; const originalChildren = dispatches.map(item => item.sessionId);
+    expect(dispatches.map(item => item.attempt)).toEqual([1, 2, 3]);
+    await expect(runtime.resume()).rejects.toThrow("重试上限");
+    await new Promise(resolve => setTimeout(resolve, 10)); expect(dispatches).toHaveLength(3);
+    await runtime.resume({ allowRetryWindow: true });
+    await eventually(() => runtime.snapshot()?.status === "blocked" && runtime.snapshot()?.attempts["1"] === 6);
+    expect(runtime.snapshot()?.id).toBe(taskId); expect(runtime.snapshot()?.attemptLimits?.["1"]).toBe(6);
+    expect(dispatches.map(item => item.attempt)).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(dispatches.slice(0, 3).map(item => item.sessionId)).toEqual(originalChildren);
+    expect(new Set(dispatches.map(item => item.sessionId)).size).toBe(6);
+    expect(new Set(f.backups.map(item => item.path)).size).toBe(5);
+    expect(f.backups.map(item => item.attempt)).toEqual([2, 3, 4, 5, 6]);
+    assertSerialTask(f.disk());
+    await expect(runtime.resume()).rejects.toThrow("重试上限");
+    await new Promise(resolve => setTimeout(resolve, 10)); expect(dispatches).toHaveLength(6);
+    runtime.dispose();
+  });
+
+  it("does not repair prose that existed before this task dispatched a chapter", async () => {
+    const f = fixture(1); f.partial.add(1); f.repairable.add(1);
+    const runtime = new SerialRuntime(f.adapter); await runtime.start({ count: 1 });
+    await eventually(() => runtime.snapshot()?.status === "blocked");
+    expect(f.requests).toHaveLength(0); expect(f.backups).toHaveLength(0); runtime.dispose();
+  });
+
+  it("keeps an undispatched reservation after restart without consuming another attempt", async () => {
+    const f = fixture(1); f.hold(); const first = new SerialRuntime(f.adapter);
+    await first.start({ count: 1 }); await eventually(() => first.snapshot()?.active?.dispatched === true); first.dispose();
+    const saved = f.disk()!; const identity = saved.active!.sessionId; const requestId = saved.active!.requestId;
+    saved.active!.dispatched = false; f.setDisk(saved); f.requests.splice(0); f.childIds.splice(0);
+    f.state({ running: false, pendingInput: false, requestKnown: false }); f.auto();
+    const recovered = new SerialRuntime(f.adapter); await recovered.restore(); await recovered.resume();
+    await eventually(() => recovered.snapshot()?.status === "completed");
+    expect(f.requests).toEqual([requestId]); expect(f.childIds).toEqual([identity]);
+    expect(recovered.snapshot()?.attempts["1"]).toBe(1); recovered.dispose();
+  });
+
+  it("does not call the repair model when its backup cannot be persisted", async () => {
+    const f = fixture(1); let calls = 0;
+    f.adapter.dispatch = async () => { calls += 1; f.partial.add(1); f.repairable.add(1); f.state({ running: false, pendingInput: false, lastTurnReason: "completed", requestKnown: true }); };
+    f.adapter.prepareRepair = async () => { throw new Error("backup write denied"); };
+    const runtime = new SerialRuntime(f.adapter); await runtime.start({ count: 1 });
+    await eventually(() => runtime.snapshot()?.status === "blocked");
+    expect(calls).toBe(1); expect(runtime.snapshot()?.active?.dispatched).toBe(false); expect(runtime.snapshot()?.error).toContain("backup write denied"); runtime.dispose();
+  });
+
+  it("rejects corrupt progress and insufficient outline coverage", async () => {
+    const f = fixture(3); const runtime = new SerialRuntime(f.adapter);
+    await expect(runtime.start({ count: 50 })).rejects.toThrow("只有 3 章");
+    expect(() => assertSerialTask({ schemaVersion: 1, nextChapter: 50, completed: [1] })).toThrow("损坏"); runtime.dispose();
+  });
+});
