@@ -1,6 +1,6 @@
 {
   "name": "@oh-story/dsh",
-  "version": "0.1.26-serial.3",
+  "version": "0.1.26-serial.4",
   "description": "原版提示词驱动的长篇连载工作台：多书导入、独立项目、跨项目续写队列",
   "keywords": [
     "deepseek-harness",
@@ -9,11 +9,11 @@
     "long-serial",
     "batch-generation"
   ],
-  "homepage": "https://github.com/zenstory-ai/oh-story-dsh#readme",
-  "bugs": "https://github.com/zenstory-ai/oh-story-dsh/issues",
+  "homepage": "https://github.com/HeyFagao/long-serial-harness#readme",
+  "bugs": "https://github.com/HeyFagao/long-serial-harness/issues",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/zenstory-ai/oh-story-dsh.git",
+    "url": "git+https://github.com/HeyFagao/long-serial-harness.git",
     "directory": "packages/dsh-plugin"
   },
   "engines": {
@@ -52,7 +52,8 @@
     "cordis.patch.yml",
     "lib/**/*",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "THIRD_PARTY_NOTICES.txt"
   ],
   "scripts": {
     "build": "tsx ../../scripts/build-dsh-plugin.ts && tsc -p tsconfig.build.json",
@@ -76,8 +77,8 @@
     "@deepseek-ai/dsh-fs": ">=0.2.0-rc.2 <0.2.1-0 || >=0.2.1-alpha.1 <0.2.2-0 || >=0.2.2-alpha.2 <0.2.3-0",
     "@deepseek-ai/dsh-host-webserver": ">=0.2.0-rc.2 <0.2.1-0 || >=0.2.1-alpha.1 <0.2.2-0 || >=0.2.2-alpha.2 <0.2.3-0",
     "@deepseek-ai/dsh-llm": ">=0.2.0-rc.2 <0.2.1-0 || >=0.2.1-alpha.1 <0.2.2-0 || >=0.2.2-alpha.2 <0.2.3-0",
-    "@deepseek-ai/dsh-session": ">=0.2.0-rc.2 <0.2.1-0 || >=0.2.1-alpha.1 <0.2.2-0 || >=0.2.2-alpha.2 <0.2.3-0",
     "@deepseek-ai/dsh-sandbox-policy": ">=0.2.0-rc.2 <0.2.1-0 || >=0.2.1-alpha.1 <0.2.2-0 || >=0.2.2-alpha.2 <0.2.3-0",
+    "@deepseek-ai/dsh-session": ">=0.2.0-rc.2 <0.2.1-0 || >=0.2.1-alpha.1 <0.2.2-0 || >=0.2.2-alpha.2 <0.2.3-0",
     "@deepseek-ai/dsh-skill": ">=0.2.0-rc.2 <0.2.1-0 || >=0.2.1-alpha.1 <0.2.2-0 || >=0.2.2-alpha.2 <0.2.3-0",
     "@deepseek-ai/dsh-subagent": ">=0.2.0-rc.2 <0.2.1-0 || >=0.2.1-alpha.1 <0.2.2-0 || >=0.2.2-alpha.2 <0.2.3-0",
     "@deepseek-ai/dsh-tools": ">=0.2.0-rc.2 <0.2.1-0 || >=0.2.1-alpha.1 <0.2.2-0 || >=0.2.2-alpha.2 <0.2.3-0",
@@ -103,8 +104,8 @@
     "@deepseek-ai/dsh-fs": "0.2.2-rc.1",
     "@deepseek-ai/dsh-host-webserver": "0.2.2-rc.1",
     "@deepseek-ai/dsh-llm": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-session": "0.2.2-rc.1",
     "@deepseek-ai/dsh-sandbox-policy": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-session": "0.2.2-rc.1",
     "@deepseek-ai/dsh-skill": "0.2.2-rc.1",
     "@deepseek-ai/dsh-subagent": "0.2.2-rc.1",
     "@deepseek-ai/dsh-tools": "0.2.2-rc.1",
@@ -118,5 +119,8 @@
     "typescript": "6.0.3",
     "zod": "4.4.3"
   },
-  "private": true
+  "private": true,
+  "dependencies": {
+    "fflate": "0.8.3"
+  }
 }

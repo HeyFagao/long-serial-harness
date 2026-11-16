@@ -57,6 +57,7 @@ function NovelWorkbench({ sessionId, blank, openSerialSession, bookNavigation }:
   const [selected, setSelected] = useState(remembered.current.selected);
   const [drafts, setDrafts] = useState<Record<string, Draft>>(remembered.current.drafts);
   const [mode, setMode] = useState<"preview" | "source">(remembered.current.mode);
+  const [archived, setArchived] = useState(false);
   const [workspace, setWorkspace] = useState<WorkspacePayload>();
   const [error, setError] = useState<string>();
   const [fileError, setFileError] = useState<string>();
@@ -132,8 +133,8 @@ function NovelWorkbench({ sessionId, blank, openSerialSession, bookNavigation }:
       {error !== undefined && <p className="novel-error" role="alert">{error}</p>}
       <div className="novel-layout">
         <aside className="novel-controls">
-          <BookLibraryPanel sessionId={sessionId} navigation={bookNavigation} onImported={reload} />
-          {files.some(file => file.path.startsWith("大纲/") || file.path.startsWith("正文/")) && <SerialPanel sessionId={sessionId} onWorkspaceChanged={reload} onOpenSession={openSerialSession} welcome />}
+          <BookLibraryPanel sessionId={sessionId} navigation={bookNavigation} onImported={reload} onAvailabilityChange={setArchived} />
+          {!archived && files.some(file => file.path.startsWith("大纲/") || file.path.startsWith("正文/")) && <SerialPanel sessionId={sessionId} onWorkspaceChanged={reload} onOpenSession={openSerialSession} welcome />}
           <section className="novel-model-card"><h2>模型与中转站</h2><p className="novel-muted">在下方 Harness 模型选择器中切换写作模型。新增中转站请打开「设置 → 模型」。</p></section>
         </aside>
         <section className="novel-reading" aria-label="章节与正文">
@@ -178,6 +179,11 @@ export function apply(context: ClientContext): void {
     const workbench = context.slots.register({ name: "oh-story.workspace", inject: () => ({
       openSerialSession: (owner: string, child: string): Promise<void> => openSerialChapterSession(context.sessions as unknown as ISessions, context.get("uiWorkspace") as SerialWorkspaceNavigation | undefined, owner, child),
       bookNavigation: {
+        unregister: async (workspaceId: string): Promise<void> => {
+          const workspaces = context.get("workspaces") as { delete(id: string): Promise<void> } | undefined;
+          if (workspaces === undefined) throw new Error("Harness 工作区列表尚未就绪。");
+          await workspaces.delete(workspaceId);
+        },
         openSession: (sessionId: string): Promise<void> => openSerialChapterSession(context.sessions as unknown as ISessions, context.get("uiWorkspace") as SerialWorkspaceNavigation | undefined, sessionId, sessionId),
         register: async (path: string, title: string): Promise<string> => {
           const workspaces = context.get("workspaces") as { create(input: { path: string }): Promise<{ workspaceId: string }>; rename(id: string, title: string): Promise<unknown> } | undefined;

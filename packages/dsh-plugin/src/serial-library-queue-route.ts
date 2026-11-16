@@ -4,7 +4,7 @@ import type { Context } from "@deepseek-ai/cordis";
 import type { FsVersion } from "@deepseek-ai/dsh-fs";
 import { listLibraryBooks } from "./serial-library.js";
 import { captureLibraryOwnerContext, ensureLibraryBookRealm, type LibraryOwnerContext } from "./serial-library-native.js";
-import { assertLibraryTask, SerialLibraryRuntime, type LibraryQueueAdapter, type LibraryTask } from "./serial-library-runtime.js";
+import { assertLibraryTask, assertLibraryConcurrency, SerialLibraryRuntime, type LibraryQueueAdapter, type LibraryTask } from "./serial-library-runtime.js";
 import { getSerialRuntime } from "./serial-route.js";
 import { creativeTarget, jsonBody, mapFsError, readVersionedFile, send, workspaceRealmForSession, WorkspaceHttpError, type WorkspaceRealm } from "./workspace-route.js";
 import { isTrustedWorkspaceRequest } from "./workspace-request-trust.js";
@@ -40,7 +40,6 @@ export function createLibraryQueueAdapter(context: Context, realm: WorkspaceReal
     async plan() {
       const library = await listLibraryBooks(realm);
       if (library.isBookProject) throw new WorkspaceHttpError(409, "请回到书库总览操作所有项目。");
-      if (library.books.length > 1000) throw new WorkspaceHttpError(413, "单个书库批次最多包含 1000 本小说，请按书库分组。");
       return library.books.map(book => ({ id: book.id, title: book.title, absolutePath: book.absolutePath,
         nextChapter: book.completedChapters + 1, lastChapter: Math.max(book.completedChapters, book.totalChapters),
         ...(book.absolutePath === "" || book.totalChapters < 1 ? { error: book.error ?? "本书项目记录无效，请先修复导入。" }
@@ -71,7 +70,7 @@ function generationOptions(input: Record<string, unknown>): LibraryTask["generat
   if (result.minChars !== undefined || result.maxChars !== undefined) {
     if (result.minChars === undefined || result.maxChars === undefined || result.minChars < 500 || result.maxChars > 20000 || result.minChars > result.maxChars) throw new WorkspaceHttpError(400, "每章字数需要完整填写 500—20000 以内的有效范围。");
   }
-  if (result.maxAttempts !== undefined && (result.maxAttempts < 1 || result.maxAttempts > 3)) throw new WorkspaceHttpError(400, "修订尝试次数必须为 1—3。");
+  if (result.maxAttempts !== undefined && (result.maxAttempts < 1 || result.maxAttempts > 6)) throw new WorkspaceHttpError(400, "修订尝试次数必须为 1—6。");
   if (input.divergence !== undefined && (Number(input.divergence) < 0 || Number(input.divergence) > 2)) throw new WorkspaceHttpError(400, "批量正文生成的发散等级为 0—2；建议模式不能批量写正文。");
   if (input.style !== undefined) {
     if (typeof input.style !== "string" || input.style.length > 4000) throw new WorkspaceHttpError(400, "补充文风要求不能超过 4000 字。");
@@ -132,7 +131,9 @@ export function registerLibraryQueueRoute(context: Context, options: { readonly 
       switch (input.action) {
         case "start": {
           if (input.count !== 10 && input.count !== 20 && input.count !== "all") throw new WorkspaceHttpError(400, "请选择所有项目新增 10 章、20 章或写至完本。");
-          task = await holder.runtime.start(input.count, generationOptions(input));
+          const concurrency = input.concurrency ?? "all";
+          assertLibraryConcurrency(concurrency);
+          task = await holder.runtime.start(input.count, generationOptions(input), concurrency);
           break;
         }
         case "pause": task = await holder.runtime.pause(); break;

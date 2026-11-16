@@ -123,7 +123,8 @@ export function childExecution(events: readonly SessionEvent[]): {
 /** Native spawn starts every chapter in empty context and inherits DSH model, preset and permissions. */
 export function createNativeSerialController(
   context: Context,
-  getOwnerRealm: () => Promise<WorkspaceRealm>
+  getOwnerRealm: () => Promise<WorkspaceRealm>,
+  label = "长篇连载"
 ): Pick<SerialAdapter, "state" | "dispatch" | "cancel"> {
   const activations = new Map<string, ActivationState>();
   context.effect(() => async () => { await Promise.allSettled([...activations.values()].map(item => item.activation.dispose())); }, "oh-story: fresh serial child lifecycle");
@@ -214,7 +215,7 @@ export function createNativeSerialController(
           ...(realm.agent.options.maxTokens === undefined ? {} : { maxTokens: realm.agent.options.maxTokens }) };
         const task: FreshTask = { parent: realm.agent, prompt: [{ type: "text", text: prompt }], maxDepth: 2, agentOptions };
         published = await runtime.startActivation({ provider: "spawn", childId: SessionId(active.sessionId),
-          label: `长篇连载 · 第${String(active.chapter)}章 · 第${String(active.attempt)}次`, ...task, request: task, signal: controller.signal, delivery: "caller" });
+          label: `${label} · 第${String(active.chapter)}章 · 第${String(active.attempt)}次`, ...task, request: task, signal: controller.signal, delivery: "caller" });
         const activation = published;
         if (activation.childId !== active.sessionId) { await activation.dispose(); throw new Error("原生子会话没有采用已保存的章节身份，已停止本次写作。"); }
         const state: ActivationState = { activation };

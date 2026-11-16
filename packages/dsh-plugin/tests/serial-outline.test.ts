@@ -217,7 +217,7 @@ describe("native Oh Story chapter receipts", () => {
       repairIssues: ["正文已写，但状态字段缺失"], repairOriginal: "第50章：归来\n上一版原文" });
     expect(prompt).toMatch(/^你是一名中文网络长篇小说的执笔/u);
     expect(prompt).toContain("本轮只完成当前工作区这本书的第 50 章");
-    expect(prompt).toContain("当前批次字数范围为 1800–2200 字");
+    expect(prompt).toContain("当前批次建议字数为 1800–2200 字");
     expect(prompt).toContain("当前批次字数配置优先于原版系统提示词");
     expect(prompt).toContain("下面是你上一版章节正文与状态变更，程序检测发现以下问题");
     expect(prompt).toContain("只针对上述问题做最小修改");

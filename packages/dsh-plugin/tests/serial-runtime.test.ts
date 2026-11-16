@@ -47,6 +47,45 @@ async function eventually(check: () => boolean): Promise<void> {
 }
 
 describe("native serial scheduler", () => {
+  it("retries only the independent title six times, then resumes without regenerating prose", async () => {
+    const f = fixture(1); const titles: SerialActive[] = []; const done = new Set<number>();
+    let succeeds = false;
+    const state = f.adapter.state;
+    f.adapter.state = async active => titles.some(item => item.sessionId === active?.sessionId)
+      ? { running: false, pendingInput: false, lastTurnReason: "completed", requestKnown: true, finalText: "标题" }
+      : active?.attempt !== undefined && active.sessionId !== f.childIds[0] && f.complete.size > 0 ? { running: false, pendingInput: false, requestKnown: false } : state(active);
+    f.adapter.inspectTitle = async chapter => done.has(chapter);
+    f.adapter.dispatchTitle = async active => { expect(f.complete.has(active.chapter)).toBe(true); titles.push({ ...active }); };
+    f.adapter.finalizeTitle = async active => { if (succeeds) done.add(active.chapter); return { ok: succeeds, issue: "标题缺少依据" }; };
+    const runtime = new SerialRuntime(f.adapter); await runtime.start({ count: 1 });
+    await eventually(() => runtime.snapshot()?.status === "blocked");
+    expect(f.requests).toHaveLength(1); expect(titles).toHaveLength(6);
+    expect(runtime.snapshot()?.error).toContain("只补标题");
+    expect(runtime.snapshot()?.completed).toEqual([]); expect(f.complete.has(1)).toBe(true);
+    succeeds = true;
+    await runtime.resume({ allowRetryWindow: true });
+    await eventually(() => runtime.snapshot()?.status === "completed");
+    expect(f.requests).toHaveLength(1); expect(done.has(1)).toBe(true); runtime.dispose();
+  });
+
+  it("stops the title child and resumes it after a cold restore, preserving the prose request", async () => {
+    const f = fixture(1); const titles: SerialActive[] = []; const states = new Map<string, SerialObservation>();
+    const state = f.adapter.state; let done = false;
+    f.adapter.state = async active => states.get(active?.sessionId ?? "") ?? (f.complete.size > 0 && active?.sessionId !== f.childIds[0] ? { running: false, pendingInput: false, requestKnown: false } : await state(active));
+    f.adapter.inspectTitle = async () => done;
+    f.adapter.dispatchTitle = async active => { titles.push(active); states.set(active.sessionId, { running: true, pendingInput: false, requestKnown: true }); };
+    f.adapter.finalizeTitle = async () => { done = true; return { ok: true }; };
+    f.adapter.cancel = async active => { f.cancellations.push(active.sessionId); states.set(active.sessionId, { running: false, pendingInput: false, lastTurnReason: "aborted", requestKnown: true }); };
+    const runtime = new SerialRuntime(f.adapter); await runtime.start({ count: 1 });
+    await eventually(() => titles.length === 1);
+    await runtime.stop(); expect(f.cancellations).toEqual([titles[0]!.sessionId]); runtime.dispose();
+    const restored = new SerialRuntime(f.adapter); await restored.restore(); await restored.resume();
+    await eventually(() => titles.length === 2);
+    expect(titles[0]!.sessionId).not.toBe(titles[1]!.sessionId);
+    states.set(titles[1]!.sessionId, { running: false, pendingInput: false, lastTurnReason: "completed", requestKnown: true });
+    await eventually(() => restored.snapshot()?.status === "completed");
+    expect(f.requests).toHaveLength(1); expect(done).toBe(true); restored.dispose();
+  });
   it("settles native text through the host before accepting the chapter", async () => {
     const f = fixture(1);
     f.adapter.dispatch = async active => { f.requests.push(active.requestId); f.state({ running: false, pendingInput: false, lastTurnReason: "completed", requestKnown: true, finalText: "原版两块输出" }); };
@@ -86,7 +125,7 @@ describe("native serial scheduler", () => {
     expect(new Set(f.childIds).size).toBe(150);
     expect(f.childIds).not.toContain("owner");
     expect(Object.keys(runtime.snapshot()!.completedSessions)).toHaveLength(100);
-    expect(runtime.snapshot()).toMatchObject({ minChars: 2300, maxChars: 2500, maxAttempts: 3 });
+    expect(runtime.snapshot()).toMatchObject({ minChars: 2300, maxChars: 2500, maxAttempts: 6 });
     runtime.dispose();
   });
 
@@ -161,15 +200,13 @@ describe("native serial scheduler", () => {
     expect(f.requests).toHaveLength(1); second.dispose();
   });
 
-  it("blocks native failures and bounds explicit retries without prose", async () => {
-    const f = fixture(3);
+  it("automatically retries a failed model five times before blocking", async () => {
+    const f = fixture(1);
     f.adapter.dispatch = async active => { f.requests.push(active.requestId); f.state({ running: false, pendingInput: false, lastTurnError: "network unavailable", lastTurnReason: "error" }); };
-    const runtime = new SerialRuntime(f.adapter); await runtime.start({ count: 3, maxAttempts: 2 });
+    const runtime = new SerialRuntime(f.adapter); await runtime.start({ count: 1 });
     await eventually(() => runtime.snapshot()?.status === "blocked");
-    expect(f.requests).toHaveLength(1);
-    f.state({ running: false, pendingInput: false });
-    await runtime.resume(); await eventually(() => runtime.snapshot()?.status === "blocked");
-    expect(f.requests).toHaveLength(2);
+    expect(f.requests).toHaveLength(6);
+    expect(new Set(f.requests).size).toBe(6);
     await expect(runtime.resume()).rejects.toThrow("重试上限"); runtime.dispose();
   });
 
@@ -273,7 +310,7 @@ describe("native serial scheduler", () => {
     expect(f.backups[0]!.attempt).toBe(2); runtime.dispose();
   });
 
-  it("stops after two backed-up quality repairs and preserves the last draft", async () => {
+  it("stops after five backed-up quality repairs and preserves the last draft", async () => {
     const f = fixture(1); const dispatches: SerialActive[] = [];
     f.adapter.dispatch = async active => {
       dispatches.push(structuredClone(active)); f.partial.add(1); f.repairable.add(1);
@@ -282,8 +319,8 @@ describe("native serial scheduler", () => {
     };
     const runtime = new SerialRuntime(f.adapter); await runtime.start({ count: 1 });
     await eventually(() => runtime.snapshot()?.status === "blocked");
-    expect(dispatches).toHaveLength(3); expect(new Set(dispatches.map(active => active.sessionId)).size).toBe(3);
-    expect(f.backups.map(backup => backup.attempt)).toEqual([2, 3]); expect(f.partial.has(1)).toBe(true);
+    expect(dispatches).toHaveLength(6); expect(new Set(dispatches.map(active => active.sessionId)).size).toBe(6);
+    expect(f.backups.map(backup => backup.attempt)).toEqual([2, 3, 4, 5, 6]); expect(f.partial.has(1)).toBe(true);
     expect(runtime.snapshot()?.completed).toEqual([]); await expect(runtime.resume()).rejects.toThrow("重试上限"); runtime.dispose();
   });
 
@@ -293,7 +330,7 @@ describe("native serial scheduler", () => {
       dispatches.push(structuredClone(active)); f.partial.add(1); f.repairable.add(1);
       f.state({ running: false, pendingInput: false, lastTurnReason: "completed", requestKnown: true });
     };
-    const runtime = new SerialRuntime(f.adapter); await runtime.start({ count: 1 });
+    const runtime = new SerialRuntime(f.adapter); await runtime.start({ count: 1, maxAttempts: 3 });
     await eventually(() => runtime.snapshot()?.status === "blocked");
     const taskId = runtime.snapshot()!.id; const originalChildren = dispatches.map(item => item.sessionId);
     expect(dispatches.map(item => item.attempt)).toEqual([1, 2, 3]);

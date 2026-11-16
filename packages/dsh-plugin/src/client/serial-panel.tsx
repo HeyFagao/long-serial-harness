@@ -11,6 +11,8 @@ interface SerialTaskView {
   readonly nextChapter: number;
   readonly completed: readonly number[];
   readonly active?: { readonly chapter: number; readonly attempt: number; readonly sessionId: string };
+  readonly phase?: "title";
+  readonly titleActive?: { readonly chapter: number; readonly attempt: number; readonly sessionId: string };
   readonly error?: string;
   readonly updatedAt: string;
 }
@@ -126,7 +128,7 @@ export function SerialPanel({ sessionId, onWorkspaceChanged, onOpenSession, welc
     if (current?.active === undefined || pending !== undefined) return;
     setPending("open-session");
     setError(undefined);
-    try { await onOpenSession(current.ownerSessionId, current.active.sessionId); }
+    try { await onOpenSession(current.ownerSessionId, (current.phase === "title" ? current.titleActive : current.active)?.sessionId ?? current.active.sessionId); }
     catch (reason: unknown) { if (mounted.current) setError(reason instanceof Error ? reason.message : String(reason)); }
     finally { if (mounted.current) setPending(undefined); }
   };
@@ -153,7 +155,7 @@ export function SerialPanel({ sessionId, onWorkspaceChanged, onOpenSession, welc
       const url = URL.createObjectURL(body);
       const link = document.createElement("a");
       link.href = url;
-      link.download = `${(snapshot?.outline?.title || "长篇连载").replace(/[\\/:*?"<>|]/gu, "_")}-已完成.txt`;
+      link.download = `${(snapshot?.outline?.title || "长篇连载").replace(/[\\/:*?"<>|]/gu, "_")}-章节TXT.zip`;
       document.body.append(link);
       link.click();
       link.remove();
@@ -193,7 +195,7 @@ export function SerialPanel({ sessionId, onWorkspaceChanged, onOpenSession, welc
       {task !== undefined && task !== null && <div className="oh-serial-progress-card">
         <div className="oh-serial-progress-caption"><span>本批第 {task.startChapter}—{task.targetChapter} 章</span><strong>{done}<small> / {total} 章已验收</small></strong></div>
         <progress max={total || 1} value={done} aria-label="本批已验收章节" />
-        <div className="oh-serial-progress-meta"><span>{task.status === "completed" ? "本批章节已保存并通过检查" : task.status === "stopped" ? `本批已停止 · 下一章为第 ${String(task.nextChapter)} 章` : task.active !== undefined ? `正在处理第 ${String(task.active.chapter)} 章 · 第 ${String(task.active.attempt)} 次尝试` : `下一章：第 ${String(task.nextChapter)} 章`}</span><span>{progress}%</span></div>
+        <div className="oh-serial-progress-meta"><span>{task.status === "completed" ? "本批章节已保存并通过检查" : task.status === "stopped" ? `本批已停止 · 下一章为第 ${String(task.nextChapter)} 章` : task.phase === "title" ? `正文已保存 · 正在独立生成第 ${String(task.nextChapter)} 章公众号标题 · 第 ${String(task.titleActive?.attempt ?? 1)} 次尝试` : task.active !== undefined ? `正在处理第 ${String(task.active.chapter)} 章 · 第 ${String(task.active.attempt)} 次尝试` : `下一章：第 ${String(task.nextChapter)} 章`}</span><span>{progress}%</span></div>
         {task.error !== undefined && <div className="oh-serial-task-error" role="alert">{task.error}</div>}
         {differentSession && <p className="oh-serial-note">这批任务属于另一会话。恢复或管理原批次请点击「回到任务会话」；已结束的历史批次不影响你在当前会话开始新批次。</p>}
         {task.status === "blocked" && <p className="oh-serial-note">请先查看上方错误；点击「查看当前章会话」查看日志、轨迹并处理审批。处理后点击「重试并继续」，已验收章节会保留。</p>}
@@ -206,7 +208,7 @@ export function SerialPanel({ sessionId, onWorkspaceChanged, onOpenSession, welc
           {controls.canResume && <button className="oh-serial-primary" type="button" disabled={busy || differentSession} onClick={() => { void act("resume"); }}>{pending === "resume" ? "正在恢复…" : task.status === "blocked" ? "重试并继续" : task.status === "stopped" ? "恢复这批" : "继续本批"}</button>}
           {(running || task.status === "blocked" || task.status === "paused") && <button className="oh-serial-stop" type="button" disabled={busy || differentSession} onClick={() => { void act("stop"); }}>{pending === "stop" ? "正在停止…" : "立即停止"}</button>}
           {controls.retryStop && <button className="oh-serial-stop" type="button" disabled={busy || differentSession} onClick={() => { void act("stop"); }}>{pending === "stop" ? "正在重试停止…" : "重试停止"}</button>}
-          <a className="oh-serial-export" href={endpoint("serial/export", sessionId)} aria-disabled={busy} onClick={(event) => { event.preventDefault(); void download(); }} download>{pending === "export" ? "正在导出…" : "导出已完成 TXT ↗"}</a>
+          <a className="oh-serial-export" href={endpoint("serial/export", sessionId)} aria-disabled={busy} onClick={(event) => { event.preventDefault(); void download(); }} download>{pending === "export" ? "正在导出…" : "导出章节 TXT 压缩包 ↗"}</a>
         </div>
       </div>}
 
@@ -217,7 +219,7 @@ export function SerialPanel({ sessionId, onWorkspaceChanged, onOpenSession, welc
             {[10, 20, 50].map((value) => <button type="button" key={value} aria-pressed={!untilEnd && count === value} onClick={() => { setCount(value); setUntilEnd(false); }}>{value} 章</button>)}
             <button type="button" aria-pressed={untilEnd} onClick={() => { setUntilEnd(true); }}>生成全本</button>
           </div>
-          <details className="oh-serial-settings"><summary>写作设置</summary><label className="oh-serial-field oh-serial-divergence" htmlFor={`${id}-divergence`}>发散级别<select id={`${id}-divergence`} value={divergence} onChange={(event) => { setDivergence(Number(event.target.value)); }}><option value={0}>0 · 严格遵守章纲</option><option value={1}>1 · 允许补充细节</option><option value={2}>2 · 允许补充次要情节</option></select></label><div className="oh-serial-word-range"><label>最少<input type="number" min="500" max="20000" step="100" value={minChars} placeholder="默认" onChange={(event) => { setMinChars(event.target.value); }} /></label><span>—</span><label>最多<input type="number" min="500" max="20000" step="100" value={maxChars} placeholder="默认" onChange={(event) => { setMaxChars(event.target.value); }} /></label><span>字</span></div><label className="oh-serial-field oh-serial-style" htmlFor={`${id}-style`}>本书文风补充<textarea id={`${id}-style`} value={style} maxLength={4000} rows={3} placeholder="例如：第三人称有限视角，多用行动与对话推进，少解释情绪。" onChange={(event) => { setStyle(event.target.value); }} /></label><p className="oh-serial-note">默认每章 2300—2500 字；可调整上下限，或同时留空恢复默认。</p><button type="button" className="oh-serial-test-one" aria-pressed={!untilEnd && count === 1} onClick={() => { setCount(1); setUntilEnd(false); }}>只试写 1 章</button></details>
+          <details className="oh-serial-settings"><summary>写作设置</summary><label className="oh-serial-field oh-serial-divergence" htmlFor={`${id}-divergence`}>发散级别<select id={`${id}-divergence`} value={divergence} onChange={(event) => { setDivergence(Number(event.target.value)); }}><option value={0}>0 · 严格遵守章纲</option><option value={1}>1 · 允许补充细节</option><option value={2}>2 · 允许补充次要情节</option></select></label><div className="oh-serial-word-range"><label>建议最少<input type="number" min="500" max="20000" step="100" value={minChars} placeholder="默认" onChange={(event) => { setMinChars(event.target.value); }} /></label><span>—</span><label>建议最多<input type="number" min="500" max="20000" step="100" value={maxChars} placeholder="默认" onChange={(event) => { setMaxChars(event.target.value); }} /></label><span>字</span></div><label className="oh-serial-field oh-serial-style" htmlFor={`${id}-style`}>本书文风补充<textarea id={`${id}-style`} value={style} maxLength={4000} rows={3} placeholder="例如：第三人称有限视角，多用行动与对话推进，少解释情绪。" onChange={(event) => { setStyle(event.target.value); }} /></label><p className="oh-serial-note">建议每章 2300—2500 字，仅作写作参考；验收只要求正文超过1500字，不设上限。失败后自动重试5次，仍失败才提示处理。</p><button type="button" className="oh-serial-test-one" aria-pressed={!untilEnd && count === 1} onClick={() => { setCount(1); setUntilEnd(false); }}>只试写 1 章</button></details>
         </fieldset>
         {invalidLength && <p className="oh-serial-task-error">请设置 500—20000 字范围，最多字数不能小于最少字数。</p>}
         <button className="oh-serial-primary oh-serial-start" type="button" disabled={!canStart || invalidLength} onClick={() => { void act("start", { count: untilEnd ? "all" : count, divergence, ...(customLength ? { minChars: Number(minChars), maxChars: Number(maxChars) } : {}), ...(style.trim() === "" ? {} : { style: style.trim() }) }); }}>{pending === "start" ? "正在启动…" : untilEnd ? "一键生成 · 全本" : `一键生成 · ${String(count)} 章`}</button>

@@ -1,5 +1,6 @@
 import type { SerialResumeOptions, SerialStartOptions, SerialTask } from "./serial-runtime.js";
 
+export type LibraryConcurrency = number | "all";
 export type LibraryCount = 10 | 20 | "all";
 export type LibraryStatus = "running" | "pausing" | "paused" | "blocked" | "stopped" | "completed";
 export interface LibraryQueueBook {
@@ -23,7 +24,8 @@ export interface LibraryTask {
   status: LibraryStatus;
   count: LibraryCount;
   books: LibraryQueueBook[];
-  activeBookId?: string;
+  activeBookId?: string; // Legacy serial.3 receipt.
+  concurrency?: LibraryConcurrency;
   error?: string;
   updatedAt: string;
   ownerContext: unknown;
@@ -63,8 +65,9 @@ export function assertLibraryTask(value: unknown): asserts value is LibraryTask 
   const task = value as LibraryTask;
   if (task.schemaVersion !== 1 || typeof task.id !== "string" || typeof task.ownerSessionId !== "string" || typeof task.cwd !== "string"
     || !["running", "pausing", "paused", "blocked", "stopped", "completed"].includes(task.status)
-    || ![10, 20, "all"].includes(task.count) || !Array.isArray(task.books) || task.books.length > 1000
+    || ![10, 20, "all"].includes(task.count) || !Array.isArray(task.books)
     || typeof task.generation !== "object" || task.generation === null) throw new Error("书库任务记录格式无效，请保留原文件后处理。");
+  if (task.concurrency !== undefined) assertLibraryConcurrency(task.concurrency);
   const ids = new Set<string>();
   for (const book of task.books) {
     if (typeof book.id !== "string" || ids.has(book.id) || typeof book.title !== "string" || typeof book.absolutePath !== "string" || typeof book.ownerSessionId !== "string"
@@ -73,6 +76,10 @@ export function assertLibraryTask(value: unknown): asserts value is LibraryTask 
       || !["pending", "running", "completed", "failed", "skipped"].includes(book.status)) throw new Error("书库章节范围或项目身份无效，未继续生成。");
     ids.add(book.id);
   }
+}
+
+export function assertLibraryConcurrency(value: unknown): asserts value is LibraryConcurrency {
+  if (value !== "all" && (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1)) throw new Error("并发数必须为正整数，或选择全部项目同时生成。");
 }
 
 /** Durable host-owned queue. Targets are fixed once: retries never add another ten chapters. */
@@ -133,7 +140,7 @@ export class SerialLibraryRuntime {
     });
     return this.snapshot();
   }
-  async start(count: LibraryCount, generation: LibraryTask["generation"] = {}): Promise<LibraryTask> {
+  async start(count: LibraryCount, generation: LibraryTask["generation"] = {}, concurrency: LibraryConcurrency = 1): Promise<LibraryTask> {
     await this.locked(async () => {
       if (![10, 20, "all"].includes(count)) throw new Error("书库批量仅支持新增 10 章、20 章或写至完本。");
       this.task ??= await this.adapter.load();
@@ -141,6 +148,7 @@ export class SerialLibraryRuntime {
         assertLibraryTask(this.task);
         if (! ["completed", "stopped"].includes(this.task.status)) throw new Error("已有未完成的书库批次，请继续或停止后再新建。");
       }
+      assertLibraryConcurrency(concurrency);
       const ownerContext = await this.adapter.captureContext();
       const plans = await this.adapter.plan();
       if (plans.length === 0) throw new Error("书库还没有小说项目，请先批量导入最终输出。");
@@ -151,7 +159,7 @@ export class SerialLibraryRuntime {
         ...(book.error === undefined ? {} : { error: book.error })
       }));
       await this.commit({ schemaVersion: 1, id: this.adapter.makeId(), ownerSessionId: this.adapter.ownerSessionId, cwd: this.adapter.cwd,
-        status: "running", count, books, ownerContext, generation: copy(generation), updatedAt: this.adapter.now() });
+        status: "running", count, concurrency, books, ownerContext, generation: copy(generation), updatedAt: this.adapter.now() });
     });
     this.kick();
     return this.snapshot()!;
@@ -160,15 +168,16 @@ export class SerialLibraryRuntime {
     await this.locked(async () => {
       const next = copy(this.owned());
       if (!ACTIVE.has(next.status)) return;
-      const active = next.books.find(book => book.id === next.activeBookId);
-      next.status = active === undefined ? "paused" : "pausing";
+      const active = next.books.filter(book => book.status === "running");
+      next.status = active.length === 0 ? "paused" : "pausing";
       delete next.error;
       await this.commit(next);
-      if (active?.serialTaskId !== undefined) {
-        const controller = this.controllers.get(active.ownerSessionId) ?? await this.adapter.controller(active, next);
-        this.controllers.set(active.ownerSessionId, controller);
-        if (controller.snapshot()?.id === active.serialTaskId) await controller.pause();
-      }
+      await Promise.all(active.map(async book => {
+        if (book.serialTaskId === undefined) return;
+        const controller = this.controllers.get(book.ownerSessionId) ?? await this.adapter.controller(book, next);
+        this.controllers.set(book.ownerSessionId, controller);
+        if (controller.snapshot()?.id === book.serialTaskId) await controller.pause();
+      }));
     });
     this.wake?.();
     return this.snapshot()!;
@@ -181,10 +190,8 @@ export class SerialLibraryRuntime {
       for (const book of next.books) {
         if (book.status === "failed") { book.status = "pending"; book.retryRequested = true; delete book.error; }
       }
-      const active = next.books.find(book => book.id === next.activeBookId);
-      if (active !== undefined && active.serialTaskId !== undefined) {
-        active.retryRequested = true;
-      }
+      const active = next.books.filter(book => book.status === "running");
+      for (const book of active) if (book.serialTaskId !== undefined) book.retryRequested = true;
       next.status = "running";
       delete next.error;
       await this.commit(next);
@@ -195,12 +202,11 @@ export class SerialLibraryRuntime {
   async stop(): Promise<LibraryTask> {
     await this.locked(async () => {
       const next = copy(this.owned());
-      const active = next.books.find(book => book.id === next.activeBookId);
       next.status = "blocked";
       next.error = "正在停止当前小说，已暂停书库后续派发。";
       await this.commit(next);
       try {
-        await this.stopReservedBook(active, next);
+        await this.stopRunningBooks(next);
         next.status = "stopped";
         delete next.error;
       } catch (error) {
@@ -232,7 +238,7 @@ export class SerialLibraryRuntime {
             const next = copy(this.owned());
             next.status = "blocked";
             next.error = message(error);
-            try { await this.stopReservedBook(next.books.find(book => book.id === next.activeBookId), next); }
+            try { await this.stopRunningBooks(next); }
             catch (cancelError) { next.error += `；尚未确认当前小说已停止：${message(cancelError)}`; }
             await this.commit(next);
           });
@@ -241,18 +247,42 @@ export class SerialLibraryRuntime {
       if (!this.disposed && this.task !== null && ACTIVE.has(this.task.status)) await this.wait();
     }
   }
+  private async stopRunningBooks(task: LibraryTask): Promise<void> {
+    const results = await Promise.allSettled(task.books.filter(book => book.status === "running").map(book => this.stopReservedBook(book, task)));
+    const errors = results.filter((item): item is PromiseRejectedResult => item.status === "rejected");
+    if (errors.length > 0) throw new Error(errors.map(item => message(item.reason)).join("；"));
+  }
   private async step(): Promise<void> {
     const next = copy(this.owned());
     if (!ACTIVE.has(next.status)) return;
-    let book = next.books.find(item => item.id === next.activeBookId);
-    if (book === undefined) {
-      if (next.status === "pausing") { next.status = "paused"; await this.commit(next); return; }
-      book = next.books.find(item => item.status === "pending");
-      if (book === undefined) { next.status = "completed"; await this.commit(next); return; }
-      next.activeBookId = book.id;
-      book.status = "running";
-      await this.commit(next); // Reserve the owner and fixed target before any native session or request.
+    const limit = next.concurrency === "all" ? next.books.length : next.concurrency ?? 1;
+    // Admission is serialized for durable receipts; each controller runs its own chapter loop concurrently.
+    for (const book of next.books.filter(item => item.status === "running")) {
+      await this.stepBook(next, book);
+      if (!ACTIVE.has(next.status)) break;
     }
+    if (next.status === "running") {
+      for (const book of next.books.filter(item => item.status === "pending")) {
+        if (next.books.filter(item => item.status === "running").length >= limit) break;
+        book.status = "running";
+        await this.commit(next);
+        await this.stepBook(next, book);
+        if (next.status !== "running") break;
+      }
+    }
+    if (next.status === "blocked") await this.stopRunningBooks(next);
+    if (next.status === "pausing") {
+      await Promise.all(next.books.filter(book => book.status === "running").map(async book => {
+        const controller = this.controllers.get(book.ownerSessionId);
+        if (controller?.snapshot()?.status === "running") await controller.pause();
+      }));
+      const active = next.books.filter(book => book.status === "running");
+      if (active.every(book => this.controllers.get(book.ownerSessionId)?.snapshot()?.status === "paused")) next.status = "paused";
+    }
+    if (next.status === "running" && !next.books.some(book => book.status === "running" || book.status === "pending")) next.status = "completed";
+    await this.commit(next);
+  }
+  private async stepBook(next: LibraryTask, book: LibraryQueueBook): Promise<void> {
     try {
       const controller = await this.adapter.controller(book, next);
       this.controllers.set(book.ownerSessionId, controller);
@@ -285,8 +315,7 @@ export class SerialLibraryRuntime {
         if (isSharedLibraryFailure(error)) { next.status = "blocked"; next.error = error; }
         else { book.status = "failed"; delete next.activeBookId; }
       } else if (serial.status === "paused") {
-        next.status = "paused";
-        next.error = "当前小说已暂停；继续本批将从原进度接续。";
+        next.status = "pausing";
       } else if (next.status === "pausing" && serial.status === "running") {
         await controller.pause();
       }

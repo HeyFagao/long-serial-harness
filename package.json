@@ -1,6 +1,6 @@
 {
   "name": "oh-story-dsh",
-  "version": "0.1.26-serial.3",
+  "version": "0.1.26-serial.4",
   "private": true,
   "description": "原版提示词驱动的长篇连载工作台：多书导入、独立项目、跨项目续写队列",
   "license": "MIT",
@@ -26,6 +26,7 @@
     "@types/node": "25.5.0",
     "esbuild": "0.28.2",
     "eslint": "10.8.1",
+    "fflate": "0.8.3",
     "tsx": "4.23.12",
     "typescript": "6.0.3",
     "typescript-eslint": "8.67.0",

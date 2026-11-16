@@ -1,6 +1,9 @@
 import { posix } from "node:path";
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { importLibraryBooks, listLibraryBooks, validateLibraryInputs, type LibraryInputFile } from "../src/serial-library.js";
+import { unzipSync, strFromU8 } from "fflate";
+import { exportLibraryBooks, importLibraryBooks, listLibraryBooks, recycleLibraryBooks, realmForLibraryBook, selectedLibraryIds, validateLibraryInputs, type LibraryBook, type LibraryInputFile } from "../src/serial-library.js";
+import { commitOriginalOutput } from "../src/serial-output.js";
 import type { WorkspaceRealm } from "../src/workspace-route.js";
 
 function library() {
@@ -38,6 +41,102 @@ function library() {
 }
 
 const source = (number: number): LibraryInputFile => ({ filename: `书${String(number)}.txt`, text: `书名：第${String(number)}本书\n第1章：钥匙\n只有书${String(number)}的角色出场。\n第2章：门开了\n书${String(number)}的独有伏笔被保留。` });
+
+async function writeChapter(test: ReturnType<typeof library>, book: LibraryBook, chapter = 1): Promise<void> {
+  const child = await realmForLibraryBook(test.realm, book.relativePath);
+  const result = await commitOriginalOutput(child, {
+    active: { chapter, sessionId: `child-${book.id}-${String(chapter)}`, requestId: `req-${String(chapter)}`, attempt: 1, dispatched: true },
+    taskId: "test", minChars: 2300, maxChars: 2500, totalChapters: 2, title: "钥匙",
+    text: `第${String(chapter)}章 钥匙\n\n${"她走进屋里取来钥匙。".repeat(180)}\n\n【状态变更】\n本章摘要：发现钥匙的编号。\n实际字数：1800\n章尾钩类型：疑问${String(chapter % 2)}\n人物：\n林青：知道钥匙被换过，尚不知道来人的名字。\n伏笔：\nFB001：新埋，发现钥匙柄的编号。\n时间：半小时\n与章纲不同的地方及原因：无\n下一章必须接住的事：确认编号来源。`
+  });
+  expect(result.accepted).toBe(true);
+}
+
+describe("book recycling and TXT export", () => {
+  it("holds a pending title out of export and uses only a title bound to the saved chapter", async () => {
+    const test = library(); const book = (await importLibraryBooks(test.realm, [source(1)])).books[0]!;
+    await writeChapter(test, book);
+    const taskPath = `${book.absolutePath}/追踪/连载任务.json`;
+    test.files.set(taskPath, JSON.stringify({ status: "running", phase: "title", nextChapter: 1 }));
+    await expect(exportLibraryBooks(test.realm, [book.id])).rejects.toThrow("标题未完成");
+    const prose = test.files.get(`${book.absolutePath}/正文/第001章.md`)!;
+    const title = { chapter: 1, title: "她取回了那把旧钥匙，却发现上面刻着另一个人的编号", bodySha256: createHash("sha256").update(prose).digest("hex") };
+    const titlePath = `${book.absolutePath}/追踪/公众号标题/第001章.json`;
+    test.files.set(titlePath, JSON.stringify(title)); test.files.set(taskPath, JSON.stringify({ status: "completed", nextChapter: 2 }));
+    const outer = unzipSync(await exportLibraryBooks(test.realm, [book.id]));
+    const inner = unzipSync(outer[Object.keys(outer).find(name => name.endsWith(".zip"))!]!);
+    const chapter = strFromU8(inner[Object.keys(inner).find(name => name.startsWith("第001章"))!]!);
+    expect(chapter).toContain(`${title.title}\r\n书名：《第1本书》`);
+    expect(test.files.get(`${book.absolutePath}/正文/第001章.md`)).toBe(prose);
+    test.files.set(titlePath, JSON.stringify({ ...title, bodySha256: "wrong" }));
+    await expect(exportLibraryBooks(test.realm, [book.id])).rejects.toThrow("标题与正文不一致");
+  });
+  it("recycles and restores a completed book without changing its source, prose or progress", async () => {
+    const test = library();
+    const book = (await importLibraryBooks(test.realm, [source(1)])).books[0]!;
+    await writeChapter(test, book); await writeChapter(test, book, 2);
+    const before = new Map([...test.files].filter(([path]) => !path.endsWith("书项目.json")));
+    const deleted = await recycleLibraryBooks(test.realm, [book.id]);
+    expect(deleted.results).toEqual([{ id: book.id, ok: true }]);
+    expect(deleted.books).toHaveLength(0);
+    expect(deleted.archivedBooks?.[0]).toMatchObject({ id: book.id, completedChapters: 2, status: "archived" });
+    expect((await importLibraryBooks(test.realm, [source(1)])).results[0]?.error).toContain("回收站");
+    const zip = unzipSync(await exportLibraryBooks(test.realm, [book.id]));
+    expect(Object.keys(zip).some(name => name.endsWith("_全本.zip"))).toBe(true);
+    const restored = await recycleLibraryBooks(test.realm, [book.id], true);
+    expect(restored.books[0]).toMatchObject({ id: book.id, completedChapters: 2 });
+    expect(restored.archivedBooks).toHaveLength(0);
+    expect(new Map([...test.files].filter(([path]) => !path.endsWith("书项目.json")))).toEqual(before);
+  });
+
+  it("rejects running, paused and queue-reserved books, while processing safe selections", async () => {
+    const test = library();
+    const books = (await importLibraryBooks(test.realm, [source(1), source(2), source(3), source(4)])).books;
+    test.files.set(`${books[0]!.absolutePath}/追踪/连载任务.json`, JSON.stringify({ status: "running" }));
+    test.files.set(`${books[1]!.absolutePath}/追踪/连载任务.json`, JSON.stringify({ status: "paused" }));
+    test.files.set("/books/追踪/书库任务.json", JSON.stringify({ status: "running", books: [{ id: books[2]!.id, status: "pending" }] }));
+    const result = await recycleLibraryBooks(test.realm, books.map(book => book.id));
+    expect(result.results.map(item => item.ok)).toEqual([false, false, false, true]);
+    expect(result.archivedBooks).toHaveLength(1);
+    test.files.set(`${books[0]!.absolutePath}/追踪/连载任务.json`, JSON.stringify({ status: "stopped" }));
+    expect((await recycleLibraryBooks(test.realm, [books[0]!.id])).results[0]?.ok).toBe(true);
+  });
+
+  it("exports duplicate titles as distinct UTF-8 TXT files and names skipped empty books", async () => {
+    const test = library();
+    const books = (await importLibraryBooks(test.realm, [source(1), { ...source(1), text: source(1).text.replace("钥匙", "另一把钥匙") }, source(2)])).books;
+    await writeChapter(test, books[0]!); await writeChapter(test, books[1]!);
+    const before = new Map(test.files);
+    const zip = unzipSync(await exportLibraryBooks(test.realm, books.map(book => book.id)));
+    const names = Object.keys(zip).filter(name => name !== "导出说明.txt");
+    expect(names).toHaveLength(2);
+    expect(names.every(name => name.endsWith("未完结_已保存1章.zip"))).toBe(true);
+    for (const name of names) {
+      const inner = unzipSync(zip[name]!);
+      const chapterNames = Object.keys(inner).filter(item => item.startsWith("第"));
+      expect(chapterNames).toHaveLength(1);
+      const data = inner[chapterNames[0]!]!;
+      expect([...data.slice(0, 3)]).toEqual([239, 187, 191]);
+      const body = strFromU8(data);
+      expect(body).toContain("钥匙\r\n书名：《第1本书》\r\n第1章\r\n");
+      expect(body).not.toContain("【状态变更】");
+      expect(body).not.toContain("本章摘要");
+    }
+    expect(strFromU8(zip["导出说明.txt"]!)).toContain("未导出《第2本书》");
+    expect(test.files).toEqual(before);
+    await expect(exportLibraryBooks(test.realm, [books[2]!.id])).rejects.toThrow("没有可导出的正文");
+    test.files.set(`${books[0]!.absolutePath}/正文/第001章.md`, "作者在导出前另改了稿子");
+    await expect(exportLibraryBooks(test.realm, [books[0]!.id])).rejects.toThrow("校验未通过");
+  });
+
+  it("rejects arbitrary paths and unknown IDs without writing outside the selected library", async () => {
+    const test = library();
+    expect(() => selectedLibraryIds(["../../outside"])).toThrow("勾选");
+    const result = await recycleLibraryBooks(test.realm, ["0".repeat(64)]);
+    expect(result.results[0]?.ok).toBe(false);
+    expect(test.writes()).toBe(0);
+  });
+});
 
 describe("independent multi-book import", () => {
   it("imports ten files into ten isolated book roots, retains source bytes and lists after reload", async () => {

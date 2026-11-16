@@ -89,7 +89,7 @@ export function splitOriginalOutput(text: string): { prose: string; change: stri
 export function originalOutputIssues(prose: string, change: string, minChars: number, maxChars: number, previousHook = "", requiredPlants: readonly string[] = []): string[] {
   const issues: string[] = [];
   const chars = countSerialVisibleChars(prose);
-  if (chars < minChars || chars > maxChars) issues.push(`字数 ${String(chars)} 不在 ${String(minChars)}-${String(maxChars)} 区间，需增删到区间内。`);
+  if (chars < minChars || chars > maxChars) issues.push(maxChars === Number.MAX_SAFE_INTEGER ? `正文字数 ${String(chars)}，需超过1500字。` : `字数 ${String(chars)} 不在 ${String(minChars)}-${String(maxChars)} 区间，需增删到区间内。`);
   if (change === "") issues.push("缺少【状态变更】区块，必须按字段补齐。");
   if (extractOriginalField(change, "本章摘要") === "") issues.push("状态变更缺少「本章摘要」。");
   const hook = extractOriginalField(change, "章尾钩类型");
@@ -181,7 +181,7 @@ export async function commitOriginalOutput(realm: WorkspaceRealm, options: Origi
     const chars = countSerialVisibleChars(prose);
     const lastHook = ledger.original_state.recent.at(-1)?.hook_type ?? "";
     const requiredPlants = parseOriginalChapterPlan(options.chapterRaw ?? "").fb_plant;
-    const issues = originalOutputIssues(prose, change, options.minChars ?? 2300, options.maxChars ?? 2500, lastHook, requiredPlants);
+    const issues = originalOutputIssues(prose, change, 1501, Number.MAX_SAFE_INTEGER, lastHook, requiredPlants);
     const title = options.title?.trim() || `第${String(active.chapter)}章`;
     const path = await prosePath(realm, active.chapter);
     const suffix = `第${String(active.chapter).padStart(3, "0")}章.md`;

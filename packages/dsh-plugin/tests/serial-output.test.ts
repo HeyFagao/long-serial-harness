@@ -29,7 +29,7 @@ function fixture() {
   } as unknown as WorkspaceRealm;
   return { realm, files, writes: () => writes, failOn: (n?: number) => { failAt = n; }, ledger: () => JSON.parse(files.get("追踪/_tracking-state.json")!) as OriginalTrackingLedger };
 }
-function reply(chapter = 1, body = "她走进屋里取来钥匙。".repeat(60)): string {
+function reply(chapter = 1, body = "她走进屋里取来钥匙。".repeat(180)): string {
   return `第${String(chapter)}章 旧钥匙\n\n${body}\n\n【状态变更】\n本章摘要：发现钥匙的编号。\n实际字数：600\n章尾钩类型：疑问${String(chapter % 2)}\n人物：\n林青：知道钥匙被换过，尚不知道来人的名字。\n伏笔：\nFB001：新埋，发现钥匙柄的编号。\n时间：半小时\n与章纲不同的地方及原因：无\n下一章必须接住的事：确认编号来源。`;
 }
 function options(chapter = 1, attempt = 1): OriginalOutputOptions {
@@ -38,6 +38,14 @@ function options(chapter = 1, attempt = 1): OriginalOutputOptions {
 }
 
 describe("original plain-text output host transaction", () => {
+  it("accepts 1501 and 2524 characters despite the old suggested range, but rejects 1500", async () => {
+    for (const count of [1500, 1501, 2524, 8000]) {
+      const f = fixture();
+      const text = reply(1, "字".repeat(count)).replace("第1章 旧钥匙\n\n", "");
+      const result = await commitOriginalOutput(f.realm, { ...options(), text, minChars: 2300, maxChars: 2500 });
+      expect(result.accepted).toBe(count > 1500);
+    }
+  });
   it("splits the original two-block contract without including state in prose", () => {
     expect(splitOriginalOutput("\n正文\n\n【状态变更】\n本章摘要：全文\n")).toEqual({ prose: "正文", change: "【状态变更】\n本章摘要：全文" });
     expect(splitOriginalOutput("只有正文")).toEqual({ prose: "只有正文", change: "" });

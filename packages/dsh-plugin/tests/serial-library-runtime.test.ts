@@ -87,6 +87,45 @@ function fixture(lengths: readonly number[]) {
 }
 
 describe("durable multi-book generation", () => {
+  it("runs all ten books together and stops/resumes every admitted book", async () => {
+    const f = fixture(Array<number>(10).fill(20)); f.hold(true);
+    const queue = new SerialLibraryRuntime(f.adapter);
+    await queue.start(10, {}, "all");
+    await until(() => f.starts.length === 10);
+    expect(f.maxActive()).toBe(10);
+    const id = queue.snapshot()!.id;
+    await queue.pause(); await until(() => queue.snapshot()?.status === "paused");
+    expect([...f.owners.values()].every(task => task.status === "paused")).toBe(true);
+    await queue.resume(); await until(() => [...f.owners.values()].every(task => task.status === "running"));
+    await queue.stop();
+    expect([...f.owners.values()].every(task => task.status === "stopped")).toBe(true);
+    f.hold(false); await queue.resume(); await until(() => queue.snapshot()?.status === "completed");
+    expect(queue.snapshot()!.id).toBe(id); expect(f.starts).toHaveLength(10);
+    expect(f.totals).toEqual(Array(10).fill(10)); queue.dispose();
+  });
+  it("honors a custom concurrency and refills free slots", async () => {
+    const f = fixture([2, 8, 4, 10, 3]); const queue = new SerialLibraryRuntime(f.adapter);
+    await queue.start("all", {}, 3); await until(() => queue.snapshot()?.status === "completed");
+    expect(f.maxActive()).toBe(3); expect(f.totals).toEqual([2, 8, 4, 10, 3]); queue.dispose();
+  });
+  it("stops all already running books on a shared provider failure", async () => {
+    const f = fixture([20, 20, 20]); f.hold(true); const queue = new SerialLibraryRuntime(f.adapter);
+    await queue.start(10, {}, "all"); await until(() => f.starts.length === 3);
+    f.errors.set("0", "HTTP 429"); f.hold(false);
+    await until(() => queue.snapshot()?.status === "blocked");
+    expect([...f.owners.values()].every(task => task.status === "stopped")).toBe(true);
+    f.errors.clear(); await queue.resume(); await until(() => queue.snapshot()?.status === "completed");
+    expect(f.totals).toEqual([10, 10, 10]); queue.dispose();
+  });
+  it("restores all concurrent owners and preserves the chosen concurrency", async () => {
+    const f = fixture([20, 20, 20]); f.hold(true); const first = new SerialLibraryRuntime(f.adapter);
+    await first.start(10, {}, "all"); await until(() => f.saved()?.books.every(book => book.serialTaskId !== undefined) === true);
+    first.dispose(); for (const task of f.owners.values()) task.status = "paused";
+    const next = new SerialLibraryRuntime(f.adapter); await next.restore();
+    expect(next.snapshot()?.concurrency).toBe("all"); expect(next.snapshot()?.status).toBe("paused");
+    f.hold(false); await next.resume(); await until(() => next.snapshot()?.status === "completed");
+    expect(f.totals).toEqual([10, 10, 10]); expect(f.starts).toHaveLength(3); next.dispose();
+  });
   it("adds 10, then 20, then finishes ten independent books without overrun", async () => {
     const f = fixture([32, 32, ...Array<number>(8).fill(11)]);
     const queue = new SerialLibraryRuntime(f.adapter);

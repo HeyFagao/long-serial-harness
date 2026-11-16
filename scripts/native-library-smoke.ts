@@ -9,6 +9,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { zstdDecompressSync } from "node:zlib";
 import { chromium, type Browser, type Page, type Response as BrowserResponse } from "@playwright/test";
+import { unzipSync, strFromU8 } from "fflate";
 import { ORIGINAL_SYSTEM_PROMPT, ORIGINAL_SYSTEM_PROMPT_SHA256 } from "../packages/dsh-plugin/src/original-prompts.js";
 import type { LibraryBook, LibrarySnapshot } from "../packages/dsh-plugin/src/serial-library.js";
 import type { LibraryTask } from "../packages/dsh-plugin/src/serial-library-runtime.js";
@@ -38,9 +39,10 @@ function sourceFor(key: string): string {
 interface WireMessage { readonly role?: string; readonly content?: unknown }
 interface Block { readonly type?: string; readonly text?: string }
 interface Answer { readonly key: string; readonly chapter: number; readonly sessionId: string; readonly text: string }
-interface ModelFixture { server: Server; baseURL: string; books: Map<string, LibraryBook>; answers: Answer[]; waiting: Set<string>; holds: Set<string>; failures: string[]; requests: number; shortDraft?: { readonly text: string; readonly sessionId: string }; rewritePassed: boolean }
+interface ModelFixture { server: Server; baseURL: string; books: Map<string, LibraryBook>; answers: Answer[]; titles: Answer[]; titleRetried: boolean; waiting: Set<string>; holds: Set<string>; failures: string[]; requests: number; shortDraft?: { readonly text: string; readonly sessionId: string }; rewritePassed: boolean }
 function blocks(message: WireMessage): readonly Block[] { return Array.isArray(message.content) ? message.content as Block[] : typeof message.content === "string" ? [{ type: "text", text: message.content }] : []; }
 async function assertPrompt(book: LibraryBook, key: string, chapter: number, prompt: string): Promise<void> {
+  assert(!prompt.includes("【微信公众号小说长标题】"), "Title instructions leaked into writing request");
   assert(prompt.startsWith(ORIGINAL_SYSTEM_PROMPT), "The original SYSTEM prompt was replaced or shortened");
   assert.equal(digest(ORIGINAL_SYSTEM_PROMPT), ORIGINAL_SYSTEM_PROMPT_SHA256);
   assert(prompt.includes("【本章细纲】") && prompt.includes("【发散等级】"), "Original USER template missing");
@@ -74,7 +76,7 @@ async function assertPrompt(book: LibraryBook, key: string, chapter: number, pro
   if (chapter > 11) assert(!attachment.includes(`沈宁抵达城南的第${String(chapter - 11)}天，`), "Older prose escaped the ten-chapter window");
 }
 async function startModel(): Promise<ModelFixture> {
-  const model: ModelFixture = { server: undefined as unknown as Server, baseURL: "", books: new Map(), answers: [], waiting: new Set(), holds: new Set(), failures: [], requests: 0, rewritePassed: false };
+  const model: ModelFixture = { server: undefined as unknown as Server, baseURL: "", books: new Map(), answers: [], titles: [], titleRetried: false, waiting: new Set(), holds: new Set(), failures: [], requests: 0, rewritePassed: false };
   const server = createServer((request, response) => {
     let body = "";
     // Full Chinese prose spans HTTP chunks; the streaming decoder preserves split UTF-8 codepoints.
@@ -86,6 +88,7 @@ async function startModel(): Promise<ModelFixture> {
         const payload = JSON.parse(body) as { readonly messages?: readonly WireMessage[] };
         const messages = payload.messages ?? [];
         const matching = messages.filter(message => message.role === "user").map(message => blocks(message).map(block => block.text ?? "").join("\n")).filter(text => /本轮只完成当前工作区这本书的第 \d+ 章/u.test(text));
+        const titlePrompts = messages.filter(message => message.role === "user").map(message => blocks(message).map(block => block.text ?? "").join("\n")).filter(text => text.includes("【独立标题任务】"));
         let text = "LIBRARY_SMOKE_READY";
         if (matching.length > 0) {
           assert.equal(matching.length, 1, "A fresh chapter inherited a prior chapter's prompt");
@@ -115,6 +118,24 @@ async function startModel(): Promise<ModelFixture> {
             text = deterministicNativeOutput({ bookKey: key, chapter });
             model.answers.push({ key, chapter, sessionId, text });
           }
+        }
+        if (titlePrompts.length > 0) {
+          assert.equal(titlePrompts.length, 1); assert.equal(matching.length, 0);
+          const prompt = titlePrompts[0]!;
+          assert(!prompt.includes(ORIGINAL_SYSTEM_PROMPT) && !prompt.includes("【本章细纲】") && !prompt.includes("_STYLE_START"), "Title request inherited writing context");
+          const key = /SMOKEBOOK\d{2}/u.exec(prompt)?.[0]; assert(key !== undefined && model.books.has(key));
+          const chapter = Number(/章号：(\d+)/u.exec(prompt)?.[1]);
+          const prose = await readFile(join(model.books.get(key)!.absolutePath, chapterPath(chapter)), "utf8");
+          const attached = prompt.slice(prompt.indexOf("<chapter_body>\n") + "<chapter_body>\n".length, prompt.lastIndexOf("\n</chapter_body>"));
+          assert.equal(attached, prose, "Title task must receive only this saved chapter in full");
+          const sessionId = request.headers["x-deepseek-harness-session-id"]; assert(typeof sessionId === "string");
+          assert(!model.answers.some(item => item.sessionId === sessionId));
+          if (!model.titleRetried) { text = "模拟标题格式失败"; model.titleRetried = true; }
+          else {
+            text = JSON.stringify({ title: `她核清第${String(chapter)}本账册，门外的无名信却送来了失踪的原始契约`, evidence: [prose.split("\n").find(line => line.includes("沈宁抵达"))!.slice(0, 40)] });
+            model.titles.push({ key, chapter, sessionId, text });
+          }
+          assert.equal(await readFile(join(model.books.get(key)!.absolutePath, chapterPath(chapter)), "utf8"), prose);
         }
         response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
         const events = [
@@ -199,7 +220,8 @@ async function checkBook(book: LibraryBook, key: string): Promise<void> {
 async function checkNativeChildren(home: string, model: ModelFixture): Promise<void> {
   const directory = join(home, "sessions"); const files = await readdir(directory, { recursive: true });
   assert.equal(new Set(model.answers.map(answer => answer.sessionId)).size, 152);
-  for (const answer of model.answers) {
+  assert.equal(new Set([...model.answers, ...model.titles].map(answer => answer.sessionId)).size, 304);
+  for (const answer of [...model.answers, ...model.titles]) {
     const file = files.find(path => path.endsWith(`${answer.sessionId}/session.v4.jsonl.zstd`)); assert(file !== undefined);
     const lines = zstdDecompressSync(await readFile(join(directory, file))).toString("utf8").trim().split("\n");
     const header = JSON.parse(lines[0]!) as { readonly parentSession: string; readonly origin: string; readonly isSeeded: boolean; readonly agentPreset: string; readonly cwd?: string };
@@ -299,6 +321,8 @@ async function main(): Promise<void> {
       for (const name of ["library-failure.log", "library-failure.png", "library-failure-aria.txt"]) await rm(join(evidence, name), { force: true });
       await writeFile(join(evidence, "library-import-smoke.json"), `${JSON.stringify(report, null, 2)}\n`); process.stdout.write(`${JSON.stringify(report)}\n`); passed = true; return;
     }
+    await page.getByLabel("书间并发模式").selectOption("custom");
+    await page.getByLabel("同时生成的书数").fill("1");
     const blocked = model.books.get(keys[9]!)!; const blockedStyle = join(blocked.absolutePath, "设定/文风.md"); const style = await readFile(blockedStyle); await rm(blockedStyle);
     model.holds.add(`${keys[0]!}/1`); await clickQueue(page, "所有项目新增 10 章");
     const started = (await queue(origin, sessionId))!; assert.equal(started.count, 10);
@@ -317,12 +341,16 @@ async function main(): Promise<void> {
     assert.equal(partial.books.find(book => book.status === "failed")?.id, blocked.id);
     await writeFile(blockedStyle, style); await queue(origin, sessionId, { action: "resume" });
     const firstDone = await waitQueue(origin, sessionId, task => task.status === "completed"); assert(firstDone.books.every(book => book.status === "completed" && book.completedChapters === 10)); assert.equal(model.answers.length, 100);
-    model.holds.add(`${keys[0]!}/11`);
-    const secondStarted = (await queue(origin, sessionId, { action: "start", count: 20 }))!;
+    for (const key of keys) model.holds.add(`${key}/11`);
+    const secondStarted = (await queue(origin, sessionId, { action: "start", count: 20, concurrency: "all" }))!;
     await waitNativeRequest(origin, sessionId, model, `${keys[0]!}/11`);
+    await waitFor(async () => keys.every(key => model!.waiting.has(`${key}/11`)), "ten simultaneous native chapter requests");
+    const recycleActive = await dshFetch(`${origin}/oh-story/library?sessionId=${encodeURIComponent(sessionId)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "archive", ids: [model.books.get(keys[0]!)!.id] }) });
+    const recycleActiveResult = await recycleActive.json() as { results: { ok: boolean }[] };
+    assert.equal(recycleActiveResult.results[0]?.ok, false, "Active model task must prevent recycling");
     await queue(origin, sessionId, { action: "stop" }); await waitQueue(origin, sessionId, task => task.status === "stopped");
     await waitFor(async () => !model!.waiting.has(`${keys[0]!}/11`), "stopped native model response cancellation"); assert.equal(model.answers.length, 100);
-    model.holds.delete(`${keys[0]!}/11`);
+    for (const key of keys) model.holds.delete(`${key}/11`);
     const secondResumed = (await queue(origin, sessionId, { action: "resume" }))!;
     assert.equal(secondResumed.id, secondStarted.id); assert.deepEqual(secondResumed.books.map(book => [book.id, book.startChapter, book.targetChapter]), secondStarted.books.map(book => [book.id, book.startChapter, book.targetChapter]));
     const secondDone = await waitQueue(origin, sessionId, task => task.status === "completed"); assert(secondDone.books.every(book => book.startChapter === 11)); assert.equal(model.answers.length, 148);
@@ -334,9 +362,16 @@ async function main(): Promise<void> {
       const book = model.books.get(key)!; await checkBook(book, key);
       const serialTask = JSON.parse(await readFile(join(book.absolutePath, "追踪/连载任务.json"), "utf8")) as { readonly ownerSessionId: string };
       const exported = await dshFetch(`${origin}/oh-story/serial/export?sessionId=${encodeURIComponent(serialTask.ownerSessionId)}`); assert.equal(exported.status, 200);
-      const text = await exported.text(); assert(!text.includes("【状态变更】")); assert(text.includes(`第${String(totalFor(key))}章 ${key}的账册`));
-      assert.deepEqual([...new Set(text.match(/SMOKEBOOK\d{2}/gu))], [key]);
+      assert.equal(exported.headers.get("content-type"), "application/zip");
+      const chapterZip = unzipSync(new Uint8Array(await exported.arrayBuffer()));
+      const chapterFiles = Object.keys(chapterZip).filter(name => name.startsWith("第")); assert.equal(chapterFiles.length, totalFor(key));
+      for (const name of chapterFiles) {
+        const text = strFromU8(chapterZip[name]!); assert(!text.includes("【状态变更】"));
+        assert(text.includes(`书名：《${titleFor(key)}》`)); assert(text.includes("门外的无名信"));
+        assert.deepEqual([...new Set(text.match(/SMOKEBOOK\d{2}/gu))], [key]);
+      }
     }
+    assert.equal(model.titles.length, 152); assert(model.titleRetried);
     await checkNativeChildren(home, model);
     assert(model.rewritePassed && model.shortDraft !== undefined);
     const backupRoot = join(model.books.get(keys[0]!)!.absolutePath, "追踪/连载修订");
@@ -350,8 +385,41 @@ async function main(): Promise<void> {
     await reopened.getByRole("treeitem").filter({ hasText: "书库验收会话" }).first().click();
     await reopened.locator(`[data-conversation-session="${sessionId}"]`).waitFor({ state: "visible", timeout: 20_000 });
     await waitFor(async () => await reopened.getByRole("list", { name: "小说项目列表" }).getByRole("listitem").count() === 10, "reopened persistent library");
+    await reopened.getByRole("button", { name: "选择已完本", exact: true }).click();
+    const downloadPromise = reopened.waitForEvent("download");
+    await reopened.getByRole("button", { name: "批量导出 TXT", exact: true }).click();
+    const download = await downloadPromise;
+    const downloadPath = join(evidence, "library-txt-export.zip"); await download.saveAs(downloadPath);
+    const zip = unzipSync(await readFile(downloadPath));
+    const txtNames = Object.keys(zip).filter(name => name !== "导出说明.txt"); assert.equal(txtNames.length, 10);
+    let chapterTxtCount = 0;
+    for (const name of txtNames) {
+      assert(name.endsWith("_全本.zip")); const chapters = unzipSync(zip[name]!);
+      const names = Object.keys(chapters).filter(filename => filename.startsWith("第")); chapterTxtCount += names.length;
+      for (const filename of names) {
+        const txt = strFromU8(chapters[filename]!);
+        const bookKeys = [...new Set(txt.match(/SMOKEBOOK\d{2}/gu))]; assert.equal(bookKeys.length, 1);
+        assert(txt.includes("书名：《") && txt.includes("门外的无名信")); assert(!txt.includes("【状态变更】"));
+      }
+    }
+    assert.equal(chapterTxtCount, 152);
+    const proseBefore = await Promise.all(keys.map(key => readFile(join(model!.books.get(key)!.absolutePath, chapterPath(1)), "utf8")));
+    await reopened.getByRole("button", { name: "删除所选书", exact: true }).click();
+    await reopened.getByRole("button", { name: "确认移入回收站", exact: true }).click();
+    const librarySnapshot = async (): Promise<LibrarySnapshot> => {
+      const response = await dshFetch(`${origin}/oh-story/library?sessionId=${encodeURIComponent(sessionId)}`); assert.equal(response.status, 200); return await response.json() as LibrarySnapshot;
+    };
+    await waitFor(async () => (await librarySnapshot()).archivedBooks?.length === 10, "recycled ten complete books");
+    assert.equal((await librarySnapshot()).books.length, 0);
+    await reopened.getByText("回收站 · 10 本", { exact: true }).click();
+    await reopened.getByRole("button", { name: `恢复 ${titleFor(keys[0]!)}`, exact: true }).click();
+    await waitFor(async () => (await librarySnapshot()).books.length === 1, "restored book from UI");
+    const restoreOthers = await dshFetch(`${origin}/oh-story/library?sessionId=${encodeURIComponent(sessionId)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "restore", ids: keys.slice(1).map(key => model!.books.get(key)!.id) }) }); assert.equal(restoreOthers.status, 200);
+    await waitFor(async () => await reopened.getByRole("list", { name: "小说项目列表" }).getByRole("listitem").count() === 10, "restored ten books");
+    assert.deepEqual(await Promise.all(keys.map(key => readFile(join(model!.books.get(key)!.absolutePath, chapterPath(1)), "utf8"))), proseBefore);
+    for (const key of keys) await checkBook(model.books.get(key)!, key);
     await reopened.screenshot({ path: join(evidence, "library-complete.png"), animations: "disabled" }); assert.equal(pageErrors.length, 0, pageErrors.join("\n"));
-    const report = { ok: true, dshVersion: version, pluginSha256, provider: "local-deterministic-text-fixture", realPaidModel: false, importedBooks: 10, registeredNativeWorkspaces: 10, separateProjectDirectories: 10, batches: [{ count: 10, accepted: 100 }, { count: 20, accepted: 48 }, { count: "all", accepted: 4 }], acceptedChapters: 152, freshNativeChapterSessions: 152, hostCommittedTextAndState: "passed", originalSystemSha256: ORIGINAL_SYSTEM_PROMPT_SHA256, originalRewriteAndBackup: "passed", fullStyleAndPreviousTen: "passed", bookIsolation: "passed", exportedBooks: 10, failedBookIsolationAndRetry: "passed", pauseResume: "passed", stopResumeFixedTargets: "passed", duplicateStart: "passed", nativeHostRestart: "passed", browserCloseAndReopen: "passed", novelOnlyPackageAndUI: "passed", outsideSymlinkImport: "rejected-without-outside-writes", modelToolCalls: 0, literaryQuality: "not assessed" };
+    const report = { ok: true, simultaneousNativeRequests: 10, dshVersion: version, pluginSha256, provider: "local-deterministic-text-fixture", realPaidModel: false, importedBooks: 10, registeredNativeWorkspaces: 10, separateProjectDirectories: 10, batches: [{ count: 10, accepted: 100 }, { count: 20, accepted: 48 }, { count: "all", accepted: 4 }], acceptedChapters: 152, freshNativeChapterSessions: 152, independentTitleSessions: 152, titleContextIsolation: "passed-current-chapter-only", titleRetryWithoutRewritingProse: "passed", chapterTxtFiles: 152, hostCommittedTextAndState: "passed", originalSystemSha256: ORIGINAL_SYSTEM_PROMPT_SHA256, originalRewriteAndBackup: "passed", fullStyleAndPreviousTen: "passed", bookIsolation: "passed", exportedBooks: 10, batchTxtZipDownload: "passed-10-book-zips-152-chapter-txts", recycleAndRestore: "passed-10-books-prose-unchanged", activeBookRecycle: "rejected", failedBookIsolationAndRetry: "passed", pauseResume: "passed", stopResumeFixedTargets: "passed", duplicateStart: "passed", nativeHostRestart: "passed", browserCloseAndReopen: "passed", novelOnlyPackageAndUI: "passed", outsideSymlinkImport: "rejected-without-outside-writes", modelToolCalls: 0, literaryQuality: "not assessed" };
     await writeFile(join(evidence, "library-smoke.json"), `${JSON.stringify(report, null, 2)}\n`); for (const name of ["library-failure.log", "library-failure.png", "library-failure-aria.txt"]) await rm(join(evidence, name), { force: true });
     process.stdout.write(`${JSON.stringify(report)}\n`); passed = true;
   } catch (error) {

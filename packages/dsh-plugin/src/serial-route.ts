@@ -1,3 +1,5 @@
+import { buildWechatTitlePrompt, parseWechatTitleOutput } from "./wechat-title.js";
+import { createChapterZip, safeExportName, type ExportBook, type ExportChapter } from "./serial-export.js";
 import { createHash, randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Context } from "@deepseek-ai/cordis";
@@ -359,7 +361,23 @@ export function createSerialAdapter(context: Context, realm: WorkspaceRealm): Se
     if (current.cwd !== realm.cwd || current.root.targetKey !== realm.root.targetKey) throw new WorkspaceHttpError(409, "原生会话的工作目录已改变，请在原写作项目恢复连载。");
     realm = current;
   };
+  const requireAvailableBook = async () => {
+    const receipt = await optionalText(realm, "追踪/书项目.json");
+    if (receipt !== undefined && (JSON.parse(receipt) as { archivedAt?: unknown }).archivedAt !== undefined) throw new WorkspaceHttpError(409, "本书已在回收站，请先从书库恢复再继续生成。");
+  };
   const native = createNativeSerialController(context, async () => { await refresh(); return realm; });
+  const titleNative = createNativeSerialController(context, async () => { await refresh(); return realm; }, "公众号标题");
+  const titleSource = async (chapter: number) => {
+    await refresh(); await requireAvailableBook();
+    const path = (await chapterPaths(realm, "prose")).get(chapter);
+    const prose = path === undefined ? undefined : await optionalText(realm, path);
+    if (prose === undefined || prose.trim() === "" || committedChapter(await readTracking(realm)) < chapter) throw new WorkspaceHttpError(409, "本章正文尚未保存验收，不能起标题。");
+    const tracking = await readTracking(realm);
+    const record = await optionalText(realm, `追踪/逐章记录/第${String(chapter).padStart(3, "0")}章.md`);
+    const checked = validateSerialChapter({ chapter, prose, trackingState: tracking, chapterRecord: record });
+    if (!checked.ok) throw new WorkspaceHttpError(409, `标题生成前正文校验失败：${checked.issues.join("；")}`);
+    return { prose, hash: createHash("sha256").update(prose).digest("hex"), title: (await outlineSummary(realm))?.title ?? "长篇连载" };
+  };
   return {
     ownerSessionId: realm.sessionId,
     cwd: realm.cwd,
@@ -371,7 +389,10 @@ export function createSerialAdapter(context: Context, realm: WorkspaceRealm): Se
       if (await realm.fs.stat(target) === undefined) return null;
       const current = await readVersionedFile(realm.fs, target, MAX_BYTES);
       version = current.version;
-      try { currentTask = JSON.parse(current.content) as SerialTask; return currentTask; }
+      try { currentTask = JSON.parse(current.content) as SerialTask;
+        currentTask.maxAttempts = 6;
+        if (currentTask.attemptLimits !== undefined) for (const chapter of Object.keys(currentTask.attemptLimits)) currentTask.attemptLimits[chapter] = Math.max(6, currentTask.attemptLimits[chapter]!);
+        return currentTask; }
       catch { throw new WorkspaceHttpError(409, "连载任务记录损坏，保留原文件，请先修复后恢复。"); }
     },
     async save(task) {
@@ -382,6 +403,7 @@ export function createSerialAdapter(context: Context, realm: WorkspaceRealm): Se
     },
     async plan() {
       await refresh();
+      await requireAvailableBook();
       const tracking = await readTracking(realm);
       const through = committedChapter(tracking);
       const importedThrough = importedThroughChapter(tracking);
@@ -396,7 +418,7 @@ export function createSerialAdapter(context: Context, realm: WorkspaceRealm): Se
       }
       return { nextChapter: through + 1, chapters: [...(await chapterPaths(realm, "outline")).keys()].sort((a, b) => a - b) };
     },
-    async inspect(chapter, minChars, maxChars) {
+    async inspect(chapter) {
       await refresh();
       if (currentTask !== null) await verifySerialIntegrity(realm, currentTask.id, chapter - 1, currentTask.active === undefined && currentTask.completed.length === 0 && currentTask.nextChapter === currentTask.startChapter, true);
       const path = (await chapterPaths(realm, "prose")).get(chapter);
@@ -404,7 +426,7 @@ export function createSerialAdapter(context: Context, realm: WorkspaceRealm): Se
       const prose = await optionalText(realm, path);
       const record = await optionalText(realm, `追踪/逐章记录/第${String(chapter).padStart(3, "0")}章.md`);
       const trackingState = await readTracking(realm);
-      const result = validateSerialChapter({ chapter, prose: prose ?? "", trackingState, chapterRecord: record, ...(minChars === undefined ? {} : { minChars }), ...(maxChars === undefined ? {} : { maxChars }) });
+      const result = validateSerialChapter({ chapter, prose: prose ?? "", trackingState, chapterRecord: record, minChars: 1501, maxChars: Number.MAX_SAFE_INTEGER });
       const repairable = isOriginalTrackingLedger(trackingState)
         ? trackingState.last_committed_chapter === chapter - 1 && trackingState.pending_chapters[String(chapter)]?.taskId === currentTask?.id
         : typeof trackingState === "object" && trackingState !== null && "schema_version" in trackingState && trackingState.schema_version === 4
@@ -417,7 +439,33 @@ export function createSerialAdapter(context: Context, realm: WorkspaceRealm): Se
       if (currentTask === null) throw new WorkspaceHttpError(409, "缺少当前连载任务，未创建修订备份。");
       return prepareSerialRepair(realm, chapter, attempt, issues, currentTask.id);
     },
-    ...native,
+    state: active => (currentTask?.phase === "title" ? titleNative : native).state(active),
+    cancel: active => (currentTask?.phase === "title" ? titleNative : native).cancel(active),
+    async inspectTitle(chapter) {
+      const source = await titleSource(chapter);
+      const saved = await optionalText(realm, `追踪/公众号标题/第${String(chapter).padStart(3, "0")}章.json`);
+      if (saved === undefined) return false;
+      const title = JSON.parse(saved) as { chapter?: number; bodySha256?: string; title?: string };
+      if (title.chapter !== chapter || title.bodySha256 !== source.hash || typeof title.title !== "string" || title.title.trim() === "") throw new WorkspaceHttpError(409, "公众号标题记录与本章正文不一致，已保留原稿，请核对。");
+      return true;
+    },
+    async dispatchTitle(active) {
+      const source = await titleSource(active.chapter);
+      await titleNative.dispatch(active, buildWechatTitlePrompt(source.title, active.chapter, source.prose));
+    },
+    async finalizeTitle(active, observation) {
+      const source = await titleSource(active.chapter);
+      let title;
+      try { title = parseWechatTitleOutput(observation.finalText, source.prose); }
+      catch (error) { return { ok: false, issue: error instanceof Error ? error.message : String(error) }; }
+      const path = `追踪/公众号标题/第${String(active.chapter).padStart(3, "0")}章.json`;
+      const content = `${JSON.stringify({ schemaVersion: 1, chapter: active.chapter, ...title, bodySha256: source.hash, sessionId: active.sessionId }, null, 2)}\n`;
+      const existing = await optionalText(realm, path);
+      if (existing !== undefined) {
+        if (existing !== content) throw new WorkspaceHttpError(409, "本章已有其他标题记录，未覆盖。");
+      } else await realm.fs.writeText(await creativeTarget(realm, path), content, { kind: "createIfAbsent" }, undefined, realm.sandboxPolicy.resolve({ session: realm.agent.session }));
+      return { ok: true };
+    },
     async finalize(active, observation) {
       await refresh();
       if (currentTask === null || currentTask.active?.sessionId !== active.sessionId) throw new WorkspaceHttpError(409, "连载任务与待保存章节不一致，未改写正文。");
@@ -431,12 +479,12 @@ export function createSerialAdapter(context: Context, realm: WorkspaceRealm): Se
         ...(outline?.title === undefined ? {} : { bookTitle: outline.title }),
         totalChapters: outline?.totalChapters ?? currentTask.targetChapter,
         ...(chapterTitle === undefined ? {} : { title: chapterTitle }),
-        ...(currentTask.minChars === undefined ? {} : { minChars: currentTask.minChars }),
-        ...(currentTask.maxChars === undefined ? {} : { maxChars: currentTask.maxChars })
+        minChars: 1501, maxChars: Number.MAX_SAFE_INTEGER
       });
     },
     async dispatch(active) {
       await refresh();
+      await requireAvailableBook();
       if (currentTask === null || currentTask.active?.sessionId !== active.sessionId) throw new WorkspaceHttpError(409, "连载任务与待派发章节不一致，未调用模型。");
       const references = await prepareSerialReferenceContext(realm, active.chapter, currentTask.id, true);
       const originalContext = await prepareOriginalChapterContext(realm, active.chapter, references);
@@ -466,13 +514,16 @@ export function createSerialAdapter(context: Context, realm: WorkspaceRealm): Se
   };
 }
 
-async function exportSerial(realm: WorkspaceRealm, response: ServerResponse): Promise<void> {
+export async function exportSerialChapters(realm: WorkspaceRealm): Promise<ExportBook> {
   const tracking = await readTracking(realm);
-  const through = committedChapter(tracking);
+  const committedThrough = committedChapter(tracking);
+  const taskRaw = await optionalText(realm, TASK_PATH);
+  const task = taskRaw === undefined ? undefined : JSON.parse(taskRaw) as { phase?: string; nextChapter?: number };
+  const through = task?.phase === "title" && Number.isSafeInteger(task.nextChapter) ? Math.min(committedThrough, task.nextChapter! - 1) : committedThrough;
   const importedThrough = importedThroughChapter(tracking);
   const paths = await chapterPaths(realm, "prose");
   requireCommittedChapterFiles(paths, through);
-  const chapters: string[] = [];
+  const chapters: ExportChapter[] = [];
   let bytes = 0;
   for (const chapter of [...paths.keys()].filter(number => number <= through).sort((a, b) => a - b)) {
     const prose = await optionalText(realm, paths.get(chapter)!);
@@ -483,12 +534,25 @@ async function exportSerial(realm: WorkspaceRealm, response: ServerResponse): Pr
     } else if ((prose ?? "").trim() === "") throw new WorkspaceHttpError(409, `已导入的第 ${String(chapter)} 章正文为空，暂不导出。`);
     bytes += Buffer.byteLength(prose!);
     if (bytes > 64 * 1024 * 1024) throw new WorkspaceHttpError(413, "合并正文超过 64 MB，请分卷导出。");
-    chapters.push(prose!.trim());
+    const headlineRaw = await optionalText(realm, `追踪/公众号标题/第${String(chapter).padStart(3, "0")}章.json`);
+    let headline: string | undefined;
+    if (headlineRaw !== undefined) {
+      const saved = JSON.parse(headlineRaw) as { chapter?: number; bodySha256?: string; title?: string };
+      if (saved.chapter !== chapter || saved.bodySha256 !== createHash("sha256").update(prose!).digest("hex") || typeof saved.title !== "string" || saved.title.trim() === "") throw new WorkspaceHttpError(409, `第${String(chapter)}章公众号标题与正文不一致，暂不导出。`);
+      headline = saved.title;
+    }
+    chapters.push({ number: chapter, prose: prose!.trim(), ...(headline === undefined ? {} : { headline }) });
   }
-  if (chapters.length === 0) throw new WorkspaceHttpError(409, "还没有通过追踪校验的已完成章节。");
-  const title = (await outlineSummary(realm))?.title ?? "长篇连载";
-  const body = `\uFEFF${title}\n\n${chapters.join("\n\n\n")}\n`;
-  response.writeHead(200, { "content-type": "text/plain; charset=utf-8", "content-length": Buffer.byteLength(body), "content-disposition": `attachment; filename="novel.txt"; filename*=UTF-8''${encodeURIComponent(`${title.replace(/[\\/:*?"<>|\r\n]/gu, "_")}.txt`)}`, "cache-control": "no-store", "x-content-type-options": "nosniff" });
+  if (chapters.length === 0) throw new WorkspaceHttpError(409, "还没有可导出的已完成章节；若正文已保存但标题未完成，请先恢复标题任务。");
+  const outline = await outlineSummary(realm);
+  return { title: outline?.title ?? "长篇连载", totalChapters: outline?.totalChapters ?? through, chapters };
+}
+
+async function exportSerial(realm: WorkspaceRealm, response: ServerResponse): Promise<void> {
+  const book = await exportSerialChapters(realm);
+  const body = createChapterZip(book);
+  const name = `${safeExportName(book.title)}_${book.chapters.length >= book.totalChapters ? "全本" : `未完结_已保存${String(book.chapters.length)}章`}.zip`;
+  response.writeHead(200, { "content-type": "application/zip", "content-length": body.length, "content-disposition": `attachment; filename="book-chapters.zip"; filename*=UTF-8''${encodeURIComponent(name)}`, "cache-control": "no-store", "x-content-type-options": "nosniff" });
   response.end(body);
 }
 

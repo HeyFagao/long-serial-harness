@@ -1,9 +1,11 @@
+import { createChapterZip } from "./serial-export.js";
 import { createHash } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Context } from "@deepseek-ai/cordis";
 import type { FsTarget, FsVersion } from "@deepseek-ai/dsh-fs";
 import { parseSerialOutline } from "./serial-outline.js";
-import { importSerialOutline } from "./serial-route.js";
+import { zipSync, strToU8 } from "fflate";
+import { exportSerialChapters, importSerialOutline } from "./serial-route.js";
 import { jsonBody, mapFsError, readVersionedFile, send, workspaceRealmForSession, WorkspaceHttpError, type WorkspaceRealm } from "./workspace-route.js";
 import { isTrustedWorkspaceRequest } from "./workspace-request-trust.js";
 
@@ -33,6 +35,7 @@ interface BookReceipt {
   readonly relativePath: string;
   readonly totalChapters: number;
   readonly status: "importing" | "ready";
+  readonly archivedAt?: string;
 }
 export interface LibrarySnapshot {
   readonly libraryPath: string;
@@ -40,6 +43,7 @@ export interface LibrarySnapshot {
   readonly isBookProject: boolean;
   readonly books: readonly LibraryBook[];
   readonly limits: typeof LIBRARY_LIMITS;
+  readonly archivedBooks?: readonly LibraryBook[];
 }
 export interface LibraryImportResult {
   readonly filename: string;
@@ -94,7 +98,7 @@ async function bookView(realm: WorkspaceRealm, receipt: BookReceipt): Promise<Li
   return {
     id: receipt.id, title: receipt.title, filename: receipt.filename, absolutePath: realm.cwd,
     relativePath: receipt.relativePath, totalChapters: receipt.totalChapters, completedChapters,
-    status: receipt.status !== "ready" ? "incomplete" : typeof task?.value.status === "string" ? task.value.status : "ready",
+    status: receipt.archivedAt !== undefined ? "archived" : receipt.status !== "ready" ? "incomplete" : typeof task?.value.status === "string" ? task.value.status : "ready",
     ...(typeof task?.value.error === "string" ? { error: task.value.error } : {})
   };
 }
@@ -128,7 +132,7 @@ export async function listLibraryBooks(realm: WorkspaceRealm): Promise<LibrarySn
         error: error instanceof Error ? error.message : "本书记录不可读，请先处理此项目。" });
     }
   }
-  return { libraryPath: realm.cwd, isBookProject: false, books: books.sort((a, b) => a.title.localeCompare(b.title, "zh-Hans-CN") || a.id.localeCompare(b.id)), limits: LIBRARY_LIMITS };
+  return { libraryPath: realm.cwd, isBookProject: false, books: books.filter(book => book.status !== "archived").sort((a, b) => a.title.localeCompare(b.title, "zh-Hans-CN") || a.id.localeCompare(b.id)), archivedBooks: books.filter(book => book.status === "archived"), limits: LIBRARY_LIMITS };
 }
 
 export function validateLibraryInputs(value: unknown): readonly LibraryInputFile[] {
@@ -171,6 +175,7 @@ async function importBook(realm: WorkspaceRealm, file: LibraryInputFile): Promis
   if (previous !== undefined) {
     const stored = receiptOf(previous.value);
     if (stored.id !== id || stored.sourceSha256 !== sourceSha256 || stored.relativePath !== relativePath) throw new WorkspaceHttpError(409, "目标项目与当前输入不同，已保留原项目。");
+    if (stored.archivedAt !== undefined) throw new WorkspaceHttpError(409, "这本书已在回收站，请先恢复；重复导入不会覆盖或新建成稿。");
     if (stored.status === "ready") return { filename: file.filename, status: "existing", book: await bookView(child, stored) };
   } else {
     await realm.fs.writeText(await containedTarget(child, BOOK_RECEIPT), `${JSON.stringify(receipt, null, 2)}\n`, { kind: "createIfAbsent" }, undefined, realm.sandboxPolicy.resolve({ session: realm.agent.session }));
@@ -198,6 +203,71 @@ export async function importLibraryBooks(realm: WorkspaceRealm, files: readonly 
   return { ...await listLibraryBooks(realm), results };
 }
 
+export function selectedLibraryIds(value: unknown): readonly string[] {
+  if (!Array.isArray(value) || value.length === 0 || !value.every(id => typeof id === "string" && /^[a-f0-9]{64}$/u.test(id))) throw new WorkspaceHttpError(400, "请先勾选书项目。");
+  return [...new Set(value as string[])];
+}
+
+/** Reversible deletion: only mark the catalogue receipt; manuscripts and native sessions remain intact. */
+export async function recycleLibraryBooks(realm: WorkspaceRealm, ids: readonly string[], restore = false): Promise<LibrarySnapshot & { results: { id: string; ok: boolean; error?: string }[] }> {
+  const library = await listLibraryBooks(realm);
+  if (library.isBookProject) throw new WorkspaceHttpError(409, "请回到书库总览管理书项目。");
+  const queue = await readJson(realm, "追踪/书库任务.json");
+  const results: { id: string; ok: boolean; error?: string }[] = [];
+  for (const id of selectedLibraryIds(ids)) {
+    try {
+      const book = [...library.books, ...(library.archivedBooks ?? [])].find(item => item.id === id);
+      if (book === undefined) throw new WorkspaceHttpError(404, "书项目不在当前书库。");
+      const child = await realmForLibraryBook(realm, book.relativePath);
+      const stored = await readJson(child, BOOK_RECEIPT);
+      if (stored === undefined || stored.value.id !== id) throw new WorkspaceHttpError(409, "书项目记录已变化，请刷新后重试。");
+      const receipt = receiptOf(stored.value);
+      if (!restore) {
+        const task = await readJson(child, "追踪/连载任务.json");
+        if (task !== undefined && !["completed", "stopped"].includes(String(task.value.status))) throw new WorkspaceHttpError(409, "本书还有未结束的生成任务，请先停止该任务再移入回收站。");
+        const reserved = Array.isArray(queue?.value.books) ? queue.value.books.map(record).find(item => item?.id === id) : undefined;
+        if (queue !== undefined && !["completed", "stopped"].includes(String(queue.value.status)) && ["pending", "running"].includes(String(reserved?.status))) throw new WorkspaceHttpError(409, "本书已加入书库生成批次，请先停止该批次再移入回收站。");
+      }
+      const updated = { ...receipt };
+      if (restore) delete updated.archivedAt;
+      else updated.archivedAt ??= new Date().toISOString();
+      await realm.fs.writeText(await containedTarget(child, BOOK_RECEIPT), `${JSON.stringify(updated, null, 2)}\n`, { kind: "replaceIfVersion", version: stored.version }, undefined, realm.sandboxPolicy.resolve({ session: realm.agent.session }));
+      results.push({ id, ok: true });
+    } catch (error) { results.push({ id, ok: false, error: error instanceof Error ? error.message : "操作失败，原稿保留。" }); }
+  }
+  return { ...await listLibraryBooks(realm), results };
+}
+
+/** TXT snapshots contain only committed chapters; failed/empty books are named in the download manifest. */
+export async function exportLibraryBooks(realm: WorkspaceRealm, ids: readonly string[]): Promise<Uint8Array> {
+  const library = await listLibraryBooks(realm);
+  if (library.isBookProject) throw new WorkspaceHttpError(409, "请回到书库总览批量导出。");
+  const entries: Record<string, Uint8Array> = {};
+  const notes = ["批量导出说明", "仅导出已保存并通过校验的章节正文。生成中的后续章节不包含在本次快照中。", "导出不删除原稿。", ""];
+  let total = 0;
+  let exported = 0;
+  for (const [index, id] of selectedLibraryIds(ids).entries()) {
+    const book = [...library.books, ...(library.archivedBooks ?? [])].find(item => item.id === id);
+    if (book === undefined) { notes.push(`跳过未知项目 ${id.slice(0, 12)}`); continue; }
+    try {
+      const text = await exportSerialChapters(await realmForLibraryBook(realm, book.relativePath));
+      const complete = text.chapters.length >= book.totalChapters;
+      const filename = `${String(index + 1).padStart(3, "0")}_${folderTitle(book.title)}_${complete ? "全本" : `未完结_已保存${String(text.chapters.length)}章`}.zip`;
+      const data = createChapterZip(text);
+      total += text.chapters.reduce((sum, chapter) => sum + Buffer.byteLength(chapter.prose), 0);
+      if (total > 128 * 1024 * 1024) throw new WorkspaceHttpError(413, "本次正文合计超过128 MB，请减少勾选数量分批导出。");
+      entries[filename] = data; exported += 1;
+      notes.push(`${filename}：第1—${String(text.chapters.length)}章，共${String(book.totalChapters)}章大纲${complete ? "，已完本" : "，尚未完本"}。`);
+    } catch (error) {
+      if (error instanceof WorkspaceHttpError && error.status === 413) throw error;
+      notes.push(`未导出《${book.title}》：${error instanceof Error ? error.message : "读取失败"}`);
+    }
+  }
+  if (exported === 0) throw new WorkspaceHttpError(409, `所选书没有可导出的正文。${notes.slice(4).join("；")}`);
+  entries["导出说明.txt"] = strToU8(`\uFEFF${notes.join("\r\n")}\r\n`);
+  return zipSync(entries, { level: 0 });
+}
+
 export function registerLibraryRoute(context: Context, options: { readonly trustedHosts?: readonly string[] } = {}): void {
   const locks = new Map<string, Promise<unknown>>();
   context.effect(() => context.webServer.register({ kind: "exact", path: "/oh-story/library", async handler(request: IncomingMessage, response: ServerResponse) {
@@ -208,12 +278,24 @@ export function registerLibraryRoute(context: Context, options: { readonly trust
       if (request.method === "GET") { send(response, 200, await listLibraryBooks(realm)); return; }
       if (request.method !== "POST") throw new WorkspaceHttpError(405, "仅支持 GET 和 POST。");
       const input = await jsonBody(request, LIBRARY_LIMITS.maxTotalBytes * 3 + 65536);
-      const files = validateLibraryInputs(input.files);
+      const files = input.action === undefined ? validateLibraryInputs(input.files) : undefined;
       const key = realm.root.targetKey;
       const previous = locks.get(key) ?? Promise.resolve();
-      const current = previous.catch(() => undefined).then(() => importLibraryBooks(realm, files));
+      const current = previous.catch(() => undefined).then(async () => {
+        if (files !== undefined) return importLibraryBooks(realm, files);
+        const ids = selectedLibraryIds(input.ids);
+        if (input.action === "export") return exportLibraryBooks(realm, ids);
+        if (input.action === "archive" || input.action === "restore") return recycleLibraryBooks(realm, ids, input.action === "restore");
+        throw new WorkspaceHttpError(400, "未知书库管理操作。");
+      });
       locks.set(key, current);
-      try { send(response, 200, await current); }
+      try {
+        const result = await current;
+        if (result instanceof Uint8Array) {
+          response.writeHead(200, { "content-type": "application/zip", "content-length": result.length, "content-disposition": 'attachment; filename="novels-txt.zip"', "cache-control": "no-store", "x-content-type-options": "nosniff" });
+          response.end(result);
+        } else send(response, 200, result);
+      }
       finally { if (locks.get(key) === current) locks.delete(key); }
     } catch (error) {
       const mapped = error instanceof WorkspaceHttpError ? error : mapFsError(error);

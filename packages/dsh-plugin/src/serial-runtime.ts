@@ -26,6 +26,9 @@ export interface SerialTask {
   /** Absolute attempt ceilings; only an explicit human retry may extend one chapter's window. */
   attemptLimits?: Record<string, number>;
   active?: SerialActive;
+  phase?: "title";
+  titleActive?: SerialActive;
+  titleAttemptLimit?: number;
   error?: string;
   updatedAt: string;
   maxAttempts: number;
@@ -73,6 +76,9 @@ export interface SerialAdapter {
   state(active?: SerialActive): Promise<SerialObservation>;
   /** Persist a completed plain-text chapter through the host before accepting its receipt. */
   finalize?(active: SerialActive, observation: SerialObservation): Promise<void>;
+  inspectTitle?(chapter: number): Promise<boolean>;
+  dispatchTitle?(active: SerialActive): Promise<void>;
+  finalizeTitle?(active: SerialActive, observation: SerialObservation): Promise<{ ok: boolean; issue?: string }>;
   dispatch(active: SerialActive, prompt: string): Promise<void>;
   cancel(active: SerialActive): Promise<void>;
   makeId(): string;
@@ -140,6 +146,7 @@ export class SerialRuntime {
     await this.locked(async () => {
       this.task ??= await this.adapter.load();
       if (this.task !== null) assertSerialTask(this.task);
+      if (this.task?.phase === "title") throw new Error("本书正文已保存但当前章标题尚未完成，请恢复原批次继续起标题。");
       if (this.task !== null && RUNNING.has(this.task.status)) throw new Error("已有连载任务正在进行，请先暂停或停止。");
       if (this.task !== null && this.task.status !== "completed" && this.task.status !== "stopped") {
         this.owned();
@@ -165,8 +172,8 @@ export class SerialRuntime {
       const count = options.count === "all" ? contiguous : options.count;
       if (!Number.isSafeInteger(count) || count < 1 || count > 1000) throw new Error("本批章节数必须为 1–1000，或选择写完已导入的连续大纲。");
       if (count > contiguous) throw new Error(`从第 ${String(start)} 章起只有 ${String(contiguous)} 章连续细纲，请先补齐本批大纲。`);
-      const maxAttempts = options.maxAttempts ?? 3;
-      if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 3) throw new Error("重试次数必须为 1–3。");
+      const maxAttempts = options.maxAttempts ?? 6;
+      if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 6) throw new Error("重试次数必须为 1–6。");
       if ((options.minChars === undefined) !== (options.maxChars === undefined)) throw new Error("自定义字数范围需要同时填写最少和最多字数，也可以全部留空使用原有细纲设置。");
       for (const value of [options.minChars, options.maxChars]) {
         if (value !== undefined && (!Number.isSafeInteger(value) || value < 500 || value > 20000)) throw new Error("每章字数范围必须为 500–20000 的整数。");
@@ -207,12 +214,22 @@ export class SerialRuntime {
       const next = clone(this.owned());
       if (next.status === "completed") throw new Error("这批任务已经完成，请新建下一批。");
       if (RUNNING.has(next.status)) return;
-      const observation = await this.adapter.state(next.active);
+      const observation = await this.adapter.state(next.phase === "title" ? next.titleActive : next.active);
       if (observation.running || observation.pendingInput || observation.ownQueued === true) throw new Error("当前章节仍在运行或等待原生审批，请先在右侧对话中处理。");
-      if (next.active !== undefined) {
+      if (next.phase === "title" && next.titleActive !== undefined) {
+        if (await this.adapter.inspectTitle?.(next.nextChapter)) this.acceptChapter(next);
+        else if (observation.lastTurnReason === "completed" && !observation.externalInput && (await this.adapter.finalizeTitle?.(next.titleActive, observation))?.ok === true) this.acceptChapter(next);
+        else if (next.titleActive.dispatched || observation.requestKnown === true) {
+          if (options.allowRetryWindow && next.titleActive.attempt >= (next.titleAttemptLimit ?? 6)) next.titleAttemptLimit = next.titleActive.attempt + 6;
+          next.titleActive = this.reserveTitle(next, observation);
+        }
+      } else if (next.active !== undefined) {
         if (observation.lastTurnReason === "completed" && !observation.externalInput) await this.adapter.finalize?.(next.active, observation);
         const inspected = await this.adapter.inspect(next.active.chapter, next.minChars, next.maxChars);
-        if (inspected.ok) this.acceptChapter(next);
+        if (inspected.ok) {
+          if (this.adapter.dispatchTitle !== undefined) { next.phase = "title"; next.titleActive = this.reserveTitle(next, observation); }
+          else this.acceptChapter(next);
+        }
         else if (!next.active.dispatched && observation.requestKnown !== true) {
           // The process may have stopped before any model admission. Keep that reserved child and attempt.
           if (observation.cursor !== undefined) next.active.baselineSeq = observation.cursor;
@@ -269,6 +286,9 @@ export class SerialRuntime {
     if (task.active !== undefined) task.completedSessions[String(chapter)] = task.active.sessionId;
     task.nextChapter += 1;
     delete task.active;
+    delete task.phase;
+    delete task.titleActive;
+    delete task.titleAttemptLimit;
     delete task.error;
   }
 
@@ -279,11 +299,12 @@ export class SerialRuntime {
       const next = clone(this.owned());
       if (next.status === "completed") return;
       stoppedTaskId = next.id;
-      if (next.active !== undefined) {
-        const observation = await this.adapter.state(next.active);
-        const isolated = next.active.sessionId !== next.ownerSessionId;
+      const executing = next.phase === "title" ? next.titleActive : next.active;
+      if (executing !== undefined) {
+        const observation = await this.adapter.state(executing);
+        const isolated = executing.sessionId !== next.ownerSessionId;
         if (observation.ownQueued === true || ((isolated || (RUNNING.has(next.status) && !observation.externalInput))
-          && (observation.running || (observation.pendingInput && observation.requestKnown === true)))) activeToCancel = next.active;
+          && (observation.running || (observation.pendingInput && observation.requestKnown === true)))) activeToCancel = executing;
       }
       if (next.status !== "stopped") {
         next.status = "stopped";
@@ -299,7 +320,7 @@ export class SerialRuntime {
       try { await this.adapter.cancel(activeToCancel); }
       catch (error) {
         await this.locked(async () => {
-          if (this.task === null || this.task.id !== stoppedTaskId || this.task.status !== "stopped" || this.task.active?.requestId !== activeToCancel?.requestId) return;
+          if (this.task === null || this.task.id !== stoppedTaskId || this.task.status !== "stopped" || (this.task.phase === "title" ? this.task.titleActive : this.task.active)?.requestId !== activeToCancel?.requestId) return;
           const next = clone(this.task);
           next.error = `停止请求尚未完成：${describe(error)}。请再次点击停止重试；不会派发下一章。`;
           await this.commit(next);
@@ -347,12 +368,72 @@ export class SerialRuntime {
     });
   }
 
+  private async retrySettledFailure(expected: SerialTask, observation: SerialObservation): Promise<boolean> {
+    if (expected.status !== "running" || expected.active === undefined || expected.active.attempt >= attemptLimit(expected, expected.nextChapter)
+      || observation.running || observation.pendingInput || observation.ownQueued || observation.externalInput) return false;
+    const inspected = await this.adapter.inspect(expected.nextChapter, expected.minChars, expected.maxChars);
+    if (inspected.ok || (inspected.proseExists && inspected.repairable !== true)) return false;
+    let retried = false;
+    await this.locked(async () => {
+      if (this.task?.id !== expected.id || this.task.status !== "running" || this.task.active?.requestId !== expected.active?.requestId) return;
+      const next = clone(this.task);
+      next.active = this.reserveAttempt(next, observation, inspected.proseExists ? inspected.issues : undefined);
+      await this.commit(next); retried = true;
+    });
+    if (retried) await this.delay();
+    return retried;
+  }
+  private reserveTitle(task: SerialTask, observation: SerialObservation): SerialActive {
+    const attempt = (task.titleActive?.attempt ?? 0) + 1;
+    if (attempt > (task.titleAttemptLimit ?? 6)) throw new Error("公众号标题自动重试5次仍未完成，正文已保存。请重试并继续，仅补标题。");
+    return { chapter: task.nextChapter, sessionId: this.adapter.makeId(), requestId: this.adapter.makeId(), attempt, dispatched: false,
+      ...(observation.cursor === undefined ? {} : { baselineSeq: observation.cursor }) };
+  }
+  private async driveTitle(current: SerialTask): Promise<void> {
+    const active = current.titleActive;
+    if (active === undefined || this.adapter.dispatchTitle === undefined || this.adapter.inspectTitle === undefined || this.adapter.finalizeTitle === undefined) throw new Error("独立标题任务记录不完整，正文已保留。");
+    const observation = await this.adapter.state(active);
+    if (observation.externalInput) {
+      await this.block("标题会话收到其他工作，已暂停，正文保留。", "paused", current.id);
+      if (observation.running || observation.ownQueued || observation.pendingInput) await this.adapter.cancel(active);
+      return;
+    }
+    if (observation.pendingInput || observation.running || observation.ownQueued) { await this.delay(); return; }
+    if (observation.lastTurnReason !== undefined && CANCELLED.has(observation.lastTurnReason)) { await this.block("标题调用已停止，正文保留；继续时只补标题。", "paused", current.id); return; }
+    await this.locked(async () => {
+      if (this.task?.id !== current.id || !RUNNING.has(this.task.status) || this.task.titleActive?.requestId !== active.requestId) return;
+      let done = await this.adapter.inspectTitle!(current.nextChapter);
+      let issue: string | undefined;
+      if (!done && observation.lastTurnReason === "completed") {
+        const result = await this.adapter.finalizeTitle!(active, observation); done = result.ok; issue = result.issue;
+      }
+      const next = clone(this.task);
+      if (done) {
+        this.acceptChapter(next);
+        if (next.nextChapter > next.targetChapter) next.status = "completed";
+        else if (next.status === "pausing") next.status = "paused";
+        await this.commit(next); return;
+      }
+      if (active.dispatched || observation.requestKnown) {
+        if (active.attempt >= (next.titleAttemptLimit ?? 6)) {
+          next.status = "blocked";
+          next.error = `公众号标题自动重试5次仍未完成：${issue ?? observation.lastTurnError ?? "模型未返回有效标题"}。正文已保存；重试并继续只补标题。`;
+        } else next.titleActive = this.reserveTitle(next, observation);
+        await this.commit(next); return;
+      }
+      await this.adapter.dispatchTitle!(active);
+      next.titleActive!.dispatched = true;
+      await this.commit(next);
+    });
+    await this.delay();
+  }
   private async drive(): Promise<void> {
     let operationTaskId: string | undefined;
     try {
       while (!this.disposed && this.task !== null && RUNNING.has(this.task.status)) {
         const current = this.snapshot()!;
         operationTaskId = current.id;
+        if (current.phase === "title") { await this.driveTitle(current); continue; }
         const observation = await this.adapter.state(current.active ?? (current.observedSeq === undefined ? undefined : {
           chapter: current.nextChapter, sessionId: current.ownerSessionId, requestId: "", attempt: 0, dispatched: false, baselineSeq: current.observedSeq
         }));
@@ -370,6 +451,7 @@ export class SerialRuntime {
           return;
         }
         if (current.active?.dispatched === true && observation.lastTurnReason !== "completed") {
+          if (await this.retrySettledFailure(current, observation)) continue;
           await this.block(`原生写作轮次未正常完成（${observation.lastTurnReason ?? "缺少本轮完成回执"}）${observation.lastTurnError === undefined ? "" : `：${observation.lastTurnError}`}。请处理后继续。`, "blocked", current.id);
           return;
         }
@@ -385,10 +467,11 @@ export class SerialRuntime {
           await this.locked(async () => {
             if (this.task === null || !RUNNING.has(this.task.status) || this.task.id !== current.id || this.task.nextChapter !== current.nextChapter) return;
             const next = clone(this.task);
-            this.acceptChapter(next);
+            if (this.adapter.dispatchTitle !== undefined) { next.phase = "title"; next.titleActive = this.reserveTitle(next, observation); }
+            else this.acceptChapter(next);
             if (observation.cursor !== undefined) next.observedSeq = observation.cursor;
             if (next.nextChapter > next.targetChapter) next.status = "completed";
-            else if (next.status === "pausing") next.status = "paused";
+            else if (next.status === "pausing" && next.phase !== "title") next.status = "paused";
             await this.commit(next);
           });
           continue;
@@ -415,7 +498,7 @@ export class SerialRuntime {
         }
         if (current.status === "pausing") { await this.block("已在章节边界暂停。", "paused", current.id); return; }
         if (current.active?.dispatched === true) {
-          // DSH owns transport retries. A settled failure or missing prose requires an explicit resume.
+          if (await this.retrySettledFailure(current, observation)) continue;
           await this.block(`第 ${String(current.nextChapter)} 章未提交完成${observation.lastTurnError === undefined ? "，请查看原生写作会话中的处理要求" : `：${observation.lastTurnError}`}。`, "blocked", current.id);
           return;
         }
@@ -464,6 +547,14 @@ export class SerialRuntime {
         });
       }
     } catch (error) {
+      // Retry settled model/output failures; retain CAS and ownership barriers for existing manuscripts.
+      try {
+        const current = this.snapshot();
+        if (/最终回复.*(?:正文|为空)|模型.*(?:空回复|空输出)/u.test(describe(error)) && current !== null && current.phase !== "title" && current.id === operationTaskId && current.active !== undefined) {
+          const observation = await this.adapter.state(current.active);
+          if (await this.retrySettledFailure(current, observation)) return;
+        }
+      } catch { /* Unsafe or unreadable state must remain blocked. */ }
       try { await this.block(`连载已停止推进：${describe(error)}`, "blocked", operationTaskId); }
       catch {
         // A failed CAS must not be overwritten by a second blind write.
@@ -477,6 +568,11 @@ export class SerialRuntime {
 export function assertSerialTask(value: unknown): asserts value is SerialTask {
   if (typeof value !== "object" || value === null) throw new Error("连载任务文件不是有效对象。");
   const task = value as Partial<SerialTask>;
+  if (task.phase !== undefined && task.phase !== "title") throw new Error("标题阶段记录无效。");
+  if (task.phase === "title" && (task.titleActive === undefined || task.titleActive.chapter !== task.nextChapter || typeof task.titleActive.sessionId !== "string"
+    || task.titleActive.sessionId === task.ownerSessionId || task.titleActive.sessionId === task.active?.sessionId || typeof task.titleActive.requestId !== "string"
+    || typeof task.titleActive.dispatched !== "boolean" || !Number.isSafeInteger(task.titleActive.attempt) || task.titleActive.attempt < 1
+    || !Number.isSafeInteger(task.titleAttemptLimit ?? 6) || (task.titleAttemptLimit ?? 6) < task.titleActive.attempt)) throw new Error("标题任务记录损坏，已保留正文。");
   if (task.schemaVersion !== 1 || typeof task.id !== "string" || typeof task.ownerSessionId !== "string" || typeof task.cwd !== "string"
     || !["running", "pausing", "paused", "blocked", "stopped", "completed"].includes(task.status ?? "")
     || !Number.isSafeInteger(task.startChapter) || !Number.isSafeInteger(task.targetChapter) || !Number.isSafeInteger(task.nextChapter)
@@ -491,7 +587,7 @@ export function assertSerialTask(value: unknown): asserts value is SerialTask {
     || (task.attemptLimits !== undefined && (typeof task.attemptLimits !== "object" || task.attemptLimits === null || Array.isArray(task.attemptLimits)
       || !Object.entries(task.attemptLimits).every(([chapter, limit]) => /^\d+$/u.test(chapter) && Number(chapter) >= task.startChapter! && Number(chapter) <= task.targetChapter!
         && Number.isSafeInteger(limit) && limit >= task.maxAttempts!)))
-    || !Number.isSafeInteger(task.maxAttempts) || task.maxAttempts! < 1 || task.maxAttempts! > 3
+    || !Number.isSafeInteger(task.maxAttempts) || task.maxAttempts! < 1 || task.maxAttempts! > 6
     || typeof task.updatedAt !== "string") throw new Error("连载任务文件损坏或版本不兼容，已停止以保护正文。");
   if (task.active !== undefined && (task.active.chapter !== task.nextChapter || typeof task.active.sessionId !== "string" || task.active.sessionId === "" || task.active.sessionId === task.ownerSessionId
     || typeof task.active.requestId !== "string" || typeof task.active.dispatched !== "boolean"
