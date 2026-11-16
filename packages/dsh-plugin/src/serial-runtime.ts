@@ -97,7 +97,11 @@ export class SerialRuntime {
   private task: SerialTask | null = null;
   private serial: Promise<unknown> = Promise.resolve();
   private driving = false;
+  private drivePromise: Promise<void> | undefined;
   private disposed = false;
+  private deleting = false;
+  private deleted = false;
+  private deletionShutdown: Promise<void> | undefined;
   private wake: (() => void) | undefined;
 
   constructor(private readonly adapter: SerialAdapter) {}
@@ -118,6 +122,10 @@ export class SerialRuntime {
     return this.task;
   }
 
+  private assertNotDeleting(): void {
+    if (this.deleting) throw new Error("这本书正在删除，不能再启动或修改生成任务。");
+  }
+
   private async commit(next: SerialTask): Promise<void> {
     next.updatedAt = this.adapter.now();
     await this.adapter.save(clone(next));
@@ -126,6 +134,7 @@ export class SerialRuntime {
 
   async restore(): Promise<SerialTask | null> {
     await this.locked(async () => {
+      this.assertNotDeleting();
       if (this.task !== null) return;
       this.task = await this.adapter.load();
       if (this.task !== null) {
@@ -144,6 +153,7 @@ export class SerialRuntime {
 
   async start(options: SerialStartOptions): Promise<SerialTask> {
     await this.locked(async () => {
+      this.assertNotDeleting();
       this.task ??= await this.adapter.load();
       if (this.task !== null) assertSerialTask(this.task);
       if (this.task?.phase === "title") throw new Error("本书正文已保存但当前章标题尚未完成，请恢复原批次继续起标题。");
@@ -199,6 +209,7 @@ export class SerialRuntime {
 
   async pause(): Promise<SerialTask> {
     await this.locked(async () => {
+      this.assertNotDeleting();
       const next = clone(this.owned());
       if (!RUNNING.has(next.status)) return;
       next.status = next.active === undefined ? "paused" : "pausing";
@@ -211,6 +222,7 @@ export class SerialRuntime {
 
   async resume(options: SerialResumeOptions = {}): Promise<SerialTask> {
     await this.locked(async () => {
+      this.assertNotDeleting();
       const next = clone(this.owned());
       if (next.status === "completed") throw new Error("这批任务已经完成，请新建下一批。");
       if (RUNNING.has(next.status)) return;
@@ -296,6 +308,7 @@ export class SerialRuntime {
     let activeToCancel: SerialActive | undefined;
     let stoppedTaskId: string | undefined;
     await this.locked(async () => {
+      if (this.deleted) throw new Error("这本书的生成任务已经关闭。");
       const next = clone(this.owned());
       if (next.status === "completed") return;
       stoppedTaskId = next.id;
@@ -320,7 +333,7 @@ export class SerialRuntime {
       try { await this.adapter.cancel(activeToCancel); }
       catch (error) {
         await this.locked(async () => {
-          if (this.task === null || this.task.id !== stoppedTaskId || this.task.status !== "stopped" || (this.task.phase === "title" ? this.task.titleActive : this.task.active)?.requestId !== activeToCancel?.requestId) return;
+          if (this.deleted || this.task === null || this.task.id !== stoppedTaskId || this.task.status !== "stopped" || (this.task.phase === "title" ? this.task.titleActive : this.task.active)?.requestId !== activeToCancel?.requestId) return;
           const next = clone(this.task);
           next.error = `停止请求尚未完成：${describe(error)}。请再次点击停止重试；不会派发下一章。`;
           await this.commit(next);
@@ -328,11 +341,47 @@ export class SerialRuntime {
         throw error;
       }
       await this.locked(async () => {
-        if (this.task === null || this.task.id !== stoppedTaskId || this.task.status !== "stopped" || !this.task.error?.startsWith("停止请求尚未完成：")) return;
+        if (this.deleted || this.task === null || this.task.id !== stoppedTaskId || this.task.status !== "stopped" || !this.task.error?.startsWith("停止请求尚未完成：")) return;
         const next = clone(this.task); delete next.error; await this.commit(next);
       });
     }
     return this.snapshot()!;
+  }
+
+  /** A deletion barrier: no caller may remove files until native work and host writes settle. */
+  shutdownForDeletion(): Promise<void> {
+    if (this.deleted) return Promise.resolve();
+    if (this.deletionShutdown !== undefined) return this.deletionShutdown;
+    this.deleting = true;
+    this.wake?.();
+    this.deletionShutdown = (async () => {
+      await this.locked(async () => {
+        this.task ??= await this.adapter.load();
+        if (this.task !== null) { assertSerialTask(this.task); this.owned(); }
+      });
+      if (this.task !== null) await this.stop();
+      this.wake?.();
+      await this.drivePromise;
+      // The lock also drains public operations that were queued before deletion began.
+      await this.locked(async () => {
+        const active = this.task?.phase === "title" ? this.task.titleActive : this.task?.active;
+        if (active !== undefined) {
+          const observation = await this.adapter.state(active);
+          if (observation.running || observation.pendingInput || observation.ownQueued === true) {
+            const next = clone(this.owned());
+            next.error = "停止请求尚未完成：章节会话仍在运行、排队或等待输入，尚未删除这本书。";
+            await this.commit(next);
+            throw new Error(next.error);
+          }
+        }
+        this.disposed = true;
+        this.deleted = true;
+      });
+    })().catch(error => {
+      this.deleting = false;
+      throw error;
+    }).finally(() => { this.deletionShutdown = undefined; });
+    return this.deletionShutdown;
   }
 
   dispose(): void {
@@ -341,16 +390,17 @@ export class SerialRuntime {
   }
 
   private kick(): void {
-    if (this.disposed || this.driving || this.task === null || !RUNNING.has(this.task.status)
+    if (this.disposed || this.deleting || this.driving || this.task === null || !RUNNING.has(this.task.status)
       || this.task.ownerSessionId !== this.adapter.ownerSessionId) return;
     this.driving = true;
-    void this.drive().finally(() => {
+    this.drivePromise = this.drive().finally(() => {
       this.driving = false;
       if (!this.disposed && this.task !== null && RUNNING.has(this.task.status)) this.kick();
     });
   }
 
   private async delay(): Promise<void> {
+    if (this.disposed || this.deleting) return;
     await new Promise<void>((resolve) => {
       const done = (): void => { clearTimeout(timer); this.wake = undefined; resolve(); };
       const timer = setTimeout(done, this.adapter.pollMs ?? 1000);
@@ -401,7 +451,7 @@ export class SerialRuntime {
     if (observation.pendingInput || observation.running || observation.ownQueued) { await this.delay(); return; }
     if (observation.lastTurnReason !== undefined && CANCELLED.has(observation.lastTurnReason)) { await this.block("标题调用已停止，正文保留；继续时只补标题。", "paused", current.id); return; }
     await this.locked(async () => {
-      if (this.task?.id !== current.id || !RUNNING.has(this.task.status) || this.task.titleActive?.requestId !== active.requestId) return;
+      if (this.deleting || this.task?.id !== current.id || !RUNNING.has(this.task.status) || this.task.titleActive?.requestId !== active.requestId) return;
       let done = await this.adapter.inspectTitle!(current.nextChapter);
       let issue: string | undefined;
       if (!done && observation.lastTurnReason === "completed") {
@@ -430,7 +480,7 @@ export class SerialRuntime {
   private async drive(): Promise<void> {
     let operationTaskId: string | undefined;
     try {
-      while (!this.disposed && this.task !== null && RUNNING.has(this.task.status)) {
+      while (!this.disposed && !this.deleting && this.task !== null && RUNNING.has(this.task.status)) {
         const current = this.snapshot()!;
         operationTaskId = current.id;
         if (current.phase === "title") { await this.driveTitle(current); continue; }
@@ -515,7 +565,7 @@ export class SerialRuntime {
         if (active === undefined || this.disposed) continue;
         // The persisted request ID is reused if process death occurs before this acknowledgement.
         await this.locked(async () => {
-          if (this.disposed || this.task === null || this.task.status !== "running" || this.task.active?.requestId !== active?.requestId) return;
+          if (this.disposed || this.deleting || this.task === null || this.task.status !== "running" || this.task.active?.requestId !== active?.requestId) return;
           const admission = await this.adapter.state(active);
           if (admission.externalInput || admission.running || admission.pendingInput || admission.ownQueued === true || (admission.lastTurnReason !== undefined && CANCELLED.has(admission.lastTurnReason))) {
             const paused = clone(this.task);

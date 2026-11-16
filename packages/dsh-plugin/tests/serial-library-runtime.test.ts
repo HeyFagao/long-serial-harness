@@ -18,6 +18,7 @@ function fixture(lengths: readonly number[]) {
   const totals = lengths.map(() => 0);
   const starts: { book: string; from: number; to: number }[] = [];
   const retries: { book: string; allowRetryWindow: boolean }[] = [];
+  const stops: string[] = [];
   const owners = new Map<string, SerialTask>();
   const errors = new Map<string, string>();
   let acquisitionError: string | undefined;
@@ -66,6 +67,7 @@ function fixture(lengths: readonly number[]) {
       async pause() { const task = current()!; if (task.status === "running") active -= 1; task.status = "paused"; return structuredClone(task); },
       async resume(options) { retries.push({ book: book.id, allowRetryWindow: options?.allowRetryWindow === true }); return activate(current()!); },
       async stop() {
+        stops.push(book.id);
         if (stopError !== undefined) throw new Error(stopError);
         const task = current()!; if (task.status === "running") active -= 1; task.status = "stopped"; return structuredClone(task);
       }
@@ -82,11 +84,130 @@ function fixture(lengths: readonly number[]) {
     async plan() { return lengths.map((lastChapter, i) => ({ id: String(i), title: `Book ${String(i)}`, absolutePath: `/library/book-${String(i)}`, nextChapter: totals[i]! + 1, lastChapter })); },
     controller
   };
-  return { adapter, totals, starts, retries, errors, owners, saved: () => saved, maxActive: () => maxActive, hold: (value: boolean) => { hold = value; },
+  return { adapter, totals, starts, retries, stops, errors, owners, saved: () => saved, maxActive: () => maxActive, hold: (value: boolean) => { hold = value; },
     failAcquisition: (error?: string) => { acquisitionError = error; }, failStop: (error?: string) => { stopError = error; } };
 }
 
 describe("durable multi-book generation", () => {
+  it("removes one running reservation without stopping concurrent books or bringing it back on resume", async () => {
+    const f = fixture([20, 20, 20]); f.hold(true); const queue = new SerialLibraryRuntime(f.adapter);
+    await queue.start(10, {}, "all"); await until(() => f.saved()?.books.every(book => book.serialTaskId !== undefined) === true);
+    const owners = new Map(queue.snapshot()!.books.map(book => [book.id, book.ownerSessionId]));
+    await queue.excludeBookForDeletion("1");
+    expect(f.stops).toEqual(["1"]);
+    expect(f.saved()?.books.map(book => book.id)).toEqual(["0", "2"]);
+    expect(f.owners.get(owners.get("1")!)?.status).toBe("stopped");
+    expect(["0", "2"].every(id => f.owners.get(owners.get(id)!)?.status === "running")).toBe(true);
+    await queue.pause(); await until(() => queue.snapshot()?.status === "paused");
+    f.hold(false); await queue.resume(); await until(() => queue.snapshot()?.status === "completed");
+    expect(f.retries.map(item => item.book)).toEqual(["0", "2"]);
+    expect(f.totals).toEqual([10, 0, 10]); expect(f.starts).toHaveLength(3); queue.dispose();
+  });
+
+  it("removes a pending reservation without opening or stopping another book", async () => {
+    const f = fixture([20, 20, 20]); f.hold(true); const queue = new SerialLibraryRuntime(f.adapter);
+    await queue.start(10); await until(() => f.saved()?.books[0]?.serialTaskId !== undefined);
+    await queue.excludeBookForDeletion("1");
+    expect(f.stops).toEqual([]); expect(f.starts.map(item => item.book)).toEqual(["0"]);
+    f.hold(false); await until(() => queue.snapshot()?.status === "completed");
+    expect(f.starts.map(item => item.book)).toEqual(["0", "2"]); expect(f.totals).toEqual([10, 0, 10]); queue.dispose();
+  });
+
+  it("removes failed entries and completes an empty queue", async () => {
+    const f = fixture([20]); f.errors.set("0", "正文验收失败"); const queue = new SerialLibraryRuntime(f.adapter);
+    await queue.start(10); await until(() => queue.snapshot()?.status === "completed");
+    expect(queue.snapshot()?.books[0]?.status).toBe("failed");
+    await queue.excludeBookForDeletion("0");
+    expect(f.saved()?.books).toEqual([]); expect(f.saved()?.status).toBe("completed");
+    await expect(queue.resume()).rejects.toThrow("本批已经结束"); queue.dispose();
+  });
+
+  it("deletes a failed book from a completed historical batch opened by another library session", async () => {
+    const f = fixture([1, 1]); f.errors.set("0", "正文验收失败");
+    const first = new SerialLibraryRuntime(f.adapter); await first.start(10);
+    await until(() => first.snapshot()?.status === "completed"); first.dispose();
+    const priorOwner = f.saved()!.ownerSessionId; const untouched = f.saved()!.books[1];
+    const next = new SerialLibraryRuntime({ ...f.adapter, ownerSessionId: "new-library-session" }); await next.restore();
+    await next.excludeBookForDeletion("0");
+    expect(f.saved()?.ownerSessionId).toBe(priorOwner); expect(f.saved()?.status).toBe("completed");
+    expect(f.saved()?.books).toEqual([untouched]); expect(f.starts).toHaveLength(2); expect(f.retries).toEqual([]); next.dispose();
+  });
+
+  it("deletes one book from a stopped historical batch without adopting or resuming it", async () => {
+    const f = fixture([20, 20]); f.hold(true);
+    const first = new SerialLibraryRuntime(f.adapter); await first.start(10);
+    await until(() => f.saved()?.books[0]?.serialTaskId !== undefined); await first.stop(); first.dispose();
+    const priorOwner = f.saved()!.ownerSessionId; const untouched = f.saved()!.books[1];
+    const next = new SerialLibraryRuntime({ ...f.adapter, ownerSessionId: "new-library-session" }); await next.restore();
+    await next.excludeBookForDeletion("0");
+    expect(f.saved()?.ownerSessionId).toBe(priorOwner); expect(f.saved()?.status).toBe("stopped");
+    expect(f.saved()?.books).toEqual([untouched]); expect(f.starts).toHaveLength(1); expect(f.retries).toEqual([]); next.dispose();
+  });
+
+  it("closes the current book writer through the deletion callback when the old reservation no longer matches", async () => {
+    const f = fixture([20, 20]); f.hold(true); const queue = new SerialLibraryRuntime(f.adapter);
+    await queue.start(10, {}, "all"); await until(() => f.saved()?.books.every(book => book.serialTaskId !== undefined) === true);
+    const selected = f.saved()!.books[0]!; const other = f.saved()!.books[1]!;
+    const current = f.owners.get(selected.ownerSessionId)!;
+    current.id = "new-independent-task"; current.ownerSessionId = "new-book-owner";
+    f.failAcquisition("old model no longer configured");
+    let shutdowns = 0;
+    await queue.excludeBookForDeletion(selected.id, async () => { shutdowns += 1; current.status = "stopped"; });
+    expect(shutdowns).toBe(1); expect(current.status).toBe("stopped"); expect(f.stops).toEqual([]);
+    expect(f.saved()?.books).toEqual([other]); expect(f.owners.get(other.ownerSessionId)?.status).toBe("running");
+    expect(f.retries).toEqual([]); queue.dispose();
+  });
+
+  it("retains an old reservation if the current-writer deletion callback cannot confirm shutdown", async () => {
+    const f = fixture([20]); f.hold(true); const queue = new SerialLibraryRuntime(f.adapter);
+    await queue.start(10); await until(() => f.saved()?.books[0]?.serialTaskId !== undefined);
+    const before = f.saved();
+    await expect(queue.excludeBookForDeletion("0", async () => { throw new Error("current writer still running"); })).rejects.toThrow("current writer still running");
+    expect(f.saved()).toEqual(before); expect(f.stops).toEqual([]); queue.dispose();
+  });
+
+  it("clears the removed book's global error while leaving a blocked queue paused for explicit resume", async () => {
+    const f = fixture([20, 20]); f.errors.set("0", "HTTP 403 no_subscription"); const queue = new SerialLibraryRuntime(f.adapter);
+    await queue.start(10); await until(() => queue.snapshot()?.status === "blocked");
+    await queue.excludeBookForDeletion("0");
+    expect(f.saved()?.books.map(book => book.id)).toEqual(["1"]);
+    expect(f.saved()?.status).toBe("blocked"); expect(f.saved()?.error).toBeUndefined();
+    expect(f.starts.map(item => item.book)).toEqual(["0"]);
+    f.errors.clear(); await queue.resume(); await until(() => queue.snapshot()?.status === "completed");
+    expect(f.starts.map(item => item.book)).toEqual(["0", "1"]); queue.dispose();
+  });
+
+  it("keeps a blocked reservation and its errors when deletion cannot cancel its child", async () => {
+    const f = fixture([20, 20]); f.errors.set("0", "HTTP 403 no_subscription"); const queue = new SerialLibraryRuntime(f.adapter);
+    await queue.start(10); await until(() => queue.snapshot()?.status === "blocked");
+    const before = f.saved(); f.failStop("native cancellation failed");
+    await expect(queue.excludeBookForDeletion("0")).rejects.toThrow("native cancellation failed");
+    expect(f.saved()).toEqual(before); expect(queue.snapshot()).toEqual(before);
+    f.failStop(); await queue.excludeBookForDeletion("0");
+    expect(f.saved()?.books.map(book => book.id)).toEqual(["1"]); queue.dispose();
+  });
+
+  it("uses the native deletion barrier before removing the reservation and can retry its failure", async () => {
+    const f = fixture([20, 20]); f.errors.set("0", "HTTP 403 no_subscription");
+    const controller = f.adapter.controller; let fail = true; let draining = false; let release!: () => void;
+    const drained = new Promise<void>(resolve => { release = resolve; });
+    f.adapter.controller = async (book, task) => {
+      const inner = await controller(book, task);
+      return { ...inner, async shutdownForDeletion() {
+        if (fail) throw new Error("native still pending");
+        await inner.stop(); draining = true; await drained;
+      } };
+    };
+    const queue = new SerialLibraryRuntime(f.adapter); await queue.start(10);
+    await until(() => queue.snapshot()?.status === "blocked"); const before = f.saved();
+    await expect(queue.excludeBookForDeletion("0")).rejects.toThrow("native still pending");
+    expect(f.saved()).toEqual(before);
+    fail = false; const deletion = queue.excludeBookForDeletion("0");
+    await until(() => draining); expect(f.saved()).toEqual(before);
+    release(); await deletion;
+    expect(f.saved()?.books.map(book => book.id)).toEqual(["1"]); queue.dispose();
+  });
+
   it("runs all ten books together and stops/resumes every admitted book", async () => {
     const f = fixture(Array<number>(10).fill(20)); f.hold(true);
     const queue = new SerialLibraryRuntime(f.adapter);

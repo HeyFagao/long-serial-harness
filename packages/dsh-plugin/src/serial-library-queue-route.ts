@@ -8,6 +8,7 @@ import { assertLibraryTask, assertLibraryConcurrency, SerialLibraryRuntime, type
 import { getSerialRuntime } from "./serial-route.js";
 import { creativeTarget, jsonBody, mapFsError, readVersionedFile, send, workspaceRealmForSession, WorkspaceHttpError, type WorkspaceRealm } from "./workspace-route.js";
 import { isTrustedWorkspaceRequest } from "./workspace-request-trust.js";
+import { withLibraryOperation } from "./serial-library-operations.js";
 
 const TASK_PATH = "追踪/书库任务.json";
 const MAX_BYTES = 2_097_152;
@@ -48,7 +49,7 @@ export function createLibraryQueueAdapter(context: Context, realm: WorkspaceReal
     },
     async controller(book, task) {
       const currentLibrary = await listLibraryBooks(realm);
-      const current = currentLibrary.books.find(item => item.id === book.id);
+      const current = [...currentLibrary.books, ...(currentLibrary.deletingBooks ?? [])].find(item => item.id === book.id);
       if (current === undefined || current.absolutePath !== book.absolutePath) throw new WorkspaceHttpError(409, "书项目已移动或不属于当前书库，未继续写作。");
       const bookRealm = await ensureLibraryBookRealm(context, realm, book.absolutePath, book.ownerSessionId, task.ownerContext as LibraryOwnerContext);
       const holder = await getSerialRuntime(context, bookRealm);
@@ -79,9 +80,22 @@ function generationOptions(input: Record<string, unknown>): LibraryTask["generat
   return result;
 }
 
-export function registerLibraryQueueRoute(context: Context, options: { readonly trustedHosts?: readonly string[] } = {}): void {
-  const runtimes = new Map<string, Promise<{ runtime: SerialLibraryRuntime; ownerSessionId: string }>>();
-  const obtain = async (realm: WorkspaceRealm): Promise<{ runtime: SerialLibraryRuntime; ownerSessionId: string }> => {
+interface LibraryRuntimeHolder { runtime: SerialLibraryRuntime; ownerSessionId: string }
+const libraryRegistries = new WeakMap<Context, Map<string, Promise<LibraryRuntimeHolder>>>();
+function libraryRegistry(context: Context): Map<string, Promise<LibraryRuntimeHolder>> {
+  let registry = libraryRegistries.get(context);
+  if (registry !== undefined) return registry;
+  registry = new Map(); libraryRegistries.set(context, registry);
+  const held = registry;
+  context.effect(() => () => {
+    for (const pending of held.values()) void pending.then(holder => { holder.runtime.dispose(); }).catch(() => undefined);
+    held.clear();
+  }, "serial library queue lifecycle");
+  return registry;
+}
+
+export async function getLibraryQueueRuntime(context: Context, realm: WorkspaceRealm): Promise<LibraryRuntimeHolder> {
+  const runtimes = libraryRegistry(context);
     const key = realm.root.targetKey;
     let pending = runtimes.get(key);
     if (pending === undefined) {
@@ -109,24 +123,23 @@ export function registerLibraryQueueRoute(context: Context, options: { readonly 
     if (holder.ownerSessionId !== realm.sessionId && (task === null || task.status === "completed" || task.status === "stopped")) {
       holder.runtime.dispose();
       runtimes.delete(key);
-      return obtain(realm);
+      return getLibraryQueueRuntime(context, realm);
     }
     return holder;
-  };
-  context.effect(() => () => {
-    for (const pending of runtimes.values()) void pending.then(holder => { holder.runtime.dispose(); }).catch(() => undefined);
-    runtimes.clear();
-  }, "serial library queue lifecycle");
+  }
+
+export function registerLibraryQueueRoute(context: Context, options: { readonly trustedHosts?: readonly string[] } = {}): void {
   context.effect(() => context.webServer.register({ kind: "exact", path: "/oh-story/library/queue", async handler(request: IncomingMessage, response: ServerResponse) {
     try {
       if (!isTrustedWorkspaceRequest(request, options.trustedHosts ?? [])) throw new WorkspaceHttpError(403, "请求来源不受信任。");
       const url = new URL(request.url ?? "/", "http://127.0.0.1");
       const realm = await workspaceRealmForSession(context, url.searchParams.get("sessionId") ?? "");
-      const holder = await obtain(realm);
-      if (request.method === "GET") { send(response, 200, { task: holder.runtime.snapshot() }); return; }
+      if (request.method === "GET") { send(response, 200, { task: (await getLibraryQueueRuntime(context, realm)).runtime.snapshot() }); return; }
       if (request.method !== "POST") throw new WorkspaceHttpError(405, "仅支持 GET 和 POST。");
-      if (holder.ownerSessionId !== realm.sessionId) throw new WorkspaceHttpError(409, "请回到启动本批的书库会话管理队列。");
       const input = await jsonBody(request, 65_536);
+      const result = await withLibraryOperation(context, realm.root.targetKey, async () => {
+      const holder = await getLibraryQueueRuntime(context, realm);
+      if (holder.ownerSessionId !== realm.sessionId) throw new WorkspaceHttpError(409, "请回到启动本批的书库会话管理队列。");
       let task: LibraryTask;
       switch (input.action) {
         case "start": {
@@ -141,7 +154,9 @@ export function registerLibraryQueueRoute(context: Context, options: { readonly 
         case "stop": task = await holder.runtime.stop(); break;
         default: throw new WorkspaceHttpError(400, "未知书库队列操作。");
       }
-      send(response, 200, { task });
+      return task;
+      });
+      send(response, 200, { task: result });
     } catch (error) {
       const mapped = error instanceof WorkspaceHttpError ? error : mapFsError(error);
       send(response, mapped?.status ?? 409, { error: mapped?.message ?? (error instanceof Error ? error.message : "书库队列操作失败。") });

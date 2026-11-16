@@ -47,6 +47,112 @@ async function eventually(check: () => boolean): Promise<void> {
 }
 
 describe("native serial scheduler", () => {
+  it("waits for in-flight manuscript finalization and inspection before deletion settles", async () => {
+    const f = fixture(2); f.hold();
+    let releaseFinalization!: () => void; let releaseInspection!: () => void;
+    const finalization = new Promise<void>(resolve => { releaseFinalization = resolve; });
+    const inspection = new Promise<void>(resolve => { releaseInspection = resolve; });
+    let finalizing = false; let inspecting = false; let closed = false; let writes = 0;
+    const save = f.adapter.save; const inspect = f.adapter.inspect;
+    f.adapter.save = async task => { expect(closed).toBe(false); writes += 1; await save(task); };
+    f.adapter.finalize = async () => { finalizing = true; await finalization; expect(closed).toBe(false); };
+    f.adapter.inspect = async (...args) => { if (finalizing) { inspecting = true; await inspection; } return inspect(...args); };
+    const runtime = new SerialRuntime(f.adapter); await runtime.start({ count: 2 });
+    await eventually(() => runtime.snapshot()?.active?.dispatched === true);
+    f.finish(); await eventually(() => finalizing);
+    let settled = false;
+    const shutdown = runtime.shutdownForDeletion().then(() => { settled = true; closed = true; });
+    await new Promise(resolve => setTimeout(resolve, 5)); expect(settled).toBe(false);
+    releaseFinalization(); await eventually(() => inspecting && runtime.snapshot()?.status === "stopped");
+    expect(settled).toBe(false);
+    releaseInspection(); await shutdown;
+    const settledWrites = writes;
+    await expect(runtime.resume()).rejects.toThrow("正在删除");
+    await expect(runtime.stop()).rejects.toThrow("已经关闭");
+    await new Promise(resolve => setTimeout(resolve, 5));
+    expect(writes).toBe(settledWrites); expect(f.requests).toHaveLength(1);
+    await runtime.shutdownForDeletion();
+  });
+
+  it("deletion cancels the independent title child and retains the completed prose until purge", async () => {
+    const f = fixture(1); const titles: SerialActive[] = []; const states = new Map<string, SerialObservation>();
+    const state = f.adapter.state;
+    f.adapter.state = async active => states.get(active?.sessionId ?? "") ?? (f.complete.size > 0 && active?.sessionId !== f.childIds[0] ? { running: false, pendingInput: false } : state(active));
+    f.adapter.inspectTitle = async () => false;
+    f.adapter.dispatchTitle = async active => { titles.push(active); states.set(active.sessionId, { running: true, pendingInput: true, requestKnown: true }); };
+    f.adapter.finalizeTitle = async () => ({ ok: false });
+    f.adapter.cancel = async active => { f.cancellations.push(active.sessionId); states.set(active.sessionId, { running: false, pendingInput: false, lastTurnReason: "aborted" }); };
+    const runtime = new SerialRuntime(f.adapter); await runtime.start({ count: 1 });
+    await eventually(() => runtime.snapshot()?.titleActive?.dispatched === true);
+    await runtime.shutdownForDeletion();
+    expect(f.cancellations).toEqual([titles[0]!.sessionId]);
+    expect(f.requests).toHaveLength(1); expect(titles).toHaveLength(1); expect(f.complete.has(1)).toBe(true);
+    expect(runtime.snapshot()?.status).toBe("stopped");
+  });
+
+  it("retains cancellation failures and permits a later deletion retry", async () => {
+    const f = fixture(1); f.hold(); const cancel = f.adapter.cancel;
+    f.adapter.cancel = async () => { throw new Error("native cancellation failed"); };
+    const runtime = new SerialRuntime(f.adapter); await runtime.start({ count: 1 });
+    await eventually(() => runtime.snapshot()?.active?.dispatched === true);
+    await expect(runtime.shutdownForDeletion()).rejects.toThrow("native cancellation failed");
+    expect(runtime.snapshot()?.status).toBe("stopped");
+    expect(f.disk()?.error).toContain("native cancellation failed");
+    f.adapter.cancel = cancel;
+    await runtime.shutdownForDeletion();
+    expect(f.disk()?.error).toBeUndefined(); expect(f.requests).toHaveLength(1);
+  });
+
+  it("refuses deletion if native state remains pending after cancellation", async () => {
+    const f = fixture(1); f.hold(); f.adapter.cancel = async () => undefined;
+    const runtime = new SerialRuntime(f.adapter); await runtime.start({ count: 1 });
+    await eventually(() => runtime.snapshot()?.active?.dispatched === true);
+    f.state({ running: false, pendingInput: true, ownQueued: true, requestKnown: true });
+    await expect(runtime.shutdownForDeletion()).rejects.toThrow("尚未删除");
+    expect(f.disk()?.error).toContain("仍在运行、排队或等待输入"); runtime.dispose();
+  });
+
+  it("does not let an earlier overlapping stop write an error after deletion has drained", async () => {
+    const f = fixture(1); f.hold(); const cancel = f.adapter.cancel;
+    let releaseOldStop!: () => void; let cancelCalls = 0;
+    const oldStop = new Promise<void>(resolve => { releaseOldStop = resolve; });
+    f.adapter.cancel = async active => {
+      cancelCalls += 1;
+      if (cancelCalls === 1) { await oldStop; throw new Error("late cancellation error"); }
+      await cancel(active);
+    };
+    const runtime = new SerialRuntime(f.adapter); await runtime.start({ count: 1 });
+    await eventually(() => runtime.snapshot()?.active?.dispatched === true);
+    const stopping = runtime.stop(); await eventually(() => cancelCalls === 1);
+    await runtime.shutdownForDeletion(); const before = f.disk();
+    releaseOldStop(); await expect(stopping).rejects.toThrow("late cancellation error");
+    expect(f.disk()).toEqual(before); expect(f.disk()?.error).toBeUndefined();
+  });
+
+  it("closes a completed book without model calls or rewriting its receipt", async () => {
+    const f = fixture(1); const runtime = new SerialRuntime(f.adapter); await runtime.start({ count: 1 });
+    await eventually(() => runtime.snapshot()?.status === "completed");
+    const before = f.disk(); await runtime.shutdownForDeletion();
+    expect(f.disk()).toEqual(before); expect(f.requests).toHaveLength(1); expect(f.cancellations).toEqual([]);
+  });
+
+  it.each(["paused", "blocked", "stopped"] as const)("closes a cold %s task without starting or resuming it", async status => {
+    const f = fixture(1);
+    f.setDisk({ schemaVersion: 1, id: "old-task", ownerSessionId: "owner", cwd: "/book", status,
+      startChapter: 1, targetChapter: 1, nextChapter: 1, completed: [], completedSessions: {}, attempts: { "1": 1 },
+      active: { chapter: 1, sessionId: "old-child", requestId: "old-request", attempt: 1, dispatched: true },
+      maxAttempts: 6, updatedAt: "old" });
+    const runtime = new SerialRuntime(f.adapter); await runtime.shutdownForDeletion();
+    expect(f.disk()?.status).toBe("stopped"); expect(f.requests).toEqual([]); expect(f.cancellations).toEqual([]);
+  });
+
+  it("closes a never-started project without creating a task receipt", async () => {
+    const f = fixture(1); const runtime = new SerialRuntime(f.adapter);
+    await runtime.shutdownForDeletion();
+    expect(f.disk()).toBeNull(); expect(f.requests).toEqual([]);
+    await expect(runtime.start({ count: 1 })).rejects.toThrow("正在删除");
+  });
+
   it("retries only the independent title six times, then resumes without regenerating prose", async () => {
     const f = fixture(1); const titles: SerialActive[] = []; const done = new Set<number>();
     let succeeds = false;

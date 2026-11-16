@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
+import type { Context } from "@deepseek-ai/cordis";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import type { WorkspaceRealm } from "../src/workspace-route.js";
-import { committedChapter, importedThroughChapter, importSerialOutline, numberedChapter, prepareSerialReferenceContext, prepareSerialRepair, requireCommittedChapterFiles, verifySerialIntegrity } from "../src/serial-route.js";
+import * as workspaceRoute from "../src/workspace-route.js";
+import { committedChapter, importedThroughChapter, importSerialOutline, numberedChapter, prepareSerialReferenceContext, prepareSerialRepair, registerSerialRoute, requireCommittedChapterFiles, verifySerialIntegrity } from "../src/serial-route.js";
+import { markBookDeleting } from "../src/serial-library-operations.js";
 
 const source = "书名：测试书\n第1章：门开了\n主角发现钥匙不见了。\n第2章：旧账\n主角问清钥匙的来源。";
 
@@ -26,6 +30,45 @@ function workspace(files = new Map<string, string>()) {
 }
 
 describe("native serial workspace route", () => {
+  it.each(["GET", "POST"])("rejects a %s from an old book tab before recreating a deleted runtime", async method => {
+    const test = workspace(); const path = "/books/小说项目/selected";
+    const realm = { ...test.realm, cwd: path, root: { targetKey: path, displayPath: path } } as unknown as WorkspaceRealm;
+    let handler: ((request: IncomingMessage, response: ServerResponse) => Promise<void>) | undefined;
+    const context = { effect: (work: () => unknown) => work(), logger: () => ({ warn: vi.fn() }),
+      webServer: { register: (route: { handler: typeof handler }) => { handler = route.handler; } } } as unknown as Context;
+    const resolveRealm = vi.spyOn(workspaceRoute, "workspaceRealmForSession").mockResolvedValue(realm);
+    const stat = vi.spyOn(realm.fs, "stat");
+    try {
+      registerSerialRoute(context); markBookDeleting(context, path, true);
+      const response = { writeHead: vi.fn(), end: vi.fn() };
+      await handler!({ url: "/oh-story/serial?sessionId=book", method, headers: { host: "127.0.0.1" } } as IncomingMessage, response as unknown as ServerResponse);
+      expect(response.writeHead.mock.calls[0]?.[0]).toBe(409);
+      expect(String(response.end.mock.calls[0]?.[0])).toContain("后台删除");
+      expect(stat).not.toHaveBeenCalled(); expect(test.write).not.toHaveBeenCalled();
+    } finally { resolveRealm.mockRestore(); stat.mockRestore(); }
+  });
+
+  it.each(["GET", "POST"])("checks the persistent deletion journal before restoring a runtime on %s after restart", async method => {
+    const path = "/books/小说项目/selected";
+    const test = workspace(new Map([["追踪/书库删除任务.json", JSON.stringify({ schemaVersion: 1, jobs: [{ status: "pending", requestedAt: "2026-11-17T00:00:00Z",
+      book: { id: "a".repeat(64), title: "Selected", absolutePath: path, relativePath: "小说项目/selected" } }] })]]));
+    const realm = { ...test.realm, cwd: path, root: { targetKey: path, displayPath: path } } as unknown as WorkspaceRealm;
+    let handler: ((request: IncomingMessage, response: ServerResponse) => Promise<void>) | undefined;
+    const context = { effect: (work: () => unknown) => work(), logger: () => ({ warn: vi.fn() }),
+      webServer: { register: (route: { handler: typeof handler }) => { handler = route.handler; } } } as unknown as Context;
+    const resolveRealm = vi.spyOn(workspaceRoute, "workspaceRealmForSession").mockResolvedValue(realm);
+    const stat = vi.spyOn(realm.fs, "stat");
+    try {
+      registerSerialRoute(context);
+      const response = { writeHead: vi.fn(), end: vi.fn() };
+      await handler!({ url: "/oh-story/serial?sessionId=book", method, headers: { host: "127.0.0.1" } } as IncomingMessage, response as unknown as ServerResponse);
+      expect(response.writeHead.mock.calls[0]?.[0]).toBe(409);
+      expect(String(response.end.mock.calls[0]?.[0])).toContain("不能继续生成");
+      expect(stat.mock.calls.every(([entry]) => (entry as unknown as string) === "追踪/书库删除任务.json")).toBe(true);
+      expect(test.write).not.toHaveBeenCalled();
+    } finally { resolveRealm.mockRestore(); stat.mockRestore(); }
+  });
+
   it("imports source and outlines without overwriting and retries idempotently", async () => {
     const { realm, files, write } = workspace();
     const result = await importSerialOutline(realm, source, "自定书名");

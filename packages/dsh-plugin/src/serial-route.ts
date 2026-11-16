@@ -1,3 +1,6 @@
+import { basename, dirname } from "node:path";
+import { assertBookNotDeleting, isBookDeleting } from "./serial-library-operations.js";
+import { assertBookDeletionNotQueued } from "./serial-library-deletion-jobs.js";
 import { buildWechatTitlePrompt, parseWechatTitleOutput } from "./wechat-title.js";
 import { createChapterZip, safeExportName, type ExportBook, type ExportChapter } from "./serial-export.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -362,7 +365,11 @@ export function createSerialAdapter(context: Context, realm: WorkspaceRealm): Se
     realm = current;
   };
   const requireAvailableBook = async () => {
+    assertBookNotDeleting(context, realm.root.targetKey);
+    await assertBookDeletionNotQueued(realm);
     const receipt = await optionalText(realm, "追踪/书项目.json");
+    if (receipt === undefined && basename(dirname(realm.cwd)) === "小说项目") throw new WorkspaceHttpError(409, "本书项目已经删除，请回到书库重新导入。");
+    if (receipt !== undefined && (JSON.parse(receipt) as { deletingAt?: unknown }).deletingAt !== undefined) throw new WorkspaceHttpError(409, "本书正在后台删除，不能继续生成。");
     if (receipt !== undefined && (JSON.parse(receipt) as { archivedAt?: unknown }).archivedAt !== undefined) throw new WorkspaceHttpError(409, "本书已在回收站，请先从书库恢复再继续生成。");
   };
   const native = createNativeSerialController(context, async () => { await refresh(); return realm; });
@@ -565,6 +572,7 @@ const serialRuntimeRegistries = new WeakMap<Context, Map<string, Promise<SerialR
 
 /** One host controller per book, shared by its editor and the multi-book queue. */
 export async function getSerialRuntime(context: Context, realm: WorkspaceRealm): Promise<SerialRuntimeHolder> {
+  if (basename(dirname(realm.cwd)) === "小说项目" && await optionalText(realm, "追踪/书项目.json") === undefined) throw new WorkspaceHttpError(409, "本书项目已删除。");
   let runtimes = serialRuntimeRegistries.get(context);
   if (runtimes === undefined) {
     runtimes = new Map();
@@ -602,12 +610,33 @@ export async function getSerialRuntime(context: Context, realm: WorkspaceRealm):
   }
   const holder = await pending;
   const task = holder.runtime.snapshot();
-  if (holder.ownerSessionId !== realm.sessionId && (task === null || task.status === "completed" || task.status === "stopped")) {
+  if (!isBookDeleting(context, key) && holder.ownerSessionId !== realm.sessionId && (task === null || task.status === "completed" || task.status === "stopped")) {
     holder.runtime.dispose();
     runtimes.delete(key);
     return getSerialRuntime(context, realm);
   }
   return holder;
+}
+
+/** Keep the drained controller registered until purge finishes, rejecting late callers. */
+export async function shutdownBookForDeletion(context: Context, realm: WorkspaceRealm): Promise<void> {
+  const registry = serialRuntimeRegistries.get(context);
+  const pending = registry?.get(realm.root.targetKey);
+  const stored = await optionalText(realm, TASK_PATH);
+  if (pending === undefined && stored === undefined) return;
+  let owner = realm;
+  if (pending === undefined && stored !== undefined) {
+    const task = JSON.parse(stored) as SerialTask;
+    if (typeof task.ownerSessionId !== "string") throw new WorkspaceHttpError(409, "书项目缺少任务所属会话，未继续清理。");
+    owner = await workspaceRealmForSession(context, task.ownerSessionId);
+    if (owner.root.targetKey !== realm.root.targetKey) throw new WorkspaceHttpError(409, "书项目任务的所属会话与目录不符。");
+  }
+  const holder = pending === undefined ? await getSerialRuntime(context, owner) : await pending;
+  await holder.runtime.shutdownForDeletion();
+}
+
+export function forgetDeletedBookRuntime(context: Context, realm: WorkspaceRealm): void {
+  serialRuntimeRegistries.get(context)?.delete(realm.root.targetKey);
 }
 
 /** Host-owned loops survive browser navigation; CAS rejects a second host/process writer. */
@@ -620,6 +649,8 @@ export function registerSerialRoute(context: Context, options: { readonly truste
         if (!isTrustedWorkspaceRequest(request, options.trustedHosts ?? [])) throw new WorkspaceHttpError(403, "请求来源不受信任。");
         const url = new URL(request.url ?? "/", "http://127.0.0.1");
         const realm = await workspaceRealmForSession(context, url.searchParams.get("sessionId") ?? "");
+        assertBookNotDeleting(context, realm.root.targetKey);
+        await assertBookDeletionNotQueued(realm);
         if (url.pathname === "/oh-story/serial/export" && request.method === "GET") { await exportSerial(realm, response); return; }
         if (url.pathname !== "/oh-story/serial") throw new WorkspaceHttpError(404, "连载接口不存在。");
         const holder = await obtain(realm);
@@ -627,6 +658,7 @@ export function registerSerialRoute(context: Context, options: { readonly truste
         if (request.method !== "POST") throw new WorkspaceHttpError(405, "仅支持 GET 和 POST。");
         if (holder.ownerSessionId !== realm.sessionId) throw new WorkspaceHttpError(409, "此项目的连载任务属于另一个 DSH 会话，请回到原会话控制任务。");
         const input = await jsonBody(request, MAX_BYTES * 3);
+        assertBookNotDeleting(context, realm.root.targetKey); await assertBookDeletionNotQueued(realm);
         if (input.action === "import") {
           const task = holder.runtime.snapshot();
           if (task !== null && ["running", "pausing"].includes(task.status)) throw new WorkspaceHttpError(409, "请先暂停连载再导入大纲。");

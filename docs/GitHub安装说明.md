@@ -6,7 +6,7 @@
 2. 打开「插件 → 添加插件 → 包名或地址」，粘贴下面的插件安装直链并安装：
 
 ```text
-https://github.com/HeyFagao/long-serial-harness/releases/download/v0.1.26-serial.4/oh-story-dsh-0.1.26-serial.4.tgz
+https://github.com/HeyFagao/long-serial-harness/releases/download/v0.1.26-serial.5/oh-story-dsh-0.1.26-serial.5.tgz
 ```
 
 3. 保存当前工作后重新打开 Harness。在「设置 → 模型」添加自己的中转站地址、密钥和模型。
@@ -14,8 +14,10 @@ https://github.com/HeyFagao/long-serial-harness/releases/download/v0.1.26-serial
 
 一个文件建立一本小说、一个独立项目。单本可生成 10／20／50 章或全本；书库可让所有项目各新增 10／20 章或写至完本。先试写 1 章检查线路与文风。
 
-若直链安装受网络影响，可从 [发布页](https://github.com/HeyFagao/long-serial-harness/releases/tag/v0.1.26-serial.4) 下载 `long-serial-partner-0.1.26-serial.4.zip`，解压后运行包内 Mac／Windows 安装脚本；也可在插件安装器填写本地 `.tgz` 的完整路径。
+若直链安装受网络影响，可从 [发布页](https://github.com/HeyFagao/long-serial-harness/releases/tag/v0.1.26-serial.5) 下载 `long-serial-partner-0.1.26-serial.5.zip`，解压后运行包内 Mac／Windows 安装脚本；也可在插件安装器填写本地 `.tgz` 的完整路径。
 
 安装器需要上述 `.tgz` 链接或文件，不要填源码仓库地址或 GitHub 的 Source code ZIP。
 
-已装 serial.3 的用户：用上面的 serial.4 直链重新添加/更新同一插件，保留书库与模型设置。安装后保存工作并重新打开 Harness；旧版本不会因为仓库更新而自动替换。
+已安装旧版本的用户：用上面的 serial.5 直链重新添加/更新同一插件，保留书库、其他插件与模型设置。安装后保存工作并重新打开 Harness；旧版本不会因为仓库更新而自动替换。
+
+serial.5 的删除方式：勾选后点「删除所选书」立即移除，不再确认移入回收站。后台自动停止选中书的生成并永久清理文件，不会因为暂时清理失败把书重新显示出来。需要留稿时先导出。

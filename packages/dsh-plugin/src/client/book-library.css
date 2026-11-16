@@ -12,9 +12,11 @@
 .book-library-manage article { display:flex; gap:6px; align-items:center; padding:8px 0; flex-wrap:wrap; }
 .book-library-manage article strong { flex:1; }
 .book-library-book input[type=checkbox] { flex:0 0 auto; width:16px; height:16px; }
-.book-library-manage [aria-label="确认删除书项目"] { background:#fff5e8; padding:10px; border-radius:6px; }
 
 .book-library-book:has(>input[type=checkbox]) { grid-template-columns:16px minmax(0,1fr) auto; align-items:center; }
 .book-library-book>div:not(.book-library-error) { display:grid; min-width:0; gap:2px; }
 .book-library-manage h3 { font-size:12px; margin:0 0 6px; }
 .book-library-manage p,.book-library-manage summary { font-size:11px; line-height:1.7; }
+
+.book-library-manage-feedback:empty { display:none; }
+.book-library-manage-feedback .book-library-error { padding:8px; border:1px solid #b7473666; border-radius:6px; background:#b7473608; }

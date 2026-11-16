@@ -37,6 +37,7 @@ export interface LibraryBookController {
   resume(options?: SerialResumeOptions): Promise<SerialTask>;
   pause(): Promise<SerialTask>;
   stop(): Promise<SerialTask>;
+  shutdownForDeletion?(): Promise<void>;
 }
 export interface LibraryQueueAdapter {
   ownerSessionId: string;
@@ -108,7 +109,7 @@ export class SerialLibraryRuntime {
     this.task = task;
   }
   /** Cancellation uses the already admitted controller even when access/config validation now fails. */
-  private async stopReservedBook(book: LibraryQueueBook | undefined, task: LibraryTask): Promise<void> {
+  private async stopReservedBook(book: LibraryQueueBook | undefined, task: LibraryTask, forDeletion = false): Promise<void> {
     if (book === undefined) return;
     let controller = this.controllers.get(book.ownerSessionId);
     if (controller === undefined) {
@@ -122,7 +123,8 @@ export class SerialLibraryRuntime {
       ? serial.ownerSessionId === book.ownerSessionId && serial.startChapter === book.startChapter && serial.targetChapter === book.targetChapter
       : serial.id === book.serialTaskId;
     if (!own) throw new Error("当前小说批次身份已经变化，无法确认本批章节已停止，请查看原会话。");
-    if (serial.status !== "completed") await controller.stop();
+    if (forDeletion && controller.shutdownForDeletion !== undefined) await controller.shutdownForDeletion();
+    else if (serial.status !== "completed") await controller.stop();
   }
   async restore(): Promise<LibraryTask | null> {
     await this.locked(async () => {
@@ -216,6 +218,33 @@ export class SerialLibraryRuntime {
     });
     this.wake?.();
     return this.snapshot()!;
+  }
+  /** Remove one reservation durably; future resumes must never admit the deleted book again. */
+  async excludeBookForDeletion(id: string, shutdownCurrentBook?: () => Promise<void>): Promise<void> {
+    await this.locked(async () => {
+      this.task ??= await this.adapter.load();
+      if (this.task === null) return;
+      assertLibraryTask(this.task);
+      if (this.task.cwd !== this.adapter.cwd) throw new Error("书库目录已变化，请在原目录处理删除。");
+      // Deletion is authorized against this library, including historical batches
+      // opened from a different library session. Preserve the original queue owner;
+      // The host can resolve the current book writer even when this old reservation
+      // refers to a previous batch or obsolete model settings.
+      const next = copy(this.task);
+      const book = next.books.find(item => item.id === id);
+      if (book === undefined) return;
+      // Keep the original receipt and errors if cancellation fails. Other books are untouched.
+      if (shutdownCurrentBook !== undefined) await shutdownCurrentBook();
+      else await this.stopReservedBook(book, next, true);
+      next.books = next.books.filter(item => item.id !== id);
+      if (next.activeBookId === id) delete next.activeBookId;
+      if (book.error !== undefined && next.error === book.error && !next.books.some(item => item.error === next.error)) delete next.error;
+      if (next.books.length === 0) { next.status = "completed"; delete next.error; }
+      else if (next.status === "running" && !next.books.some(item => item.status === "pending" || item.status === "running")) next.status = "completed";
+      await this.commit(next);
+      this.controllers.delete(book.ownerSessionId);
+    });
+    this.wake?.();
   }
   dispose(): void { this.disposed = true; this.wake?.(); }
   private kick(): void {

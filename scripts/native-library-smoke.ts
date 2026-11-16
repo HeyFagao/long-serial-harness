@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -22,7 +22,8 @@ const evidence = resolve(process.env.LIBRARY_EVIDENCE_DIR ?? join(root, "..", "l
 const digest = (value: string | Buffer): string => createHash("sha256").update(value).digest("hex");
 const sleep = (milliseconds: number): Promise<void> => new Promise(done => setTimeout(done, milliseconds));
 const keys = Array.from({ length: 10 }, (_, index) => `SMOKEBOOK${String(index + 1).padStart(2, "0")}`);
-const totalFor = (key: string): number => keys.indexOf(key) < 2 ? 32 : 11;
+const deletionKeys = ["SMOKEBOOK11", "SMOKEBOOK12"] as const;
+const totalFor = (key: string): number => keys.includes(key) && keys.indexOf(key) < 2 ? 32 : 11;
 const chapterPath = (chapter: number): string => `正文/第${String(chapter).padStart(3, "0")}章.md`;
 const titleFor = (key: string): string => `回归小说${key.slice(-2)}`;
 function redact(value: string): string { return value.replace(/([?&]token=)[^\s"'<>]+/gu, "$1[REDACTED]"); }
@@ -163,6 +164,10 @@ async function waitFor(condition: () => Promise<boolean>, description: string, t
   while (Date.now() < deadline) { if (await condition()) return; await sleep(100); }
   throw new Error(`Timed out: ${description}`);
 }
+async function absent(path: string): Promise<boolean> {
+  try { await lstat(path); return false; }
+  catch (error) { if (error instanceof Error && "code" in error && error.code === "ENOENT") return true; throw error; }
+}
 async function queue(origin: string, sessionId: string, input?: object): Promise<LibraryTask | null> { return (await api<{ readonly task: LibraryTask | null }>(origin, "library/queue", sessionId, input)).task; }
 async function waitQueue(origin: string, sessionId: string, accept: (task: LibraryTask) => boolean): Promise<LibraryTask> {
   let last = ""; let result: LibraryTask | null = null;
@@ -245,6 +250,9 @@ async function main(): Promise<void> {
   let child: ChildProcess | undefined; let browser: Browser | undefined; let model: ModelFixture | undefined; let passed = false;
   try {
     await mkdir(evidence, { recursive: true }); await mkdir(libraryPath, { recursive: true });
+    const librarySentinel = join(libraryPath, "书库原始资料_不得删除.txt");
+    const sentinelText = "Only selected book project directories may be removed. Preserve this library source.\n";
+    await writeFile(librarySentinel, sentinelText);
     const configuredTarball = process.env.SERIAL_PLUGIN_TARBALL; assert(configuredTarball !== undefined, "Set SERIAL_PLUGIN_TARBALL to the exact frozen novel-only package; this smoke never repacks");
     const tarball = resolve(configuredTarball); const pluginSha256 = digest(await readFile(tarball)); await cp(tarball, join(evidence, "novel-plugin-tested.tgz"));
     const entries = command("tar", ["-tzf", tarball]).trim().split("\n");
@@ -345,9 +353,6 @@ async function main(): Promise<void> {
     const secondStarted = (await queue(origin, sessionId, { action: "start", count: 20, concurrency: "all" }))!;
     await waitNativeRequest(origin, sessionId, model, `${keys[0]!}/11`);
     await waitFor(async () => keys.every(key => model!.waiting.has(`${key}/11`)), "ten simultaneous native chapter requests");
-    const recycleActive = await dshFetch(`${origin}/oh-story/library?sessionId=${encodeURIComponent(sessionId)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "archive", ids: [model.books.get(keys[0]!)!.id] }) });
-    const recycleActiveResult = await recycleActive.json() as { results: { ok: boolean }[] };
-    assert.equal(recycleActiveResult.results[0]?.ok, false, "Active model task must prevent recycling");
     await queue(origin, sessionId, { action: "stop" }); await waitQueue(origin, sessionId, task => task.status === "stopped");
     await waitFor(async () => !model!.waiting.has(`${keys[0]!}/11`), "stopped native model response cancellation"); assert.equal(model.answers.length, 100);
     for (const key of keys) model.holds.delete(`${key}/11`);
@@ -404,22 +409,117 @@ async function main(): Promise<void> {
     }
     assert.equal(chapterTxtCount, 152);
     const proseBefore = await Promise.all(keys.map(key => readFile(join(model!.books.get(key)!.absolutePath, chapterPath(1)), "utf8")));
-    await reopened.getByRole("button", { name: "删除所选书", exact: true }).click();
-    await reopened.getByRole("button", { name: "确认移入回收站", exact: true }).click();
     const librarySnapshot = async (): Promise<LibrarySnapshot> => {
       const response = await dshFetch(`${origin}/oh-story/library?sessionId=${encodeURIComponent(sessionId)}`); assert.equal(response.status, 200); return await response.json() as LibrarySnapshot;
     };
-    await waitFor(async () => (await librarySnapshot()).archivedBooks?.length === 10, "recycled ten complete books");
-    assert.equal((await librarySnapshot()).books.length, 0);
-    await reopened.getByText("回收站 · 10 本", { exact: true }).click();
-    await reopened.getByRole("button", { name: `恢复 ${titleFor(keys[0]!)}`, exact: true }).click();
-    await waitFor(async () => (await librarySnapshot()).books.length === 1, "restored book from UI");
-    const restoreOthers = await dshFetch(`${origin}/oh-story/library?sessionId=${encodeURIComponent(sessionId)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "restore", ids: keys.slice(1).map(key => model!.books.get(key)!.id) }) }); assert.equal(restoreOthers.status, 200);
-    await waitFor(async () => await reopened.getByRole("list", { name: "小说项目列表" }).getByRole("listitem").count() === 10, "restored ten books");
+
+    // Keep all completed-book assertions above; only these disposable additions
+    // exercise deletion while one native request runs and another book waits.
+    const additions = await api<LibrarySnapshot>(origin, "library", sessionId, { files: deletionKeys.map(key => ({ filename: `${key}.txt`, text: sourceFor(key) })) });
+    assert.equal(additions.books.length, 12);
+    for (const key of deletionKeys) {
+      const book = additions.books.find(item => item.filename === `${key}.txt`); assert(book !== undefined);
+      // API import creates files; the UI normally performs native registration.
+      const additionWorkspace = await rpc<{ readonly workspace: { readonly workspaceId: string } }>(origin, "workspace/create", { request: { path: book.absolutePath } });
+      assert(additionWorkspace.workspace.workspaceId !== "");
+      model.books.set(key, book); model.holds.add(`${key}/1`);
+    }
+    const deletionOutside = join(temporary, "outside-delete-target"); await mkdir(deletionOutside);
+    const deletionSentinel = join(deletionOutside, "sentinel.txt");
+    await writeFile(deletionSentinel, "outside deletion target must remain untouched\n");
+    const transientDeletionLink = join(model.books.get(deletionKeys[1])!.absolutePath, "临时清理阻塞");
+    await symlink(deletionOutside, transientDeletionLink, "junction");
+    await queue(origin, sessionId, { action: "start", count: "all", concurrency: 1 });
+    await waitNativeRequest(origin, sessionId, model, `${deletionKeys[0]}/1`);
+    const deletionIds = deletionKeys.map(key => model!.books.get(key)!.id);
+    const reserved = (await queue(origin, sessionId))!;
+    assert.equal(reserved.concurrency, 1);
+    assert.equal(reserved.books.find(book => book.id === deletionIds[0])?.status, "running");
+    assert.equal(reserved.books.find(book => book.id === deletionIds[1])?.status, "pending");
+    assert(!model.waiting.has(`${deletionKeys[1]}/1`), "The pending deletion fixture was dispatched early");
+    const deletionStart = Date.now();
+    const acceptedDeletion = await api<LibrarySnapshot & { readonly results: readonly { readonly id: string; readonly ok: boolean }[] }>(origin, "library", sessionId, { action: "delete", ids: deletionIds });
+    const deletionAcknowledgmentMs = Date.now() - deletionStart;
+    assert(deletionAcknowledgmentMs < 5000, `Deletion waited for background cleanup: ${String(deletionAcknowledgmentMs)} ms`);
+    assert.deepEqual(acceptedDeletion.results.map(item => [item.id, item.ok]), deletionIds.map(id => [id, true]));
+    assert.deepEqual(acceptedDeletion.books.map(book => book.id).sort(), snapshot.books.map(book => book.id).sort(), "Accepted deletion must immediately hide both selected books");
+    await waitFor(async () => {
+      assert(!(await librarySnapshot()).books.some(book => deletionIds.includes(book.id)), "A cleanup failure made an accepted deletion visible again");
+      const journal = JSON.parse(await readFile(join(libraryPath, "追踪/书库删除任务.json"), "utf8")) as { readonly jobs: readonly { readonly book: { readonly id: string }; readonly status: string; readonly attempts?: number; readonly error?: string; readonly nextRetryAt?: string }[] };
+      const job = journal.jobs.find(item => item.book.id === deletionIds[1]);
+      if ((job?.attempts ?? 0) < 1) return false;
+      assert.equal(job!.status, "pending"); assert(job!.error?.includes("链接"));
+      assert(Number.isFinite(Date.parse(job!.nextRetryAt ?? "")), "Failed cleanup has no automatic retry scheduled");
+      return true;
+    }, "hidden failed deletion automatically scheduled for retry", 60_000);
+    assert.deepEqual(await readdir(deletionOutside), ["sentinel.txt"]);
+    assert.equal(await readFile(deletionSentinel, "utf8"), "outside deletion target must remain untouched\n");
+    await rm(transientDeletionLink);
+    const removedAdditions = (): Promise<boolean[]> => Promise.all(deletionKeys.map(key => absent(model!.books.get(key)!.absolutePath)));
+    await waitFor(async () => {
+      const visible = (await librarySnapshot()).books;
+      assert(!visible.some(book => deletionIds.includes(book.id)), "An accepted deletion reappeared during cleanup");
+      return (await removedAdditions()).every(Boolean);
+    }, "physical deletion of running and pending projects", 60_000);
+    await waitFor(async () => deletionKeys.every(key => !model!.waiting.has(`${key}/1`)), "deleted native model request cancellation");
+    const afterDeletion = (await queue(origin, sessionId))!;
+    assert(!afterDeletion.books.some(book => deletionIds.includes(book.id)), "Deleted books remained reserved in the queue");
+    assert.equal(afterDeletion.status, "completed");
+    const resumeDeleted = await dshFetch(`${origin}/oh-story/library/queue?sessionId=${encodeURIComponent(sessionId)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "resume" }) });
+    assert.equal(resumeDeleted.status, 409, "A completed queue must not resume a deleted reservation");
+    for (const key of deletionKeys) model.holds.delete(`${key}/1`);
+    await queue(origin, sessionId, { action: "start", count: 10, concurrency: "all" });
+    const afterRestart = await waitQueue(origin, sessionId, task => task.status === "completed");
+    assert.equal(afterRestart.books.length, 10); assert(afterRestart.books.every(book => book.status === "skipped"));
+    assert(!afterRestart.books.some(book => deletionIds.includes(book.id)));
+    assert((await removedAdditions()).every(Boolean), "A stopped writer recreated a deleted book");
+    assert.deepEqual(await readdir(deletionOutside), ["sentinel.txt"]);
+    assert.equal(await readFile(deletionSentinel, "utf8"), "outside deletion target must remain untouched\n");
+    assert.equal(model.answers.length, 152); assert.equal(model.titles.length, 152);
+    assert.equal(model.failures.length, 0, model.failures.join("\n"));
     assert.deepEqual(await Promise.all(keys.map(key => readFile(join(model!.books.get(key)!.absolutePath, chapterPath(1)), "utf8"))), proseBefore);
     for (const key of keys) await checkBook(model.books.get(key)!, key);
+    await waitFor(async () => await reopened.getByRole("list", { name: "小说项目列表" }).getByRole("listitem").count() === 10, "only original ten books remain visible");
     await reopened.screenshot({ path: join(evidence, "library-complete.png"), animations: "disabled" }); assert.equal(pageErrors.length, 0, pageErrors.join("\n"));
-    const report = { ok: true, simultaneousNativeRequests: 10, dshVersion: version, pluginSha256, provider: "local-deterministic-text-fixture", realPaidModel: false, importedBooks: 10, registeredNativeWorkspaces: 10, separateProjectDirectories: 10, batches: [{ count: 10, accepted: 100 }, { count: 20, accepted: 48 }, { count: "all", accepted: 4 }], acceptedChapters: 152, freshNativeChapterSessions: 152, independentTitleSessions: 152, titleContextIsolation: "passed-current-chapter-only", titleRetryWithoutRewritingProse: "passed", chapterTxtFiles: 152, hostCommittedTextAndState: "passed", originalSystemSha256: ORIGINAL_SYSTEM_PROMPT_SHA256, originalRewriteAndBackup: "passed", fullStyleAndPreviousTen: "passed", bookIsolation: "passed", exportedBooks: 10, batchTxtZipDownload: "passed-10-book-zips-152-chapter-txts", recycleAndRestore: "passed-10-books-prose-unchanged", activeBookRecycle: "rejected", failedBookIsolationAndRetry: "passed", pauseResume: "passed", stopResumeFixedTargets: "passed", duplicateStart: "passed", nativeHostRestart: "passed", browserCloseAndReopen: "passed", novelOnlyPackageAndUI: "passed", outsideSymlinkImport: "rejected-without-outside-writes", modelToolCalls: 0, literaryQuality: "not assessed" };
+
+    // A user may reopen the library in a fresh conversation after generation.
+    // Deletion is authorized by the same workspace, without taking queue ownership.
+    const deletionSession = await rpc<{ readonly sessionId: string }>(origin, "session/create", { request: { workspaceId: workspace.workspace.workspaceId, sessionId: crypto.randomUUID() } });
+    assert.notEqual(deletionSession.sessionId, sessionId);
+    await rpc(origin, "session/selectModel", { request: { sessionId: deletionSession.sessionId, provider: "deepseek-official", model: "deepseek-flash" } });
+    const beforeDeletionReady = model.requests;
+    await rpc(origin, "session/prompt", { request: { requestId: crypto.randomUUID(), sessionId: deletionSession.sessionId, mode: "queue", content: [{ type: "text", text: "LIBRARY_SMOKE_READY: reply ready without tools." }] } });
+    await waitFor(async () => model!.requests > beforeDeletionReady && !(await rpc<{ readonly running: boolean }>(origin, "session/state", { request: { sessionId: deletionSession.sessionId } })).running, "fresh library deletion session ready");
+    await rpc(origin, "session/rename", { request: { sessionId: deletionSession.sessionId, title: "书库删除验收新会话" } });
+    await reopened.getByRole("treeitem").filter({ hasText: "书库删除验收新会话" }).first().click({ timeout: 20_000 });
+    await reopened.locator(`[data-conversation-session="${deletionSession.sessionId}"]`).waitFor({ state: "visible", timeout: 20_000 });
+    const reopenDeletionWorkbench = reopened.getByRole("button", { name: "打开长篇工作台", exact: true }); if (await reopenDeletionWorkbench.isVisible()) await reopenDeletionWorkbench.click();
+    await waitFor(async () => await reopened.getByRole("list", { name: "小说项目列表" }).getByRole("listitem").count() === 10, "completed books visible from the fresh library session");
+    assert.equal((await queue(origin, deletionSession.sessionId))?.ownerSessionId, sessionId, "Opening the library silently took ownership of its completed queue");
+    const nativeDialogs: string[] = [];
+    reopened.on("dialog", async dialog => { nativeDialogs.push(dialog.message()); await dialog.dismiss(); });
+    await reopened.getByRole("button", { name: "选择已完本", exact: true }).click();
+    const deleteResponse = reopened.waitForResponse(response => response.url().includes("/oh-story/library?") && response.request().method() === "POST" && (response.request().postDataJSON() as { action?: string }).action === "delete", { timeout: 10_000 });
+    await reopened.getByRole("button", { name: "删除所选书", exact: true }).click();
+    await waitFor(async () => await reopened.getByRole("list", { name: "小说项目列表" }).getByRole("listitem").count() === 0, "selected projects immediately hidden without a confirmation dialog", 5000);
+    assert.equal((await deleteResponse).status(), 200); assert.deepEqual(nativeDialogs, []);
+    assert.equal(await reopened.getByRole("button", { name: /确认.*(?:删除|回收)/u }).count(), 0);
+    await waitFor(async () => {
+      assert.equal((await librarySnapshot()).books.length, 0, "Accepted completed-book deletion reappeared");
+      return (await Promise.all(keys.map(key => absent(model!.books.get(key)!.absolutePath)))).every(Boolean);
+    }, "physical deletion of all ten completed book roots", 90_000);
+    await waitFor(async () => (await librarySnapshot()).deletingBooks?.length === 0, "completed deletion jobs removed from the durable journal");
+    const finalSnapshot = await librarySnapshot();
+    assert.equal(finalSnapshot.books.length, 0); assert.equal(finalSnapshot.archivedBooks?.length ?? 0, 0);
+    assert.equal(finalSnapshot.deletingBooks?.length ?? 0, 0);
+    assert.deepEqual(await readdir(join(libraryPath, "小说项目")), []);
+    assert.equal(await readFile(librarySentinel, "utf8"), sentinelText);
+    for (const key of keys) assert.equal(await readFile(join(inputFiles, `${key}.txt`), "utf8"), sourceFor(key));
+    assert.equal(await absent(join(libraryPath, "追踪/书库任务.json")), false, "Shared library state was removed with a selected book");
+    assert.equal((await queue(origin, deletionSession.sessionId))?.ownerSessionId, sessionId, "Deletion took ownership of another session's completed queue");
+    assert.equal(model.answers.length, 152); assert.equal(model.titles.length, 152); assert.equal(model.failures.length, 0, model.failures.join("\n"));
+    await reopened.screenshot({ path: join(evidence, "library-deleted.png"), animations: "disabled" }); assert.equal(pageErrors.length, 0, pageErrors.join("\n"));
+    const report = { ok: true, simultaneousNativeRequests: 10, dshVersion: version, pluginSha256, provider: "local-deterministic-text-fixture", realPaidModel: false, importedBooks: 10, deletionFixtureBooks: 2, registeredNativeWorkspaces: 10, separateProjectDirectories: 10, batches: [{ count: 10, accepted: 100 }, { count: 20, accepted: 48 }, { count: "all", accepted: 4 }], acceptedChapters: 152, freshNativeChapterSessions: 152, independentTitleSessions: 152, titleContextIsolation: "passed-current-chapter-only", titleRetryWithoutRewritingProse: "passed", chapterTxtFiles: 152, hostCommittedTextAndState: "passed", originalSystemSha256: ORIGINAL_SYSTEM_PROMPT_SHA256, originalRewriteAndBackup: "passed", fullStyleAndPreviousTen: "passed", bookIsolation: "passed", exportedBooks: 10, batchTxtZipDownload: "passed-10-book-zips-152-chapter-txts", backgroundDeletion: "passed-running-and-pending-books-physically-removed", deletionAcknowledgmentMs, failedDeletionAutoRetry: "passed-hidden-symlink-failure-then-automatic-recovery", outsideDeletionTarget: "preserved", deletedQueueResurrection: "prevented-on-resume-and-new-batch", uiPermanentDeletion: "passed-10-books-no-confirmation-no-recycle", crossSessionCompletedBookDeletion: "passed-without-taking-queue-ownership", libraryAndOriginalInputPreservation: "passed", failedBookIsolationAndRetry: "passed", pauseResume: "passed", stopResumeFixedTargets: "passed", duplicateStart: "passed", nativeHostRestart: "passed", browserCloseAndReopen: "passed", novelOnlyPackageAndUI: "passed", outsideSymlinkImport: "rejected-without-outside-writes", modelToolCalls: 0, literaryQuality: "not assessed" };
     await writeFile(join(evidence, "library-smoke.json"), `${JSON.stringify(report, null, 2)}\n`); for (const name of ["library-failure.log", "library-failure.png", "library-failure-aria.txt"]) await rm(join(evidence, name), { force: true });
     process.stdout.write(`${JSON.stringify(report)}\n`); passed = true;
   } catch (error) {

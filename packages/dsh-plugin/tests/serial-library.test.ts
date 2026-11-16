@@ -53,6 +53,14 @@ async function writeChapter(test: ReturnType<typeof library>, book: LibraryBook,
 }
 
 describe("book recycling and TXT export", () => {
+  it("keeps the durable book identity when failed generation records are malformed", async () => {
+    const test = library();
+    const book = (await importLibraryBooks(test.realm, [source(1)])).books[0]!;
+    test.files.set(`${book.absolutePath}/追踪/连载任务.json`, "broken json");
+    const snapshot = await listLibraryBooks(test.realm);
+    expect(snapshot.books).toHaveLength(1);
+    expect(snapshot.books[0]).toMatchObject({ id: book.id, relativePath: book.relativePath, status: "blocked" });
+  });
   it("holds a pending title out of export and uses only a title bound to the saved chapter", async () => {
     const test = library(); const book = (await importLibraryBooks(test.realm, [source(1)])).books[0]!;
     await writeChapter(test, book);

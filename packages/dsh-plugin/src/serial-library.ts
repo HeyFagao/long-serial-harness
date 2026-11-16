@@ -8,6 +8,8 @@ import { zipSync, strToU8 } from "fflate";
 import { exportSerialChapters, importSerialOutline } from "./serial-route.js";
 import { jsonBody, mapFsError, readVersionedFile, send, workspaceRealmForSession, WorkspaceHttpError, type WorkspaceRealm } from "./workspace-route.js";
 import { isTrustedWorkspaceRequest } from "./workspace-request-trust.js";
+import { DELETION_JOURNAL, deletionJobs, enqueueBookDeletion, resumeBookDeletions } from "./serial-library-deletion-jobs.js";
+import { withLibraryOperation } from "./serial-library-operations.js";
 
 export const LIBRARY_DIRECTORY = "小说项目";
 const BOOK_RECEIPT = "追踪/书项目.json";
@@ -36,6 +38,7 @@ interface BookReceipt {
   readonly totalChapters: number;
   readonly status: "importing" | "ready";
   readonly archivedAt?: string;
+  readonly deletingAt?: string;
 }
 export interface LibrarySnapshot {
   readonly libraryPath: string;
@@ -44,6 +47,7 @@ export interface LibrarySnapshot {
   readonly books: readonly LibraryBook[];
   readonly limits: typeof LIBRARY_LIMITS;
   readonly archivedBooks?: readonly LibraryBook[];
+  readonly deletingBooks?: readonly LibraryBook[];
 }
 export interface LibraryImportResult {
   readonly filename: string;
@@ -91,6 +95,10 @@ export async function realmForLibraryBook(library: WorkspaceRealm, relativePath:
 }
 
 async function bookView(realm: WorkspaceRealm, receipt: BookReceipt): Promise<LibraryBook> {
+  const base = { id: receipt.id, title: receipt.title, filename: receipt.filename, absolutePath: realm.cwd,
+    relativePath: receipt.relativePath, totalChapters: receipt.totalChapters, completedChapters: 0 };
+  if (receipt.deletingAt !== undefined) return { ...base, status: "deleting" };
+  try {
   const state = await readJson(realm, "追踪/_tracking-state.json");
   const task = await readJson(realm, "追踪/连载任务.json");
   const completed = state?.value.last_committed_chapter;
@@ -101,6 +109,10 @@ async function bookView(realm: WorkspaceRealm, receipt: BookReceipt): Promise<Li
     status: receipt.archivedAt !== undefined ? "archived" : receipt.status !== "ready" ? "incomplete" : typeof task?.value.status === "string" ? task.value.status : "ready",
     ...(typeof task?.value.error === "string" ? { error: task.value.error } : {})
   };
+  } catch (error) {
+    // Broken generation records must not replace the durable identity needed for deletion.
+    return { ...base, status: receipt.archivedAt === undefined ? "blocked" : "archived", error: error instanceof Error ? error.message : "本书生成记录不可读。" };
+  }
 }
 
 /** Disk receipts, rather than browser state, are the durable book catalogue. */
@@ -111,12 +123,16 @@ export async function listLibraryBooks(realm: WorkspaceRealm): Promise<LibrarySn
     return { libraryPath: realm.cwd, parentLibraryPath: receipt.libraryPath, isBookProject: true, books: [await bookView(realm, receipt)], limits: LIBRARY_LIMITS };
   }
   const directory = await containedTarget(realm, LIBRARY_DIRECTORY);
+  const journal = await readJson(realm, DELETION_JOURNAL);
+  const deletingBooks: LibraryBook[] = journal === undefined ? [] : deletionJobs(journal.value).map(job => ({ ...job.book, status: "deleting" }));
+  const hiddenPaths = new Set(deletingBooks.map(book => book.relativePath));
   const stat = await realm.fs.stat(directory);
-  if (stat === undefined) return { libraryPath: realm.cwd, isBookProject: false, books: [], limits: LIBRARY_LIMITS };
+  if (stat === undefined) return { libraryPath: realm.cwd, isBookProject: false, books: [], deletingBooks, limits: LIBRARY_LIMITS };
   if (stat.type !== "directory") throw new WorkspaceHttpError(409, "小说项目不是目录，请先处理同名文件。");
   const books: LibraryBook[] = [];
   for (const entry of await realm.fs.listDir(directory)) {
     if (entry.type !== "directory") continue;
+    if (hiddenPaths.has(`${LIBRARY_DIRECTORY}/${entry.name}`)) continue;
     if (!realm.fs.contains(realm.root, entry.target)) continue;
     let child: WorkspaceRealm | undefined;
     try {
@@ -125,14 +141,15 @@ export async function listLibraryBooks(realm: WorkspaceRealm): Promise<LibrarySn
       if (stored === undefined) continue;
       const receipt = receiptOf(stored.value);
       if (receipt.relativePath !== `${LIBRARY_DIRECTORY}/${entry.name}`) throw new WorkspaceHttpError(409, "书项目记录与目录不一致，请先核对移动过的项目。");
-      books.push(await bookView(child, receipt));
+      const book = await bookView(child, receipt);
+      if (book.status === "deleting") deletingBooks.push(book); else books.push(book);
     } catch (error) {
       books.push({ id: createHash("sha256").update(`${realm.cwd}/${entry.name}`).digest("hex"), title: entry.name, filename: "", absolutePath: child?.cwd ?? "",
         relativePath: `${LIBRARY_DIRECTORY}/${entry.name}`, totalChapters: 0, completedChapters: 0, status: "blocked",
         error: error instanceof Error ? error.message : "本书记录不可读，请先处理此项目。" });
     }
   }
-  return { libraryPath: realm.cwd, isBookProject: false, books: books.filter(book => book.status !== "archived").sort((a, b) => a.title.localeCompare(b.title, "zh-Hans-CN") || a.id.localeCompare(b.id)), archivedBooks: books.filter(book => book.status === "archived"), limits: LIBRARY_LIMITS };
+  return { libraryPath: realm.cwd, isBookProject: false, books: books.filter(book => book.status !== "archived").sort((a, b) => a.title.localeCompare(b.title, "zh-Hans-CN") || a.id.localeCompare(b.id)), archivedBooks: books.filter(book => book.status === "archived"), deletingBooks, limits: LIBRARY_LIMITS };
 }
 
 export function validateLibraryInputs(value: unknown): readonly LibraryInputFile[] {
@@ -168,12 +185,15 @@ async function importBook(realm: WorkspaceRealm, file: LibraryInputFile): Promis
   const sourceSha256 = createHash("sha256").update(file.text, "utf8").digest("hex");
   const id = createHash("sha256").update(JSON.stringify([sourceSha256, title]), "utf8").digest("hex");
   const relativePath = `${LIBRARY_DIRECTORY}/${folderTitle(title)}--${id.slice(0, 12)}`;
+  const deletionJournal = await readJson(realm, DELETION_JOURNAL);
+  if (deletionJournal !== undefined && deletionJobs(deletionJournal.value).some(job => job.book.id === id)) throw new WorkspaceHttpError(409, "这本书正在后台清理，请稍后重新导入。");
   const child = await realmForLibraryBook(realm, relativePath);
   const previous = await readJson(child, BOOK_RECEIPT);
   if (previous === undefined && await realm.fs.stat(child.root) !== undefined) throw new WorkspaceHttpError(409, "目标目录已经存在但不是此书的导入项目，未覆盖其文件。");
   const receipt: BookReceipt = { schemaVersion: 1, id, title, filename: file.filename, sourceSha256, libraryPath: realm.cwd, relativePath, totalChapters: parsed.chapters.length, status: "importing" };
   if (previous !== undefined) {
     const stored = receiptOf(previous.value);
+    if (stored.deletingAt !== undefined) throw new WorkspaceHttpError(409, "这本书正在后台清理，请稍后重新导入。");
     if (stored.id !== id || stored.sourceSha256 !== sourceSha256 || stored.relativePath !== relativePath) throw new WorkspaceHttpError(409, "目标项目与当前输入不同，已保留原项目。");
     if (stored.archivedAt !== undefined) throw new WorkspaceHttpError(409, "这本书已在回收站，请先恢复；重复导入不会覆盖或新建成稿。");
     if (stored.status === "ready") return { filename: file.filename, status: "existing", book: await bookView(child, stored) };
@@ -269,34 +289,31 @@ export async function exportLibraryBooks(realm: WorkspaceRealm, ids: readonly st
 }
 
 export function registerLibraryRoute(context: Context, options: { readonly trustedHosts?: readonly string[] } = {}): void {
-  const locks = new Map<string, Promise<unknown>>();
   context.effect(() => context.webServer.register({ kind: "exact", path: "/oh-story/library", async handler(request: IncomingMessage, response: ServerResponse) {
     try {
       if (!isTrustedWorkspaceRequest(request, options.trustedHosts ?? [])) throw new WorkspaceHttpError(403, "请求来源不受信任。");
       const url = new URL(request.url ?? "/", "http://127.0.0.1");
       const realm = await workspaceRealmForSession(context, url.searchParams.get("sessionId") ?? "");
-      if (request.method === "GET") { send(response, 200, await listLibraryBooks(realm)); return; }
+      if (request.method === "GET") {
+        const snapshot = await listLibraryBooks(realm);
+        if (!snapshot.isBookProject) resumeBookDeletions(context, realm);
+        send(response, 200, snapshot); return;
+      }
       if (request.method !== "POST") throw new WorkspaceHttpError(405, "仅支持 GET 和 POST。");
       const input = await jsonBody(request, LIBRARY_LIMITS.maxTotalBytes * 3 + 65536);
       const files = input.action === undefined ? validateLibraryInputs(input.files) : undefined;
-      const key = realm.root.targetKey;
-      const previous = locks.get(key) ?? Promise.resolve();
-      const current = previous.catch(() => undefined).then(async () => {
+      if (input.action === "delete") { send(response, 200, await enqueueBookDeletion(context, realm, selectedLibraryIds(input.ids))); return; }
+      const result = await withLibraryOperation(context, realm.root.targetKey, async () => {
         if (files !== undefined) return importLibraryBooks(realm, files);
         const ids = selectedLibraryIds(input.ids);
         if (input.action === "export") return exportLibraryBooks(realm, ids);
         if (input.action === "archive" || input.action === "restore") return recycleLibraryBooks(realm, ids, input.action === "restore");
         throw new WorkspaceHttpError(400, "未知书库管理操作。");
       });
-      locks.set(key, current);
-      try {
-        const result = await current;
         if (result instanceof Uint8Array) {
           response.writeHead(200, { "content-type": "application/zip", "content-length": result.length, "content-disposition": 'attachment; filename="novels-txt.zip"', "cache-control": "no-store", "x-content-type-options": "nosniff" });
           response.end(result);
         } else send(response, 200, result);
-      }
-      finally { if (locks.get(key) === current) locks.delete(key); }
     } catch (error) {
       const mapped = error instanceof WorkspaceHttpError ? error : mapFsError(error);
       send(response, mapped?.status ?? 409, { error: mapped?.message ?? (error instanceof Error ? error.message : "书库操作失败。") });
