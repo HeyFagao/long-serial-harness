@@ -13,11 +13,16 @@
 ## 安装
 
 1. 安装 [官方 DeepSeek Harness](https://deepseek.com/harness/)。当前验证版本为 **0.2.2-rc.3**。
-2. 从 [v0.1.26-serial.3 发布页](https://github.com/HeyFagao/long-serial-harness/releases/tag/v0.1.26-serial.3) 下载 `long-serial-partner-0.1.26-serial.3.zip` 并解压。
-3. Mac 双击 `install-serial.command`；Windows 使用 `install-serial.ps1`。也可在 Harness「插件 → 添加插件 → 包名或地址」填写解压后的 `.tgz` 完整路径。
-4. 在 Harness 添加一个空文件夹工作区作为书库，打开长篇工作台并批量选择最终输出文件。在下方模型选择器选定中转站模型，然后开始生成。
+2. 在 Harness「插件 → 添加插件 → 包名或地址」粘贴下面的公开插件安装直链：
 
-仓库目前为私有。已有仓库访问权限的合伙人登录 GitHub 后下载；也可以由持有者直接转发安装 ZIP。私有发布附件的网址不能当作免登录安装直链。不要把源码仓库根目录当作插件安装包。
+```text
+https://github.com/HeyFagao/long-serial-harness/releases/download/v0.1.26-serial.3/oh-story-dsh-0.1.26-serial.3.tgz
+```
+
+3. 安装后保存当前工作并重新打开 Harness。在「设置 → 模型」添加自己的中转站，选定写作模型。
+4. 添加一个空文件夹工作区作为书库，打开长篇工作台并批量选择最终输出文件，然后开始生成。
+
+仓库和发布附件均已公开，无需 GitHub 登录。网络无法直接安装时，从 [v0.1.26-serial.3 发布页](https://github.com/HeyFagao/long-serial-harness/releases/tag/v0.1.26-serial.3) 下载 `long-serial-partner-0.1.26-serial.3.zip` 并解压，按包内说明运行安装脚本或使用本地 `.tgz` 完整路径。不要把源码仓库根目录当作插件安装包。
 
 ## 使用与验证
 
