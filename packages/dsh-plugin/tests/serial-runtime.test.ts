@@ -47,6 +47,42 @@ async function eventually(check: () => boolean): Promise<void> {
 }
 
 describe("native serial scheduler", () => {
+  it("captures a detached model choice for a batch and keeps it across a cold pause/resume", async () => {
+    const f = fixture(2); f.hold();
+    const modelSelection = { provider: "relay-gpt", model: "gpt-writing", reasoningEffort: "high" };
+    const runtime = new SerialRuntime(f.adapter); await runtime.start({ count: 2, modelSelection });
+    modelSelection.model = "later-main-chat-model"; modelSelection.reasoningEffort = "low";
+    await eventually(() => runtime.snapshot()?.active?.dispatched === true);
+    await runtime.pause(); f.finish();
+    await eventually(() => runtime.snapshot()?.status === "paused"); runtime.dispose();
+    expect(f.disk()?.modelSelection).toEqual({ provider: "relay-gpt", model: "gpt-writing", reasoningEffort: "high" });
+    const restored = new SerialRuntime(f.adapter); await restored.restore(); f.auto(); await restored.resume();
+    await eventually(() => restored.snapshot()?.status === "completed");
+    expect(restored.snapshot()?.modelSelection).toEqual({ provider: "relay-gpt", model: "gpt-writing", reasoningEffort: "high" });
+    expect(restored.snapshot()?.targetChapter).toBe(2); restored.dispose();
+  });
+
+  it("uses the next batch's complete choice without carrying over the previous effort", async () => {
+    const f = fixture(2); const runtime = new SerialRuntime(f.adapter);
+    await runtime.start({ count: 1, modelSelection: { provider: "relay", model: "same-model", reasoningEffort: "high" } });
+    await eventually(() => runtime.snapshot()?.status === "completed");
+    await runtime.start({ count: 1, modelSelection: { provider: "relay", model: "same-model" } });
+    await eventually(() => runtime.snapshot()?.status === "completed");
+    expect(runtime.snapshot()?.modelSelection).toEqual({ provider: "relay", model: "same-model" });
+    expect(runtime.snapshot()?.startChapter).toBe(2); runtime.dispose();
+  });
+
+  it("rejects malformed persisted model choices while accepting legacy tasks without one", async () => {
+    const f = fixture(1); const runtime = new SerialRuntime(f.adapter); await runtime.start({ count: 1 });
+    await eventually(() => runtime.snapshot()?.status === "completed");
+    const task = runtime.snapshot()!;
+    expect(() => assertSerialTask(task)).not.toThrow();
+    for (const modelSelection of [{ provider: "", model: "gpt" }, { provider: "relay", model: "gpt", reasoningEffort: 3 }, { provider: "relay" }]) {
+      expect(() => assertSerialTask({ ...task, modelSelection })).toThrow();
+    }
+    runtime.dispose();
+  });
+
   it("waits for in-flight manuscript finalization and inspection before deletion settles", async () => {
     const f = fixture(2); f.hold();
     let releaseFinalization!: () => void; let releaseInspection!: () => void;

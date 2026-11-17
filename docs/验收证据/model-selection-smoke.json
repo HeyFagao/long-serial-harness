@@ -1,0 +1,46 @@
+{
+  "ok": true,
+  "phase": "batch-model-selection",
+  "dshVersion": "0.2.2-rc.3",
+  "pluginVersion": "0.1.26-serial.8",
+  "pluginSha256": "3bfac4ae3160c6f5bbcc5592fb21ffded584d02f85cdf0428946749f8ab2b1cd",
+  "provider": "local-deterministic-text-fixture",
+  "realPaidModel": false,
+  "nativeCatalog": "passed-two-native-models-and-supported-efforts",
+  "invalidEffort": "rejected-before-model-request-and-task-write",
+  "singleBookSelection": "passed-different-model-and-effort-from-parent",
+  "libraryAppendSelection": "passed-two-books-with-independent-models-and-efforts",
+  "coldResumeSelection": "passed-pending-and-active-books-kept-snapshots-after-parent-model-change",
+  "parentSelection": "not-mutated-by-start-append-or-resume",
+  "bodyAndTitleWireSelection": "passed-model-and-effort",
+  "durableNativeRequestHeaders": "passed-provider-model-reasoning-effort",
+  "uiModelAndEffortSelection": "passed-single-book-and-library-start",
+  "selectedBooks": 3,
+  "acceptedChapters": 4,
+  "freshNativeChapterSessions": 4,
+  "independentTitleSessions": 4,
+  "modelSelections": [
+    {
+      "book": "SMOKEBOOK01",
+      "provider": "deepseek-official",
+      "model": "deepseek-v4-pro",
+      "reasoningEffort": "low"
+    },
+    {
+      "book": "SMOKEBOOK02",
+      "provider": "deepseek-official",
+      "model": "deepseek-v4-pro",
+      "reasoningEffort": "high"
+    },
+    {
+      "book": "SMOKEBOOK03",
+      "provider": "deepseek-official",
+      "model": "deepseek-flash",
+      "reasoningEffort": "low"
+    }
+  ],
+  "originalSystemSha256": "4e56881a6c2ac904dd50467eead4ada0e452e5d2c1d598701622a5b73cc4abf2",
+  "fullStyleAndPreviousTen": "passed",
+  "modelToolCalls": 0,
+  "literaryQuality": "not assessed"
+}

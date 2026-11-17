@@ -2,6 +2,7 @@ import { basename, dirname } from "node:path";
 import { assertBookNotDeleting, isBookDeleting } from "./serial-library-operations.js";
 import { assertBookDeletionNotQueued } from "./serial-library-deletion-jobs.js";
 import { buildWechatTitlePrompt, parseWechatTitleOutput } from "./wechat-title.js";
+import { resolveSerialModelSelection } from "./serial-models.js";
 import { createChapterZip, safeExportName, type ExportBook, type ExportChapter } from "./serial-export.js";
 import { createHash, randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -372,8 +373,9 @@ export function createSerialAdapter(context: Context, realm: WorkspaceRealm): Se
     if (receipt !== undefined && (JSON.parse(receipt) as { deletingAt?: unknown }).deletingAt !== undefined) throw new WorkspaceHttpError(409, "本书正在后台删除，不能继续生成。");
     if (receipt !== undefined && (JSON.parse(receipt) as { archivedAt?: unknown }).archivedAt !== undefined) throw new WorkspaceHttpError(409, "本书已在回收站，请先从书库恢复再继续生成。");
   };
-  const native = createNativeSerialController(context, async () => { await refresh(); return realm; });
-  const titleNative = createNativeSerialController(context, async () => { await refresh(); return realm; }, "公众号标题");
+  const modelSelection = () => currentTask?.modelSelection;
+  const native = createNativeSerialController(context, async () => { await refresh(); return realm; }, "长篇连载", modelSelection);
+  const titleNative = createNativeSerialController(context, async () => { await refresh(); return realm; }, "公众号标题", modelSelection);
   const titleSource = async (chapter: number) => {
     await refresh(); await requireAvailableBook();
     const path = (await chapterPaths(realm, "prose")).get(chapter);
@@ -687,7 +689,8 @@ export function registerSerialRoute(context: Context, options: { readonly truste
             const maxChars = optionalNumber("maxChars");
             const divergence = optionalNumber("divergence");
             if (input.style !== undefined && (typeof input.style !== "string" || input.style.length > 10_000)) throw new WorkspaceHttpError(400, "文风要求必须是 10000 字以内的文本。");
-            task = await holder.runtime.start({ count: input.count, ...(startChapter === undefined ? {} : { startChapter }), ...(maxAttempts === undefined ? {} : { maxAttempts }), ...(minChars === undefined ? {} : { minChars }), ...(maxChars === undefined ? {} : { maxChars }), ...(divergence === undefined ? {} : { divergence }), ...(input.style === undefined ? {} : { style: input.style }) });
+            const modelSelection = await resolveSerialModelSelection(realm, input.modelSelection);
+            task = await holder.runtime.start({ count: input.count, modelSelection, ...(startChapter === undefined ? {} : { startChapter }), ...(maxAttempts === undefined ? {} : { maxAttempts }), ...(minChars === undefined ? {} : { minChars }), ...(maxChars === undefined ? {} : { maxChars }), ...(divergence === undefined ? {} : { divergence }), ...(input.style === undefined ? {} : { style: input.style }) });
             break;
           }
           case "pause": task = await holder.runtime.pause(); break;

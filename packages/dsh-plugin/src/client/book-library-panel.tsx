@@ -3,6 +3,8 @@ import type { LibraryBook, LibraryImportResult, LibraryInputFile, LibrarySnapsho
 import type { LibraryCount, LibraryQueueBook, LibraryTask } from "../serial-library-runtime.js";
 import { endpoint } from "./workbench-ui.js";
 import libraryStyles from "./book-library.css?inline";
+import type { SerialModelSelection } from "../serial-model-selection.js";
+import { GenerationModelPicker, describeGenerationSelection, generationModelFields } from "./generation-model-picker.js";
 
 export interface NativeBookNavigation {
   register(path: string, title: string): Promise<string>;
@@ -158,6 +160,8 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
   const concurrencyDirty = useRef(false);
   const [generationScope, setGenerationScope] = useState<"selected" | "all">("selected");
   const [generationCount, setGenerationCount] = useState<LibraryCount>(10);
+  const [modelSelection, setModelSelection] = useState<SerialModelSelection>();
+  const [modelProblem, setModelProblem] = useState<string | undefined>("正在读取可用模型，请稍候。");
   const [generationError, setGenerationError] = useState<string>();
   const [generationNotice, setGenerationNotice] = useState<string>();
   const [bookSearch, setBookSearch] = useState("");
@@ -341,6 +345,7 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
   };
   const queueAction = async (action: "start" | "pause" | "resume" | "stop" | "pauseBooks" | "resumeBooks", count?: LibraryCount, ids?: readonly string[]): Promise<void> => {
     if (pending !== undefined) return;
+    if (action === "start" && modelProblem !== undefined) { setGenerationError(modelProblem); return; }
     if ((action === "start" || action === "pauseBooks" || action === "resumeBooks") && (ids === undefined || ids.length === 0)) { setGenerationError("请先选择要操作的书。"); return; }
     queueRevision.current += 1;
     setPending(`queue-${action}`); setError(undefined); setGenerationError(undefined); setGenerationNotice(undefined);
@@ -353,7 +358,7 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
         const failed = targets.find(book => registrationsRef.current[book.id]?.workspaceId === undefined);
         if (failed !== undefined) throw new Error(`《${failed.title}》尚未完成 Harness 项目登记，请在书卡上重试登记后开始。`);
       }
-      const value = await responseJson<{ readonly task: LibraryTask | null }>(await fetch(endpoint("library/queue", sessionId), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action, concurrency: concurrency === "all" ? "all" : Number(concurrency), ...(count === undefined ? {} : { count }), ...(ids === undefined ? {} : { ids: [...new Set(ids)] }) }) }));
+      const value = await responseJson<{ readonly task: LibraryTask | null }>(await fetch(endpoint("library/queue", sessionId), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action, ...(action === "start" ? generationModelFields(modelSelection) : {}), concurrency: concurrency === "all" ? "all" : Number(concurrency), ...(count === undefined ? {} : { count }), ...(ids === undefined ? {} : { ids: [...new Set(ids)] }) }) }));
       if (mounted.current) {
         setTask(value.task); setQueueError(undefined); onImported();
         if (action === "start" && value.task !== null) { concurrencyDirty.current = false; setConcurrency(String(value.task.concurrency ?? 1)); }
@@ -464,7 +469,7 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
   const startReason = visibleBooks.length === 0 ? "请先批量导入小说，再选择本次生成的章节数。" : task === undefined ? "正在读取生成状态…" : queueError !== undefined ? "暂时无法读取生成状态，请点刷新后重试。"
     : activeOtherOwner ? "这批书由另一个书库会话启动，请先回到任务会话操作。"
     : task?.status === "blocked" ? "本批遇到需要处理的问题，请先查看下方提示，再继续原批或停止后新增。"
-    : !validConcurrency ? "并发数请填写正整数。" : startSelection.reason;
+    : !validConcurrency ? "并发数请填写正整数。" : modelProblem ?? startSelection.reason;
   const searchedBooks = visibleBooks.filter(book => book.title.toLocaleLowerCase().includes(bookSearch.trim().toLocaleLowerCase()));
   const selectedOutsideSearch = normalSelectedIds.filter(id => !searchedBooks.some(book => book.id === id)).length;
   const generationPrefix = generationScope === "all" ? "全部" : "所选";
@@ -476,6 +481,7 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
       {!snapshot?.isBookProject && <input type="checkbox" aria-label={`选择 ${book.title}`} checked={checkedBooks.includes(book.id)} disabled={busy} onChange={event => { const checked = event.target.checked; setGenerationScope("selected"); setCheckedBooks(current => checked ? [...new Set([...current, book.id])] : current.filter(id => id !== book.id)); }} />}
       <div className="book-library-book-copy"><strong title={book.title}>{book.title}</strong><span>{book.completedChapters} / {book.totalChapters} 章 · {controls.label}</span>
         {reservation !== undefined && !["completed", "skipped"].includes(reservation.status) && <span>原批目标：第 {reservation.targetChapter} 章</span>}
+        {reservation?.generation?.modelSelection !== undefined && <span className="generation-model-snapshot">{describeGenerationSelection(reservation.generation.modelSelection)}</span>}
       </div>
       {!snapshot?.isBookProject && <div className="book-library-book-actions">
         {controls.canPause && controlsAllowed && <button type="button" aria-label={`暂停 ${book.title}`} disabled={busy} onClick={() => { void queueAction("pauseBooks", undefined, [book.id]); }}>暂停</button>}
@@ -513,6 +519,7 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
             <button type="button" disabled={busy} onClick={() => { setCheckedBooks([]); setGenerationScope("selected"); }}>取消选择</button>
           </div>
         </div>
+        <GenerationModelPicker sessionId={sessionId} value={modelSelection} onChange={setModelSelection} onProblem={setModelProblem} disabled={busy} />
         <div className="book-library-generation-options">
           <label>生成范围<select aria-label="生成范围" disabled={busy} value={generationScope} onChange={event => { setGenerationScope(event.target.value === "all" ? "all" : "selected"); setGenerationError(undefined); }}><option value="selected">所选书籍</option><option value="all">全部可新增的书</option></select></label>
           <fieldset className="book-library-chapter-options"><legend>每本书本次写</legend>{([10, 20, 50, "all"] as const).map(count => <label key={count} data-checked={generationCount === count ? "true" : "false"}><input type="radio" name={`library-count-${sessionId}`} value={count} checked={generationCount === count} disabled={busy} onChange={() => { setGenerationCount(count); }} />{count === "all" ? "写至完本" : `新增 ${String(count)} 章`}</label>)}</fieldset>

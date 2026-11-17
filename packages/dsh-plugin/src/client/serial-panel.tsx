@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { endpoint } from "./workbench-ui.js";
 import { serialPanelActions, serialProgressText } from "./serial-panel-state.js";
+import type { SerialModelSelection } from "../serial-model-selection.js";
+import { GenerationModelPicker, describeGenerationSelection, generationModelFields } from "./generation-model-picker.js";
 
 interface SerialTaskView {
   readonly id: string;
@@ -15,6 +17,7 @@ interface SerialTaskView {
   readonly titleActive?: { readonly chapter: number; readonly attempt: number; readonly sessionId: string };
   readonly error?: string;
   readonly updatedAt: string;
+  readonly modelSelection?: SerialModelSelection;
 }
 
 interface SerialOutlineView {
@@ -64,6 +67,8 @@ export function SerialPanel({ sessionId, onWorkspaceChanged, onOpenSession, welc
   const [minChars, setMinChars] = useState("2300");
   const [maxChars, setMaxChars] = useState("2500");
   const [style, setStyle] = useState("");
+  const [modelSelection, setModelSelection] = useState<SerialModelSelection>();
+  const [modelProblem, setModelProblem] = useState<string | undefined>("正在读取可用模型，请稍候。");
   const [pending, setPending] = useState<string>();
   const [error, setError] = useState<string>();
   const [loadError, setLoadError] = useState<string>();
@@ -188,7 +193,7 @@ export function SerialPanel({ sessionId, onWorkspaceChanged, onOpenSession, welc
       {task !== undefined && task !== null && <span className="oh-serial-badge" role="status"><i aria-hidden />{STATUS_LABELS[task.status]}{!expanded && total > 0 ? ` ${String(done)}/${String(total)}` : ""}</span>}
     </div>
     <div id={`${id}-body`} className="oh-serial-body" hidden={!expanded}>
-      <p className="oh-serial-note">沿用当前 Harness 模型，每章新建独立写作会话，自动带入完整文风与前 10 章正文（不足 10 章时读取已有正文）。保存、检查后继续。</p>
+      <p className="oh-serial-note">每批可选择写作模型与思考强度，每章新建独立写作会话，自动带入完整文风与前 10 章正文（不足 10 章时读取已有正文）。保存、检查后继续。</p>
       {(loadError !== undefined || error !== undefined) && <div className="oh-serial-alert" role="alert">{error ?? loadError}</div>}
       {snapshot === undefined && loadError === undefined && <p className="oh-serial-note" role="status">正在读取连载进度…</p>}
 
@@ -196,6 +201,7 @@ export function SerialPanel({ sessionId, onWorkspaceChanged, onOpenSession, welc
         <div className="oh-serial-progress-caption"><span>本批第 {task.startChapter}—{task.targetChapter} 章</span><strong>{done}<small> / {total} 章已验收</small></strong></div>
         <progress max={total || 1} value={done} aria-label="本批已验收章节" />
         <div className="oh-serial-progress-meta"><span>{serialProgressText(task)}</span><span>{progress}%</span></div>
+        {task.modelSelection !== undefined && <p className="generation-model-snapshot">本批模型：{describeGenerationSelection(task.modelSelection)}</p>}
         {task.phase === "title" && <p className="oh-serial-note">本章标题完成后即可导出；已完成标题的前面章节可以先导出。</p>}
         {task.error !== undefined && <div className="oh-serial-task-error" role="alert">{task.error}</div>}
         {differentSession && <p className="oh-serial-note">这批任务属于另一会话。恢复或管理原批次请点击「回到任务会话」；已结束的历史批次不影响你在当前会话开始新批次。</p>}
@@ -216,6 +222,7 @@ export function SerialPanel({ sessionId, onWorkspaceChanged, onOpenSession, welc
       <div className="oh-serial-generate">
         <fieldset disabled={busy || !controls.canStartNewBatch}>
           <legend>本次生成</legend>
+          <GenerationModelPicker sessionId={sessionId} value={modelSelection} onChange={setModelSelection} onProblem={setModelProblem} disabled={busy || !controls.canStartNewBatch} />
           <div className="oh-serial-counts" role="group" aria-label="本次生成章数">
             {[10, 20, 50].map((value) => <button type="button" key={value} aria-pressed={!untilEnd && count === value} onClick={() => { setCount(value); setUntilEnd(false); }}>{value} 章</button>)}
             <button type="button" aria-pressed={untilEnd} onClick={() => { setUntilEnd(true); }}>生成全本</button>
@@ -223,7 +230,7 @@ export function SerialPanel({ sessionId, onWorkspaceChanged, onOpenSession, welc
           <details className="oh-serial-settings"><summary>写作设置</summary><label className="oh-serial-field oh-serial-divergence" htmlFor={`${id}-divergence`}>发散级别<select id={`${id}-divergence`} value={divergence} onChange={(event) => { setDivergence(Number(event.target.value)); }}><option value={0}>0 · 严格遵守章纲</option><option value={1}>1 · 允许补充细节</option><option value={2}>2 · 允许补充次要情节</option></select></label><div className="oh-serial-word-range"><label>建议最少<input type="number" min="500" max="20000" step="100" value={minChars} placeholder="默认" onChange={(event) => { setMinChars(event.target.value); }} /></label><span>—</span><label>建议最多<input type="number" min="500" max="20000" step="100" value={maxChars} placeholder="默认" onChange={(event) => { setMaxChars(event.target.value); }} /></label><span>字</span></div><label className="oh-serial-field oh-serial-style" htmlFor={`${id}-style`}>本书文风补充<textarea id={`${id}-style`} value={style} maxLength={4000} rows={3} placeholder="例如：第三人称有限视角，多用行动与对话推进，少解释情绪。" onChange={(event) => { setStyle(event.target.value); }} /></label><p className="oh-serial-note">建议每章 2300—2500 字，仅作写作参考；验收只要求正文超过1500字，不设上限。失败后自动重试5次，仍失败才提示处理。</p><button type="button" className="oh-serial-test-one" aria-pressed={!untilEnd && count === 1} onClick={() => { setCount(1); setUntilEnd(false); }}>只试写 1 章</button></details>
         </fieldset>
         {invalidLength && <p className="oh-serial-task-error">请设置 500—20000 字范围，最多字数不能小于最少字数。</p>}
-        <button className="oh-serial-primary oh-serial-start" type="button" disabled={!canStart || invalidLength} onClick={() => { void act("start", { count: untilEnd ? "all" : count, divergence, ...(customLength ? { minChars: Number(minChars), maxChars: Number(maxChars) } : {}), ...(style.trim() === "" ? {} : { style: style.trim() }) }); }}>{pending === "start" ? "正在启动…" : untilEnd ? "一键生成 · 全本" : `一键生成 · ${String(count)} 章`}</button>
+        <button className="oh-serial-primary oh-serial-start" type="button" disabled={!canStart || invalidLength || modelProblem !== undefined} onClick={() => { void act("start", { ...generationModelFields(modelSelection), count: untilEnd ? "all" : count, divergence, ...(customLength ? { minChars: Number(minChars), maxChars: Number(maxChars) } : {}), ...(style.trim() === "" ? {} : { style: style.trim() }) }); }}>{pending === "start" ? "正在启动…" : untilEnd ? "一键生成 · 全本" : `一键生成 · ${String(count)} 章`}</button>
         {snapshot?.outline === undefined && <p className="oh-serial-note">先导入章纲，再开始生成。模型可在 Harness 的「设置 → 模型」中配置。</p>}
       </div>
 

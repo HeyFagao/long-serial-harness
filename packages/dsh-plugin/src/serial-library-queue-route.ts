@@ -9,6 +9,7 @@ import { getSerialRuntime } from "./serial-route.js";
 import { creativeTarget, jsonBody, mapFsError, readVersionedFile, send, workspaceRealmForSession, WorkspaceHttpError, type WorkspaceRealm } from "./workspace-route.js";
 import { isTrustedWorkspaceRequest } from "./workspace-request-trust.js";
 import { withLibraryOperation } from "./serial-library-operations.js";
+import { resolveSerialModelSelection } from "./serial-models.js";
 
 const TASK_PATH = "追踪/书库任务.json";
 const MAX_BYTES = 2_097_152;
@@ -32,11 +33,11 @@ export function createLibraryQueueAdapter(context: Context, realm: WorkspaceReal
         undefined, realm.sandboxPolicy.resolve({ session: realm.agent.session }));
       version = saved.version;
     },
-    async captureContext() {
+    async captureContext(modelSelection) {
       const fresh = await workspaceRealmForSession(context, realm.sessionId);
       if (fresh.root.targetKey !== realm.root.targetKey) throw new WorkspaceHttpError(409, "书库所属会话目录已改变，未开始批量写作。");
       realm = fresh;
-      return captureLibraryOwnerContext(realm);
+      return captureLibraryOwnerContext(realm, modelSelection);
     },
     async plan() {
       const library = await listLibraryBooks(realm);
@@ -146,7 +147,9 @@ export function registerLibraryQueueRoute(context: Context, options: { readonly 
           if (input.count !== 10 && input.count !== 20 && input.count !== 50 && input.count !== "all") throw new WorkspaceHttpError(400, "请选择新增 10、20、50 章或写至完本。");
           const concurrency = input.concurrency ?? "all";
           assertLibraryConcurrency(concurrency);
-          task = await holder.runtime.start(input.count, generationOptions(input), concurrency, input.ids === undefined ? undefined : selectedLibraryIds(input.ids));
+          const ids = input.ids === undefined ? undefined : selectedLibraryIds(input.ids);
+          const generation = { ...generationOptions(input), modelSelection: await resolveSerialModelSelection(realm, input.modelSelection) };
+          task = await holder.runtime.start(input.count, generation, concurrency, ids);
           break;
         }
         case "pauseBooks": task = await holder.runtime.pauseBooks(selectedLibraryIds(input.ids)); break;

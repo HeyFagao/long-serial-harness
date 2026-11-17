@@ -80,7 +80,7 @@ function fixture(lengths: readonly number[]) {
     makeId: () => `id-${String(++sequence)}`, now: () => "2026-11-16T00:00:00.000Z",
     async load() { return saved === null ? null : structuredClone(saved); },
     async save(task) { saved = structuredClone(task); },
-    async captureContext() { return { modelSelection: { provider: "selected-relay", model: "selected-model" } }; },
+    async captureContext(modelSelection) { return { modelSelection: modelSelection ?? { provider: "selected-relay", model: "selected-model" } }; },
     async plan() { return lengths.map((lastChapter, i) => ({ id: String(i), title: `Book ${String(i)}`, absolutePath: `/library/book-${String(i)}`, nextChapter: totals[i]! + 1, lastChapter })); },
     controller
   };
@@ -118,6 +118,38 @@ describe("durable multi-book generation", () => {
     expect(current.ownerContext).toEqual({ model: "first" }); expect(current.generation).toEqual({ style: "first-style" });
     await expect(queue.start(10, {}, "all", ["0"])).rejects.toThrow("继续所选书");
     f.hold(false); await until(() => queue.snapshot()?.status === "completed"); expect(f.totals).toEqual([10, 10, 20]); queue.dispose();
+  });
+
+  it("pins different model and effort choices for appended books and preserves pending choices after restart", async () => {
+    const f = fixture([20, 20, 20]); f.hold(true);
+    const firstModel = { provider: "gpt-relay", model: "gpt-writing", reasoningEffort: "high" };
+    const secondModel = { provider: "claude-relay", model: "claude-writing", reasoningEffort: "low" };
+    const used: { book: string; modelSelection: unknown }[] = [];
+    const baseController = f.adapter.controller;
+    f.adapter.controller = async (book, task) => {
+      const inner = await baseController(book, task);
+      return { ...inner, async start(options) { used.push({ book: book.id, modelSelection: structuredClone(options.modelSelection) }); return inner.start(options); } };
+    };
+    const first = new SerialLibraryRuntime(f.adapter);
+    await first.start(10, { modelSelection: firstModel }, 1, ["0", "1"]);
+    await until(() => f.starts.length === 1);
+    const original = first.snapshot()!.books[0]!;
+    await first.start(20, { modelSelection: secondModel }, 1, ["2"]);
+    expect(first.snapshot()!.books[0]).toEqual(original);
+    expect(first.snapshot()!.books[1]).toMatchObject({ ownerContext: { modelSelection: firstModel }, generation: { modelSelection: firstModel } });
+    expect(first.snapshot()!.books[2]).toMatchObject({ ownerContext: { modelSelection: secondModel }, generation: { modelSelection: secondModel } });
+    firstModel.reasoningEffort = "low";
+    expect(first.snapshot()!.books[1]!.generation!.modelSelection!.reasoningEffort).toBe("high");
+    await first.pause(); await until(() => first.snapshot()?.status === "paused"); first.dispose();
+    f.adapter.captureContext = async () => ({ modelSelection: { provider: "later-relay", model: "later-model" } });
+    const recovered = new SerialLibraryRuntime(f.adapter); await recovered.restore(); await recovered.resume(); f.hold(false);
+    await until(() => recovered.snapshot()?.status === "completed");
+    expect(used).toEqual([
+      { book: "0", modelSelection: { provider: "gpt-relay", model: "gpt-writing", reasoningEffort: "high" } },
+      { book: "1", modelSelection: { provider: "gpt-relay", model: "gpt-writing", reasoningEffort: "high" } },
+      { book: "2", modelSelection: secondModel }
+    ]);
+    recovered.dispose();
   });
 
   it("pauses only selected running books and resumes their original target", async () => {

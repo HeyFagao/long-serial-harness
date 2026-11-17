@@ -3,8 +3,10 @@ import type { Context } from "@deepseek-ai/cordis";
 import { installModelSelection, type Agent, type AgentHandle, type ModelSelection } from "@deepseek-ai/dsh-agent";
 import type {} from "@deepseek-ai/dsh-api-session-controller";
 import { setSandboxMode } from "@deepseek-ai/dsh-sandbox-policy";
+import { ReasoningEffortId } from "@deepseek-ai/dsh-llm";
 import { SessionId, type Session } from "@deepseek-ai/dsh-session";
 import { workspaceRealmForSession, WorkspaceHttpError, type WorkspaceRealm } from "./workspace-route.js";
+import { assertSerialModelSelection, type SerialModelSelection } from "./serial-model-selection.js";
 
 type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 type ApprovalPolicy = "ask" | "never";
@@ -58,6 +60,7 @@ export function assertLibraryOwnerContext(value: unknown): asserts value is Libr
     || (value.maxTokens !== undefined && (typeof value.maxTokens !== "number" || !Number.isSafeInteger(value.maxTokens) || value.maxTokens < 1))) {
     throw new WorkspaceHttpError(409, "本批模型或权限快照无效，请检查保存的任务记录后重新开始。");
   }
+  assertSerialModelSelection(value.modelSelection);
 }
 
 function presetsOf(agent: Agent): Presets | undefined {
@@ -74,18 +77,20 @@ function permissionsOf(agent: Agent): Permissions | undefined {
 }
 
 /** Capture the selected route, including a pending choice before its first model request. */
-export function captureLibraryOwnerContext(realm: WorkspaceRealm): LibraryOwnerContext {
-  const model = realm.agent.model.current();
+export function captureLibraryOwnerContext(realm: WorkspaceRealm, modelSelection?: SerialModelSelection): LibraryOwnerContext {
+  const model = modelSelection ?? realm.agent.model.current();
   if (model === undefined || model.provider === "" || model.model === "") {
     throw new WorkspaceHttpError(409, "请先为书库选择模型，批量任务不会自动改用默认线路。");
   }
+  assertSerialModelSelection(model);
   const approval = approvalOf(realm.agent);
   if (approval === undefined) throw new WorkspaceHttpError(503, "Harness 审批策略尚未就绪，未建立小说会话。");
   const presetId = presetsOf(realm.agent)?.composedPreset(realm.agent.ctx);
   const permissionPreset = permissionsOf(realm.agent)?.current(realm.agent.session);
   const maxTokens = realm.agent.options.maxTokens;
   return {
-    modelSelection: { ...model },
+    modelSelection: { provider: model.provider, model: model.model,
+      ...(model.reasoningEffort === undefined ? {} : { reasoningEffort: ReasoningEffortId(model.reasoningEffort) }) },
     ...(presetId === undefined ? {} : { presetId }),
     sandboxMode: realm.sandboxPolicy.resolve({ session: realm.agent.session }).mode,
     approvalPolicy: approval.overrideOf(realm.agent.session) ?? approval.config.policy ?? "ask",
@@ -146,7 +151,7 @@ async function ensureBook(
   if (workspace === undefined) {
     throw new WorkspaceHttpError(409, "本书尚未登记为 Harness 工作区，请在书库点击登记后继续。");
   }
-  const current = captureLibraryOwnerContext(library);
+  const current = captureLibraryOwnerContext(library, snapshot.modelSelection);
   // A user reducing the library's standing access stops a resumed batch; it cannot recreate broader owners.
   const rank: Record<SandboxMode, number> = { "read-only": 0, "workspace-write": 1, "danger-full-access": 2 };
   if (rank[current.sandboxMode] < rank[snapshot.sandboxMode]
@@ -162,8 +167,8 @@ async function ensureBook(
     await workspace.attachSession(id);
     return realm;
   }
-  if (!sameModel(current.modelSelection, snapshot.modelSelection) || current.presetId !== snapshot.presetId) {
-    throw new WorkspaceHttpError(409, "书库模型或 Agent 预设已改变，请恢复本批设置后继续，未切换小说使用的模型。");
+  if (current.presetId !== snapshot.presetId) {
+    throw new WorkspaceHttpError(409, "书库 Agent 预设已改变，请恢复本批预设后继续，未切换小说使用的预设。");
   }
   // This is configuration validation only, not a model request or a global default mutation.
   await library.agent.ctx.llm.resolveCallConfig(snapshot.modelSelection);
@@ -185,8 +190,8 @@ async function ensureBook(
       (child.session as unknown as PolicyLog).append("approval/policy", { policy: snapshot.approvalPolicy });
       child.model.select(snapshot.modelSelection);
       return { commit: () => {
-        const latest = captureLibraryOwnerContext(library);
-        if (!sameModel(latest.modelSelection, snapshot.modelSelection) || latest.presetId !== snapshot.presetId
+        const latest = captureLibraryOwnerContext(library, snapshot.modelSelection);
+        if (latest.presetId !== snapshot.presetId
           || latest.sandboxMode !== current.sandboxMode || latest.approvalPolicy !== current.approvalPolicy) {
           throw new WorkspaceHttpError(409, "书库模型或权限在创建期间发生变化，未发布小说会话。");
         }

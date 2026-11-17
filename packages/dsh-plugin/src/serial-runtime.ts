@@ -1,4 +1,5 @@
 import { buildSerialChapterPrompt } from "./serial-outline.js";
+import { assertSerialModelSelection, type SerialModelSelection } from "./serial-model-selection.js";
 
 export type SerialStatus = "running" | "pausing" | "paused" | "blocked" | "stopped" | "completed";
 export interface SerialActive {
@@ -37,6 +38,8 @@ export interface SerialTask {
   style?: string;
   divergence?: number;
   observedSeq?: number;
+  /** Detached model and reasoning choice fixed when this batch starts. */
+  modelSelection?: SerialModelSelection;
 }
 export interface SerialStartOptions {
   count: number | "all";
@@ -46,6 +49,7 @@ export interface SerialStartOptions {
   maxChars?: number;
   style?: string;
   divergence?: number;
+  modelSelection?: SerialModelSelection;
 }
 export interface SerialObservation {
   running: boolean;
@@ -191,6 +195,7 @@ export class SerialRuntime {
       if (options.minChars !== undefined && options.maxChars !== undefined && options.minChars > options.maxChars) throw new Error("最少字数不能大于最多字数。");
       if (options.style !== undefined && (typeof options.style !== "string" || options.style.length > 4000)) throw new Error("风格要求不能超过 4000 字。");
       if (options.divergence !== undefined && (!Number.isInteger(options.divergence) || options.divergence < 0 || options.divergence > 2)) throw new Error("批量生成的发散等级必须为 0–2；等级 3 仅讨论，不生成正文。");
+      if (options.modelSelection !== undefined) assertSerialModelSelection(options.modelSelection);
       const next: SerialTask = {
         schemaVersion: 1, id: this.adapter.makeId(), ownerSessionId: this.adapter.ownerSessionId,
         cwd: this.adapter.cwd, status: "running", startChapter: start, targetChapter: start + count - 1,
@@ -199,6 +204,7 @@ export class SerialRuntime {
         maxChars: options.maxChars ?? 2500,
         divergence: options.divergence ?? 0,
         ...(options.style === undefined ? {} : { style: options.style }),
+        ...(options.modelSelection === undefined ? {} : { modelSelection: structuredClone(options.modelSelection) }),
         ...(observation.cursor === undefined ? {} : { observedSeq: observation.cursor })
       };
       await this.commit(next);
@@ -618,6 +624,7 @@ export class SerialRuntime {
 export function assertSerialTask(value: unknown): asserts value is SerialTask {
   if (typeof value !== "object" || value === null) throw new Error("连载任务文件不是有效对象。");
   const task = value as Partial<SerialTask>;
+  if (task.modelSelection !== undefined) assertSerialModelSelection(task.modelSelection);
   if (task.phase !== undefined && task.phase !== "title") throw new Error("标题阶段记录无效。");
   if (task.phase === "title" && (task.titleActive === undefined || task.titleActive.chapter !== task.nextChapter || typeof task.titleActive.sessionId !== "string"
     || task.titleActive.sessionId === task.ownerSessionId || task.titleActive.sessionId === task.active?.sessionId || typeof task.titleActive.requestId !== "string"

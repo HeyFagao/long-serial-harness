@@ -6,6 +6,7 @@ import { registerWorkspaceRoute } from "./workspace-route.js";
 import { registerSerialRoute } from "./serial-route.js";
 import { registerLibraryRoute } from "./serial-library.js";
 import { registerLibraryQueueRoute } from "./serial-library-queue-route.js";
+import { registerSerialModelsRoute } from "./serial-models.js";
 import { assertTrustedWorkspaceAuthority } from "./workspace-request-trust.js";
 
 export { registerWorkspaceRoute } from "./workspace-route.js";
@@ -54,6 +55,7 @@ export function apply(context: Context, config: Config = {}): void {
   registerSerialRoute(context, { trustedHosts });
   registerLibraryRoute(context, { trustedHosts });
   registerLibraryQueueRoute(context, { trustedHosts });
+  registerSerialModelsRoute(context, { trustedHosts });
 }
 
 export default { name, inject, Config, apply };

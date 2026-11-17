@@ -1,10 +1,14 @@
 import type { Context } from "@deepseek-ai/cordis";
 import type { SessionEvent } from "@deepseek-ai/dsh-session";
 import type { ContentBlock } from "@deepseek-ai/dsh-llm";
+import type { AgentOptions } from "@deepseek-ai/dsh-agent";
+import { resolveChildAgentOptions } from "@deepseek-ai/dsh-subagent";
 import { describe, expect, it, vi } from "vitest";
 import { childExecution, createNativeSerialController, finalChapterText, parentHasNewInput, plainAssistantText } from "../src/serial-native.js";
 import type { SerialActive } from "../src/serial-runtime.js";
 import type { WorkspaceRealm } from "../src/workspace-route.js";
+import type { SerialModelSelection } from "../src/serial-model-selection.js";
+import * as serialModels from "../src/serial-models.js";
 
 function events(values: unknown[]): SessionEvent[] { return values.map((event, seq) => ({ seq, ...(event as object) })) as SessionEvent[]; }
 const initial = { id: "initial", source: { kind: "user" }, content: [{ type: "text", text: "chapter" }] };
@@ -37,7 +41,7 @@ describe("fresh native chapter execution", () => {
     expect(parentHasNewInput(events([{ type: "subagent/catalog", data: {} }]), { queue: [] })).toBe(false);
   });
 
-  function fixture() {
+  function fixture(getModelSelection?: () => Readonly<SerialModelSelection> | undefined, label = "长篇连载") {
     let settled!: (value: { stopReason: "completed" | "aborted"; output: ContentBlock[] }) => void;
     const result = new Promise<{ stopReason: "completed" | "aborted"; output: ContentBlock[] }>(resolve => { settled = resolve; });
     let parentEvent: ((session: { id: string }, event: SessionEvent) => void) | undefined;
@@ -64,7 +68,7 @@ describe("fresh native chapter execution", () => {
       }
     };
     const realm = { sessionId: "owner", agent: parent, cwd: "/book" } as unknown as WorkspaceRealm;
-    const controller = createNativeSerialController(context as unknown as Context, async () => realm);
+    const controller = createNativeSerialController(context as unknown as Context, async () => realm, label, getModelSelection);
     const active: SerialActive = { chapter: 1, sessionId: "child-1", requestId: "request-1", attempt: 1, dispatched: false, baselineSeq: -1 };
     return { context, realm, controller, active, runtime, startActivation, dispose, settled, restrictTools,
       human: () => { parentEvent?.({ id: "owner" }, events([{ type: "agent/inbox/spliced", data: { inserted: [initial] } }])[0]!); } };
@@ -80,6 +84,73 @@ describe("fresh native chapter execution", () => {
     expect(f.context.sessionController.prompt).not.toHaveBeenCalled();
     await f.controller.dispatch(f.active, "repeat transport"); expect(f.startActivation).toHaveBeenCalledTimes(1);
     await f.controller.cancel(f.active); expect(f.dispose).toHaveBeenCalledOnce(); expect(f.context.sessionController.cancel).not.toHaveBeenCalled();
+  });
+
+  it.each(["长篇连载", "公众号标题"])("uses the saved route and reasoning for %s without switching the parent", async label => {
+    const selection = { provider: "book-relay", model: "book-model", reasoningEffort: "high" };
+    const resolve = vi.spyOn(serialModels, "resolveSerialModelSelection").mockResolvedValue({ ...selection });
+    const f = fixture(() => selection, label);
+    const current = vi.spyOn(f.realm.agent.model, "current");
+    try {
+      await f.controller.dispatch(f.active, "independent writing or title");
+      expect(resolve).toHaveBeenCalledWith(f.realm, selection);
+      const spec = f.startActivation.mock.calls[0]![0] as Record<string, unknown>;
+      expect(spec).toMatchObject({ label: `${label} · 第1章 · 第1次`, agentOptions: { ...selection, maxTokens: 16000 }, request: { agentOptions: { ...selection, maxTokens: 16000 } } });
+      expect(current).not.toHaveBeenCalled();
+      expect(f.realm.agent.model.current()).toEqual({ provider: "selected-relay", model: "selected-model", reasoningEffort: "medium" });
+      await f.controller.cancel(f.active);
+    } finally { current.mockRestore(); resolve.mockRestore(); }
+  });
+
+  it.each(["长篇连载", "公众号标题"])("clears the parent's effort through the real native merge for %s when the exact model has no default", async label => {
+    const selection = { provider: "selected-relay", model: "selected-model" };
+    const f = fixture(() => selection, label);
+    const llm = {
+      listProviders: () => [{ id: selection.provider, name: "Relay" }],
+      listModels: async () => [{ provider: selection.provider, id: selection.model, name: "Writing model" }],
+      resolveModelInfo: async () => ({ reasoning: { efforts: [{ id: "low", name: "Low" }, { id: "high", name: "High" }] } }),
+      resolveCallConfig: vi.fn(async () => ({ ...selection }))
+    };
+    Object.assign(f.realm.agent.ctx, { llm });
+    Object.assign(f.realm.agent.session, { requestHeader: () => ({ config: { ...selection, reasoningEffort: "high" } }) });
+    // Confirm the host behavior that omission alone would accidentally inherit.
+    expect(resolveChildAgentOptions(f.realm.agent, selection, 1).reasoningEffort).toBe("high");
+    await f.controller.dispatch(f.active, "same model, automatic reasoning");
+    const spec = f.startActivation.mock.calls[0]![0] as { agentOptions: AgentOptions; request: { agentOptions: AgentOptions } };
+    expect(spec.agentOptions).toEqual({ ...selection, reasoningEffort: undefined, maxTokens: 16000 });
+    expect(Object.hasOwn(spec.agentOptions, "reasoningEffort")).toBe(true);
+    expect(Object.hasOwn(spec.request.agentOptions, "reasoningEffort")).toBe(true);
+    const nativeMerged = resolveChildAgentOptions(f.realm.agent, spec.request.agentOptions, 1);
+    expect(nativeMerged.reasoningEffort).toBeUndefined();
+    expect(llm.resolveCallConfig).toHaveBeenCalledWith(selection);
+    expect(f.realm.agent.model.current()?.reasoningEffort).toBe("medium");
+    await f.controller.cancel(f.active);
+  });
+
+  it.each(["所选模型已移除", "所选模型不支持这个思考强度"])("fails validation without falling back to the parent when %s", async message => {
+    const selection = { provider: "book-relay", model: "book-model", reasoningEffort: "high" };
+    const resolve = vi.spyOn(serialModels, "resolveSerialModelSelection").mockRejectedValue(new Error(message));
+    const f = fixture(() => selection);
+    try {
+      await expect(f.controller.dispatch(f.active, "chapter")).rejects.toThrow(message);
+      expect(f.startActivation).not.toHaveBeenCalled();
+      expect(f.realm.agent.model.current()).toEqual({ provider: "selected-relay", model: "selected-model", reasoningEffort: "medium" });
+    } finally { resolve.mockRestore(); }
+  });
+
+  it("does not publish a new child if human work arrives while the selected model is being validated", async () => {
+    const selection = { provider: "book-relay", model: "book-model", reasoningEffort: "high" };
+    let release!: () => void;
+    const validating = new Promise<void>(resolve => { release = resolve; });
+    const resolve = vi.spyOn(serialModels, "resolveSerialModelSelection").mockImplementation(async () => { await validating; return selection; });
+    const f = fixture(() => selection);
+    try {
+      const dispatching = f.controller.dispatch(f.active, "chapter");
+      await vi.waitFor(() => { expect(resolve).toHaveBeenCalledOnce(); });
+      f.human(); release();
+      await expect(dispatching).rejects.toThrow("主会话收到新工作");
+      expect(f.startActivation).not.toHaveBeenCalled();
+    } finally { release(); resolve.mockRestore(); }
   });
 
   it("cancels the published child when the parent receives new human work", async () => {

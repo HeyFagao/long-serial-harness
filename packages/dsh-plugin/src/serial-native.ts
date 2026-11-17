@@ -2,11 +2,13 @@ import type { Context } from "@deepseek-ai/cordis";
 import type { Agent, AgentOptions } from "@deepseek-ai/dsh-agent";
 import type { SessionAddress, SessionState } from "@deepseek-ai/dsh-api-session-controller";
 import type {} from "@deepseek-ai/dsh-api-session-controller";
-import type { ContentBlock } from "@deepseek-ai/dsh-llm";
+import { ReasoningEffortId, type ContentBlock } from "@deepseek-ai/dsh-llm";
 import { SessionId, type SessionEvent } from "@deepseek-ai/dsh-session";
 import type { SubagentResult } from "@deepseek-ai/dsh-subagent";
 import type { SerialActive, SerialAdapter, SerialObservation } from "./serial-runtime.js";
 import type { WorkspaceRealm } from "./workspace-route.js";
+import type { SerialModelSelection } from "./serial-model-selection.js";
+import { resolveSerialModelSelection } from "./serial-models.js";
 
 interface FreshActivation {
   readonly childId: SessionId;
@@ -124,7 +126,8 @@ export function childExecution(events: readonly SessionEvent[]): {
 export function createNativeSerialController(
   context: Context,
   getOwnerRealm: () => Promise<WorkspaceRealm>,
-  label = "长篇连载"
+  label = "长篇连载",
+  getModelSelection?: () => Readonly<SerialModelSelection> | undefined
 ): Pick<SerialAdapter, "state" | "dispatch" | "cancel"> {
   const activations = new Map<string, ActivationState>();
   context.effect(() => async () => { await Promise.allSettled([...activations.values()].map(item => item.activation.dispose())); }, "oh-story: fresh serial child lifecycle");
@@ -209,9 +212,14 @@ export function createNativeSerialController(
         const guardedOwner = await parentState(realm, active);
         if (guardedOwner.externalInput || guardedOwner.native.running || guardedOwner.native.pendingInput.length > 0) controller.abort(new Error("主会话状态已变化，未创建写作子会话。"));
         controller.signal.throwIfAborted();
-        const selected = realm.agent.model.current();
+        const captured = getModelSelection?.();
+        const selected = captured === undefined ? realm.agent.model.current() : await resolveSerialModelSelection(realm, captured);
+        controller.signal.throwIfAborted();
         if (selected === undefined) throw new Error("当前主会话尚未选择可用模型，未调用默认线路。请先选择模型后继续。");
-        const agentOptions: AgentOptions = { ...selected,
+        const agentOptions: AgentOptions = { provider: selected.provider, model: selected.model,
+          // Native spawn merges the parent's latest request options. An own
+          // undefined is required to clear its effort even on the same route.
+          reasoningEffort: selected.reasoningEffort === undefined ? undefined : ReasoningEffortId(selected.reasoningEffort),
           ...(realm.agent.options.maxTokens === undefined ? {} : { maxTokens: realm.agent.options.maxTokens }) };
         const task: FreshTask = { parent: realm.agent, prompt: [{ type: "text", text: prompt }], maxDepth: 2, agentOptions };
         published = await runtime.startActivation({ provider: "spawn", childId: SessionId(active.sessionId),

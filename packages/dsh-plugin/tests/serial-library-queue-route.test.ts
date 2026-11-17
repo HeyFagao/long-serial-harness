@@ -3,6 +3,7 @@ import type { Context } from "@deepseek-ai/cordis";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { LibraryQueueAdapter, LibraryTask } from "../src/serial-library-runtime.js";
 import { registerLibraryQueueRoute } from "../src/serial-library-queue-route.js";
+import { resolveSerialModelSelection } from "../src/serial-models.js";
 
 const state = vi.hoisted(() => ({ stored: null as LibraryTask | null, owners: [] as string[], calls: [] as { action: string; args: unknown[] }[] }));
 vi.mock("../src/serial-library-runtime.js", async original => ({
@@ -19,6 +20,10 @@ vi.mock("../src/serial-library-runtime.js", async original => ({
   }
 }));
 vi.mock("../src/workspace-request-trust.js", () => ({ isTrustedWorkspaceRequest: () => true }));
+vi.mock("../src/serial-models.js", () => ({ resolveSerialModelSelection: vi.fn(async (_realm: unknown, value: unknown) => {
+  if (typeof value === "object" && value !== null && "provider" in value && value.provider === "removed") throw new Error("模型不可用");
+  return value ?? { provider: "current-relay", model: "current-model" };
+}) }));
 vi.mock("../src/workspace-route.js", async original => ({
   ...await original<object>(),
   workspaceRealmForSession: async (_: unknown, id: string) => ({ sessionId: id, cwd: "/library", root: { targetKey: "library" },
@@ -47,13 +52,27 @@ function stored(status: LibraryTask["status"]): LibraryTask {
 }
 
 describe("library queue owner cache", () => {
-  beforeEach(() => { state.stored = null; state.owners = []; state.calls = []; });
+  beforeEach(() => { vi.clearAllMocks(); state.stored = null; state.owners = []; state.calls = []; });
 
   it("passes exact selected IDs and fifty chapters to the runtime", async () => {
     const request = harness(); const ids = ["a".repeat(64), "b".repeat(64)];
     const result = await request("owner-a", "POST", { action: "start", count: 50, ids, concurrency: "all", style: "selected-style" });
     expect(result.status).toBe(200);
-    expect(state.calls).toEqual([{ action: "start", args: [50, { style: "selected-style" }, "all", ids] }]);
+    expect(state.calls).toEqual([{ action: "start", args: [50, { style: "selected-style", modelSelection: { provider: "current-relay", model: "current-model" } }, "all", ids] }]);
+  });
+
+  it("resolves the selected route and reasoning effort before reserving a library batch", async () => {
+    const request = harness(); const ids = ["a".repeat(64)];
+    const modelSelection = { provider: "claude-relay", model: "claude-writing", reasoningEffort: "low" };
+    expect((await request("owner-a", "POST", { action: "start", count: 20, ids, modelSelection })).status).toBe(200);
+    expect(resolveSerialModelSelection).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "owner-a" }), modelSelection);
+    expect(state.calls).toEqual([{ action: "start", args: [20, { modelSelection }, "all", ids] }]);
+  });
+
+  it("does not reserve a batch when the selected model is no longer available", async () => {
+    const request = harness();
+    const result = await request("owner-a", "POST", { action: "start", count: 10, ids: ["a".repeat(64)], modelSelection: { provider: "removed", model: "missing" } });
+    expect(result.status).toBe(409); expect(result.body.error).toContain("模型不可用"); expect(state.calls).toEqual([]);
   });
 
   it.each(["pauseBooks", "resumeBooks"])("routes %s only to the explicitly selected books", async action => {

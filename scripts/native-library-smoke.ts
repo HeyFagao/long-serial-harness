@@ -15,6 +15,7 @@ import { AUTHOR_CHAPTER_TITLE_PROMPT } from "../packages/dsh-plugin/src/wechat-t
 import type { LibraryBook, LibrarySnapshot } from "../packages/dsh-plugin/src/serial-library.js";
 import type { LibraryTask } from "../packages/dsh-plugin/src/serial-library-runtime.js";
 import type { SerialTask } from "../packages/dsh-plugin/src/serial-runtime.js";
+import type { SerialModelSelection, SerialModelCatalog } from "../packages/dsh-plugin/src/serial-model-selection.js";
 import { deterministicNativeOutput } from "./serial-fixtures/native-output.js";
 import { authorizeDsh, dshFetch, freePort, isolateFirstUseWorkspace, rpc, stopDshProcess } from "./native-dsh-helpers.js";
 
@@ -31,7 +32,9 @@ const selectionAccepted: Readonly<Record<string, number>> = { SMOKEBOOK13: 10, S
 const baseChapters = 152;
 const selectedChapters = 15;
 const totalAcceptedChapters = baseChapters + selectedChapters;
-const totalFor = (key: string): number => selectionTotals[key] ?? (keys.includes(key) && keys.indexOf(key) < 2 ? 32 : 11);
+const totalFor = (key: string): number => process.env.LIBRARY_MODEL_ONLY === "1" && key === keys[1] ? 2
+  : process.env.LIBRARY_MODEL_ONLY === "1" && key === keys[2] ? 1
+  : selectionTotals[key] ?? (keys.includes(key) && keys.indexOf(key) < 2 ? 32 : 11);
 const chapterPath = (chapter: number): string => `正文/第${String(chapter).padStart(3, "0")}章.md`;
 const titleFor = (key: string): string => `回归小说${key.slice(-2)}`;
 function titleCandidates(chapter: number): readonly string[] {
@@ -61,7 +64,8 @@ function sourceFor(key: string): string {
 interface WireMessage { readonly role?: string; readonly content?: unknown }
 interface Block { readonly type?: string; readonly text?: string }
 interface Answer { readonly key: string; readonly chapter: number; readonly sessionId: string; readonly text: string }
-interface ModelFixture { server: Server; baseURL: string; books: Map<string, LibraryBook>; answers: Answer[]; titles: Answer[]; titleRetried: boolean; waiting: Set<string>; holds: Set<string>; failures: string[]; requests: number; shortDraft?: { readonly text: string; readonly sessionId: string }; rewritePassed: boolean }
+interface WireSelection { readonly key: string; readonly chapter: number; readonly kind: "body" | "title"; readonly sessionId: string; readonly model: string; readonly reasoningEffort?: string }
+interface ModelFixture { server: Server; baseURL: string; books: Map<string, LibraryBook>; answers: Answer[]; titles: Answer[]; titleRetried: boolean; waiting: Set<string>; holds: Set<string>; failures: string[]; requests: number; wireSelections: WireSelection[]; shortDraft?: { readonly text: string; readonly sessionId: string }; rewritePassed: boolean }
 function blocks(message: WireMessage): readonly Block[] { return Array.isArray(message.content) ? message.content as Block[] : typeof message.content === "string" ? [{ type: "text", text: message.content }] : []; }
 function fixtureOutput(bookKey: string, chapter: number, minChars?: number): string {
   const text = deterministicNativeOutput({ bookKey, chapter, ...(minChars === undefined ? {} : { minChars }) });
@@ -103,7 +107,7 @@ async function assertPrompt(book: LibraryBook, key: string, chapter: number, pro
   if (chapter > 11) assert(!attachment.includes(`沈宁抵达城南的第${String(chapter - 11)}天，`), "Older prose escaped the ten-chapter window");
 }
 async function startModel(): Promise<ModelFixture> {
-  const model: ModelFixture = { server: undefined as unknown as Server, baseURL: "", books: new Map(), answers: [], titles: [], titleRetried: false, waiting: new Set(), holds: new Set(), failures: [], requests: 0, rewritePassed: false };
+  const model: ModelFixture = { server: undefined as unknown as Server, baseURL: "", books: new Map(), answers: [], titles: [], titleRetried: false, waiting: new Set(), holds: new Set(), failures: [], requests: 0, wireSelections: [], rewritePassed: false };
   const server = createServer((request, response) => {
     let body = "";
     // Full Chinese prose spans HTTP chunks; the streaming decoder preserves split UTF-8 codepoints.
@@ -112,7 +116,7 @@ async function startModel(): Promise<ModelFixture> {
       try {
         if (request.method !== "POST" || !request.url?.endsWith("/v1/messages")) { response.writeHead(404).end(); return; }
         model.requests += 1;
-        const payload = JSON.parse(body) as { readonly messages?: readonly WireMessage[] };
+        const payload = JSON.parse(body) as { readonly model?: string; readonly messages?: readonly WireMessage[]; readonly output_config?: { readonly effort?: string }; readonly thinking?: { readonly type?: string } };
         const messages = payload.messages ?? [];
         const matching = messages.filter(message => message.role === "user").map(message => blocks(message).map(block => block.text ?? "").join("\n")).filter(text => /本轮只完成当前工作区这本书的第 \d+ 章/u.test(text));
         const titlePrompts = messages.filter(message => message.role === "user").map(message => blocks(message).map(block => block.text ?? "").join("\n")).filter(text => text.includes("【独立标题任务】"));
@@ -131,6 +135,9 @@ async function startModel(): Promise<ModelFixture> {
           await assertPrompt(model.books.get(key)!, key, chapter, prompt);
           const sessionId = request.headers["x-deepseek-harness-session-id"];
           assert(typeof sessionId === "string" && sessionId !== "");
+          assert(typeof payload.model === "string");
+          model.wireSelections.push({ key, chapter, kind: "body", sessionId, model: payload.model,
+            ...(payload.thinking?.type === "disabled" ? { reasoningEffort: "off" } : payload.output_config?.effort === undefined ? {} : { reasoningEffort: payload.output_config.effort }) });
           if (key === keys[0] && chapter === 3 && model.shortDraft === undefined) {
             text = fixtureOutput(key, chapter, 400);
             model.shortDraft = { text, sessionId };
@@ -157,6 +164,9 @@ async function startModel(): Promise<ModelFixture> {
           const attached = prompt.slice(prompt.indexOf("<chapter_body>\n") + "<chapter_body>\n".length, prompt.lastIndexOf("\n</chapter_body>"));
           assert.equal(attached, prose, "Title task must receive only this saved chapter in full");
           const sessionId = request.headers["x-deepseek-harness-session-id"]; assert(typeof sessionId === "string");
+          assert(typeof payload.model === "string");
+          model.wireSelections.push({ key, chapter, kind: "title", sessionId, model: payload.model,
+            ...(payload.thinking?.type === "disabled" ? { reasoningEffort: "off" } : payload.output_config?.effort === undefined ? {} : { reasoningEffort: payload.output_config.effort }) });
           assert(!model.answers.some(item => item.sessionId === sessionId));
           if (!model.titleRetried) { text = "模拟标题格式失败"; model.titleRetried = true; }
           else {
@@ -289,7 +299,7 @@ async function checkBook(book: LibraryBook, key: string, total = totalFor(key)):
     assert.equal(headline.title, titleCandidates(chapter)[0]); assert.equal(headline.bodySha256, digest(prose));
   }
 }
-async function checkNativeChildren(home: string, model: ModelFixture, total = baseChapters): Promise<void> {
+async function checkNativeChildren(home: string, model: ModelFixture, total = baseChapters, selections?: ReadonlyMap<string, SerialModelSelection>): Promise<void> {
   const directory = join(home, "sessions"); const files = await readdir(directory, { recursive: true });
   assert.equal(new Set(model.answers.map(answer => answer.sessionId)).size, total);
   assert.equal(new Set([...model.answers, ...model.titles].map(answer => answer.sessionId)).size, total * 2);
@@ -303,7 +313,15 @@ async function checkNativeChildren(home: string, model: ModelFixture, total = ba
     const parentHeader = JSON.parse(zstdDecompressSync(await readFile(join(directory, parentFile))).toString("utf8").split("\n")[0]!) as { readonly cwd: string; readonly isSeeded: boolean };
     assert.equal(await realpath(parentHeader.cwd), bookPath); assert.equal(parentHeader.isSeeded, false);
     const events = lines.slice(1).map(line => JSON.parse(line) as { readonly type: string; readonly seq: number; readonly data: Record<string, unknown> });
-    assert.equal(events[0]?.seq, 0); assert.equal(events[0]?.type, "subagent/descriptor"); assert.equal(events[0]?.data.agentProvider, "deepseek-official"); assert.equal(events[0]?.data.agentModel, "deepseek-flash");
+    const selected = selections?.get(answer.key) ?? { provider: "deepseek-official", model: "deepseek-flash" };
+    assert.equal(events[0]?.seq, 0); assert.equal(events[0]?.type, "subagent/descriptor"); assert.equal(events[0]?.data.agentProvider, selected.provider); assert.equal(events[0]?.data.agentModel, selected.model);
+    if (selections !== undefined) {
+      const headers = events.filter(event => event.type === "request/header").map(event => event.data.header as { readonly config: SerialModelSelection });
+      assert(headers.length > 0, "Native child did not persist its effective request header");
+      for (const saved of headers) {
+        assert.equal(saved.config.provider, selected.provider); assert.equal(saved.config.model, selected.model); assert.equal(saved.config.reasoningEffort, selected.reasoningEffort);
+      }
+    }
     assert.equal(events.filter(event => event.type === "tool/call").length, 0, "The prose-only writer called a tool");
   }
 }
@@ -394,6 +412,121 @@ async function main(): Promise<void> {
     await page.locator(`[data-conversation-session="${sessionId}"]`).waitFor({ state: "visible", timeout: 20_000 });
     await page.getByRole("button", { name: "开始批量生成", exact: true }).waitFor({ state: "visible", timeout: 20_000 });
     await assertImportContainment(origin, sessionId, libraryPath, temporary);
+    if (process.env.LIBRARY_MODEL_ONLY === "1") {
+      const singleBook = model.books.get(keys[0]!)!; const firstBook = model.books.get(keys[1]!)!; const appendedBook = model.books.get(keys[2]!)!;
+      const parentChoice: SerialModelSelection = { provider: "deepseek-official", model: "deepseek-flash", reasoningEffort: "high" };
+      const singleChoice: SerialModelSelection = { provider: "deepseek-official", model: "deepseek-v4-pro", reasoningEffort: "low" };
+      const firstChoice: SerialModelSelection = { provider: "deepseek-official", model: "deepseek-v4-pro", reasoningEffort: "high" };
+      const appendedChoice: SerialModelSelection = { provider: "deepseek-official", model: "deepseek-flash", reasoningEffort: "low" };
+      const changedParent: SerialModelSelection = { provider: "deepseek-official", model: "deepseek-flash", reasoningEffort: "max" };
+      const serial = async (owner: string, input?: object) => (await api<{ readonly task: SerialTask | null }>(origin, "serial", owner, input)).task;
+      const waitSerial = async (owner: string, status: SerialTask["status"]) => {
+        let result: SerialTask | null = null;
+        await waitFor(async () => {
+          result = await serial(owner); assert(result?.status !== "blocked" && result?.status !== "stopped", `Unexpected selected-model task state: ${JSON.stringify(result)}`);
+          return result?.status === status;
+        }, `single selected-model book ${status}`, 120_000);
+        return result!;
+      };
+      await rpc(origin, "session/selectModel", { request: { sessionId, ...parentChoice } });
+      await rpc(origin, "session/selectModel", { request: { sessionId: openedBookSession, ...parentChoice } });
+      const catalog = await api<SerialModelCatalog>(origin, "models", sessionId);
+      assert.deepEqual(catalog.current, parentChoice);
+      for (const choice of [singleChoice, firstChoice, appendedChoice, changedParent]) {
+        const advertised = catalog.models.find(entry => entry.provider === choice.provider && entry.model === choice.model);
+        assert(advertised !== undefined, "The native model picker omitted an advertised model");
+        assert(advertised.efforts.some(effort => effort.id === choice.reasoningEffort), "Native reasoning capabilities were not exposed");
+      }
+      const rejectedRequests = model.requests;
+      const rejected = await dshFetch(`${origin}/oh-story/serial?sessionId=${encodeURIComponent(openedBookSession)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "start", count: 1, modelSelection: { ...singleChoice, reasoningEffort: "unsupported-native-effort" } }) });
+      assert.equal(rejected.status, 400); assert.equal(model.requests, rejectedRequests); assert.equal(await serial(openedBookSession), null);
+      const beforeBookReady = model.requests;
+      await rpc(origin, "session/prompt", { request: { requestId: crypto.randomUUID(), sessionId: openedBookSession, mode: "queue", content: [{ type: "text", text: "LIBRARY_SMOKE_READY: reply ready without tools." }] } });
+      await waitFor(async () => model!.requests > beforeBookReady && !(await rpc<{ readonly running: boolean }>(origin, "session/state", { request: { sessionId: openedBookSession } })).running, "single selected-model owner ready");
+      await rpc(origin, "session/rename", { request: { sessionId: openedBookSession, title: "模型选择验收" } });
+      const singleWorkspace = page.getByRole("treeitem").filter({ hasText: titleFor(keys[0]!) }).first();
+      if (await singleWorkspace.getAttribute("aria-expanded") !== "true") await singleWorkspace.click();
+      await page.getByRole("treeitem").filter({ hasText: "模型选择验收" }).first().click();
+      await page.locator(`[data-conversation-session="${openedBookSession}"]`).waitFor({ state: "visible", timeout: 20_000 });
+      await page.getByLabel("本次写作模型", { exact: true }).selectOption(JSON.stringify([singleChoice.provider, singleChoice.model]));
+      await page.getByLabel("思考强度", { exact: true }).selectOption(singleChoice.reasoningEffort!);
+      await page.locator("details.oh-serial-settings > summary").click();
+      await page.getByRole("button", { name: "只试写 1 章", exact: true }).click();
+      const singleStart = page.waitForResponse(response => response.url().includes("/oh-story/serial?") && response.request().method() === "POST");
+      await page.getByRole("button", { name: "一键生成 · 1 章", exact: true }).click();
+      const singleStarted = await singleStart; assert.equal(singleStarted.status(), 200);
+      assert.deepEqual((singleStarted.request().postDataJSON() as { readonly modelSelection: SerialModelSelection }).modelSelection, singleChoice);
+      const singleTask = await serial(openedBookSession);
+      assert.deepEqual(singleTask?.modelSelection, singleChoice);
+      await waitSerial(openedBookSession, "completed");
+      assert.deepEqual((await api<SerialModelCatalog>(origin, "models", openedBookSession)).current, parentChoice, "Single-book generation changed its parent Session selection");
+      model.holds.add(`${keys[1]!}/1`);
+      await page.getByRole("button", { name: "← 回到书库总览", exact: true }).click();
+      await page.getByRole("treeitem").filter({ hasText: "书库验收会话" }).first().click();
+      await page.locator(`[data-conversation-session="${sessionId}"]`).waitFor({ state: "visible", timeout: 20_000 });
+      await page.getByRole("button", { name: "取消选择", exact: true }).click();
+      await page.getByRole("checkbox", { name: `选择 ${titleFor(keys[1]!)}`, exact: true }).check();
+      await page.getByLabel("本次写作模型", { exact: true }).selectOption(JSON.stringify([firstChoice.provider, firstChoice.model]));
+      await page.getByLabel("思考强度", { exact: true }).selectOption(firstChoice.reasoningEffort!);
+      await page.getByLabel("书间并发模式").selectOption("custom"); await page.getByLabel("同时生成的书数").fill("1");
+      await page.getByRole("radio", { name: "新增 10 章", exact: true }).check();
+      await page.screenshot({ path: join(evidence, "batch-model-picker.png"), animations: "disabled" });
+      await clickQueue(page, "开始批量生成");
+      const started = (await queue(origin, sessionId))!;
+      assert.deepEqual(started.books[0]?.generation?.modelSelection, firstChoice);
+      await waitNativeRequest(origin, sessionId, model, `${keys[1]!}/1`);
+      const appended = (await queue(origin, sessionId, { action: "start", count: 10, concurrency: 1, ids: [appendedBook.id], modelSelection: appendedChoice }))!;
+      assert.equal(appended.id, started.id);
+      assert.deepEqual(appended.books.find(book => book.id === firstBook.id)?.generation?.modelSelection, firstChoice);
+      assert.deepEqual(appended.books.find(book => book.id === appendedBook.id)?.generation?.modelSelection, appendedChoice);
+      assert(!model.answers.some(answer => answer.key === keys[2]!));
+      assert.deepEqual((await api<SerialModelCatalog>(origin, "models", sessionId)).current, parentChoice, "Adding different-model books changed the library Session selection");
+      await queue(origin, sessionId, { action: "pause" }); model.holds.delete(`${keys[1]!}/1`);
+      const paused = await waitQueue(origin, sessionId, task => task.status === "paused" && task.books.find(book => book.id === firstBook.id)?.completedChapters === 1);
+      assert.equal(paused.books.find(book => book.id === appendedBook.id)?.status, "pending");
+      await rpc(origin, "session/selectModel", { request: { sessionId, ...changedParent } });
+      await browser.close(); browser = undefined; await stopDshProcess(child); child = undefined;
+      logs.length = 0; child = launch(); tokenURL = await authorizeDsh(origin, logs);
+      const restored = (await queue(origin, sessionId))!; assert.equal(restored.id, started.id);
+      assert.deepEqual((await api<SerialModelCatalog>(origin, "models", sessionId)).current, changedParent);
+      await queue(origin, sessionId, { action: "resume" });
+      const finished = await waitQueue(origin, sessionId, task => task.status === "completed");
+      assert(finished.books.every(book => book.status === "completed"));
+      assert.deepEqual((await api<SerialModelCatalog>(origin, "models", sessionId)).current, changedParent, "Resume changed the parent Session selection");
+      assert.equal(model.answers.length, 4); assert.equal(model.titles.length, 4); assert.equal(model.failures.length, 0, model.failures.join("\n"));
+      const expected = new Map([[keys[0]!, singleChoice], [keys[1]!, firstChoice], [keys[2]!, appendedChoice]]);
+      for (const captured of model.wireSelections) {
+        const selection = expected.get(captured.key); assert(selection !== undefined);
+        assert.equal(captured.model, selection.model, `Wrong wire model for ${captured.key}/${String(captured.chapter)}/${captured.kind}`);
+        assert.equal(captured.reasoningEffort, selection.reasoningEffort, `Wrong wire effort for ${captured.key}/${String(captured.chapter)}/${captured.kind}`);
+      }
+      await checkNativeChildren(home, model, 4, expected);
+      await checkBook(singleBook, keys[0]!, 1); await checkBook(firstBook, keys[1]!, 2); await checkBook(appendedBook, keys[2]!, 1);
+      browser = await chromium.launch({ channel: process.env.DSH_SMOKE_BROWSER_CHANNEL ?? "chrome", headless: true });
+      const modelsPage = await browser.newPage({ viewport: { width: 1440, height: 1000 } }); modelsPage.on("pageerror", error => pageErrors.push(error.message));
+      await modelsPage.goto(tokenURL, { waitUntil: "networkidle" });
+      const modelsNotice = modelsPage.getByRole("button", { name: /^(?:Continue|继续)$/u }); if (await modelsNotice.isVisible()) await modelsNotice.click();
+      const libraryWorkspace = modelsPage.getByRole("treeitem").filter({ hasText: "书库集成测试" }).first();
+      await libraryWorkspace.waitFor({ state: "visible", timeout: 20_000 }); if (await libraryWorkspace.getAttribute("aria-expanded") !== "true") await libraryWorkspace.click();
+      await modelsPage.getByRole("treeitem").filter({ hasText: "书库验收会话" }).first().click();
+      await modelsPage.locator(`[data-conversation-session="${sessionId}"]`).waitFor({ state: "visible", timeout: 20_000 });
+      await modelsPage.locator(".novel-version").filter({ hasText: `运行版本：${pluginMetadata.version}` }).waitFor({ state: "visible", timeout: 20_000 });
+      await modelsPage.screenshot({ path: join(evidence, "batch-model-selection.png"), animations: "disabled" });
+      assert.equal(pageErrors.length, 0, pageErrors.join("\n"));
+      const report = {
+        ok: true, phase: "batch-model-selection", dshVersion: version, pluginVersion: pluginMetadata.version, pluginSha256,
+        provider: "local-deterministic-text-fixture", realPaidModel: false,
+        nativeCatalog: "passed-two-native-models-and-supported-efforts", invalidEffort: "rejected-before-model-request-and-task-write",
+        singleBookSelection: "passed-different-model-and-effort-from-parent", libraryAppendSelection: "passed-two-books-with-independent-models-and-efforts",
+        coldResumeSelection: "passed-pending-and-active-books-kept-snapshots-after-parent-model-change", parentSelection: "not-mutated-by-start-append-or-resume",
+        bodyAndTitleWireSelection: "passed-model-and-effort", durableNativeRequestHeaders: "passed-provider-model-reasoning-effort", uiModelAndEffortSelection: "passed-single-book-and-library-start",
+        selectedBooks: 3, acceptedChapters: 4, freshNativeChapterSessions: 4, independentTitleSessions: 4,
+        modelSelections: [...expected].map(([key, selection]) => ({ book: key, ...selection })),
+        originalSystemSha256: ORIGINAL_SYSTEM_PROMPT_SHA256, fullStyleAndPreviousTen: "passed", modelToolCalls: 0, literaryQuality: "not assessed"
+      };
+      await writeFile(join(evidence, "model-selection-smoke.json"), `${JSON.stringify(report, null, 2)}\n`);
+      process.stdout.write(`${JSON.stringify(report)}\n`); passed = true; return;
+    }
     if (process.env.LIBRARY_UPGRADE_ONLY === "1") {
       const singleBook = model.books.get(keys[0]!)!;
       const queuedBook = model.books.get(keys[1]!)!;

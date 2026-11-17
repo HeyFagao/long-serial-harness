@@ -1,4 +1,5 @@
 import type { SerialResumeOptions, SerialStartOptions, SerialTask } from "./serial-runtime.js";
+import { assertSerialModelSelection, type SerialModelSelection } from "./serial-model-selection.js";
 
 export type LibraryConcurrency = number | "all";
 export type LibraryCount = 10 | 20 | 50 | "all";
@@ -48,7 +49,7 @@ export interface LibraryQueueAdapter {
   cwd: string;
   load(): Promise<LibraryTask | null>;
   save(task: LibraryTask): Promise<void>;
-  captureContext(): Promise<unknown>;
+  captureContext(modelSelection?: SerialModelSelection): Promise<unknown>;
   plan(): Promise<readonly { id: string; title: string; absolutePath: string; nextChapter: number; lastChapter: number; error?: string }[]>;
   controller(book: LibraryQueueBook, task: LibraryTask): Promise<LibraryBookController>;
   makeId(): string;
@@ -73,6 +74,7 @@ export function assertLibraryTask(value: unknown): asserts value is LibraryTask 
     || ![10, 20, 50, "all"].includes(task.count) || !Array.isArray(task.books)
     || typeof task.generation !== "object" || task.generation === null) throw new Error("书库任务记录格式无效，请保留原文件后处理。");
   if (task.concurrency !== undefined) assertLibraryConcurrency(task.concurrency);
+  if (task.generation.modelSelection !== undefined) assertSerialModelSelection(task.generation.modelSelection);
   const ids = new Set<string>();
   for (const book of task.books) {
     if (typeof book.id !== "string" || ids.has(book.id) || typeof book.title !== "string" || typeof book.absolutePath !== "string" || typeof book.ownerSessionId !== "string"
@@ -82,6 +84,7 @@ export function assertLibraryTask(value: unknown): asserts value is LibraryTask 
       || (book.count !== undefined && ![10, 20, 50, "all"].includes(book.count))
       || (book.generation !== undefined && (typeof book.generation !== "object" || book.generation === null || Array.isArray(book.generation)))) throw new Error("书库章节范围或项目身份无效，未继续生成。");
     ids.add(book.id);
+    if (book.generation?.modelSelection !== undefined) assertSerialModelSelection(book.generation.modelSelection);
   }
 }
 
@@ -191,7 +194,8 @@ export class SerialLibraryRuntime {
         const unfinished = previous.books.filter(book => selection.has(book.id) && !["completed", "skipped"].includes(book.status));
         if (unfinished.length > 0) throw new Error(`《${unfinished[0]!.title}》已有未完成目标，请使用“继续所选书”，不会重新增加章节或覆盖原目标。`);
       }
-      const ownerContext = await this.adapter.captureContext();
+      if (generation.modelSelection !== undefined) assertSerialModelSelection(generation.modelSelection);
+      const ownerContext = await this.adapter.captureContext(generation.modelSelection);
       const books: LibraryQueueBook[] = selectedPlans.map(book => ({
         id: book.id, title: book.title, absolutePath: book.absolutePath, ownerSessionId: this.adapter.makeId(),
         startChapter: book.nextChapter, targetChapter: count === "all" ? book.lastChapter : Math.min(book.lastChapter, book.nextChapter + count - 1),

@@ -1,5 +1,6 @@
 import type { Context } from "@deepseek-ai/cordis";
 import type { AgentOptions, CreateAgentOptions, ModelSelection } from "@deepseek-ai/dsh-agent";
+import { ReasoningEffortId } from "@deepseek-ai/dsh-llm";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { assertLibraryOwnerContext, captureLibraryOwnerContext, ensureLibraryBookRealm } from "../src/serial-library-native.js";
 import { workspaceRealmForSession, type WorkspaceRealm } from "../src/workspace-route.js";
@@ -90,6 +91,46 @@ describe("library book native owners", () => {
     ]);
     expect(f.raw.sessions.flush).toHaveBeenCalledOnce();
     expect(f.workspace.attachSession).toHaveBeenCalledWith("book-owner");
+  });
+
+  it("uses a batch-specific route and effort without changing the library's selected model", async () => {
+    const f = fixture();
+    f.parentState.selection = { provider: "parent-relay", model: "parent-model", reasoningEffort: ReasoningEffortId("high") };
+    const selection = { provider: "claude-relay", model: "claude-writing", reasoningEffort: "low" };
+    const snapshot = captureLibraryOwnerContext(f.library, selection);
+    expect(snapshot.modelSelection).toEqual(selection);
+    expect(snapshot.modelSelection).not.toBe(selection);
+    await ensureLibraryBookRealm(f.context, f.library, "/library/book", "book-owner", snapshot);
+    expect(f.create.mock.calls[0]![0].agentOptions).toEqual(selection);
+    expect(f.parent.model.select).not.toHaveBeenCalled();
+    expect(f.parentState.selection).toEqual({ provider: "parent-relay", model: "parent-model", reasoningEffort: "high" });
+    expect(f.parent.ctx.llm.resolveCallConfig).toHaveBeenCalledWith(selection);
+  });
+
+  it("creates a pending owner from its saved route after the library switches models", async () => {
+    const f = fixture();
+    const snapshot = captureLibraryOwnerContext(f.library, { provider: "gpt-relay", model: "gpt-writing", reasoningEffort: "high" });
+    f.parentState.selection = { provider: "gemini-relay", model: "gemini-writing", reasoningEffort: ReasoningEffortId("low") };
+    await ensureLibraryBookRealm(f.context, f.library, "/library/book", "book-owner", snapshot);
+    expect(f.create.mock.calls[0]![0].agentOptions).toEqual(snapshot.modelSelection);
+    expect(f.child.model.current()).toEqual(snapshot.modelSelection);
+    expect(f.parentState.selection).toEqual({ provider: "gemini-relay", model: "gemini-writing", reasoningEffort: "low" });
+  });
+
+  it("does not carry the parent's effort into an explicitly chosen model's automatic effort", async () => {
+    const f = fixture();
+    f.parentState.selection = { provider: "parent-relay", model: "parent-model", reasoningEffort: ReasoningEffortId("high") };
+    const snapshot = captureLibraryOwnerContext(f.library, { provider: "gemini-relay", model: "gemini-writing" });
+    await ensureLibraryBookRealm(f.context, f.library, "/library/book", "book-owner", snapshot);
+    expect(f.create.mock.calls[0]![0].agentOptions).toEqual({ provider: "gemini-relay", model: "gemini-writing" });
+    expect(snapshot.modelSelection).not.toHaveProperty("reasoningEffort");
+  });
+
+  it("validates the saved route before creating an owner and does not switch to the library's fallback", async () => {
+    const f = fixture(); const snapshot = captureLibraryOwnerContext(f.library);
+    f.parent.ctx.llm.resolveCallConfig.mockRejectedValue(new Error("模型不可用"));
+    await expect(ensureLibraryBookRealm(f.context, f.library, "/library/book", "book-owner", snapshot)).rejects.toThrow("模型不可用");
+    expect(f.create).not.toHaveBeenCalled(); expect(f.parent.model.select).not.toHaveBeenCalled();
   });
 
   it("deduplicates simultaneous calls for the reserved owner", async () => {

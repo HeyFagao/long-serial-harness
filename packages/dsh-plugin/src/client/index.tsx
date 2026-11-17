@@ -177,11 +177,11 @@ function NovelWorkbench({ sessionId, blank, openSerialSession, bookNavigation }:
         <aside className="novel-controls">
           <BookLibraryPanel sessionId={sessionId} navigation={bookNavigation} onImported={reload} onAvailabilityChange={setArchived} />
           {!archived && files.some(file => file.path.startsWith("大纲/") || file.path.startsWith("正文/")) && <SerialPanel sessionId={sessionId} onWorkspaceChanged={reload} onOpenSession={openSerialSession} welcome />}
-          <section className="novel-model-card"><h2>模型与中转站</h2><p className="novel-muted">在下方 Harness 模型选择器中切换写作模型。新增中转站请打开「设置 → 模型」。</p></section>
+          <section className="novel-model-card"><h2>模型与中转站</h2><p className="novel-muted">每批写作模型和思考强度可在生成设置中选择。新增中转站请打开「设置 → 模型」。</p></section>
         </aside>
         {isBookProject ? reading : files.length > 0 && <details className="novel-library-records"><summary>查看运行记录</summary>{reading}</details>}
       </div>
-      <p className="novel-native-note">运行日志与模型设置沿用下方 Harness 会话；当前章节的独立会话可从生成进度中打开。</p>
+      <p className="novel-native-note">中转站由 Harness 管理，每批保存所选模型与思考强度；当前章节的独立会话可从生成进度中打开。</p>
     </>}
   </section>;
 }

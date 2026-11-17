@@ -12,7 +12,8 @@
 - 单独暂停或继续所选书，其他书继续；已有批次沿用原目标，新书可加入正在运行的队列。
 - 正文验收后，独立调用模型执行作者提供的标题提示词：根据本章拟 5 个 15—25 字候选，全部编号放在每章 TXT 开头，发布时自行选择；标题失败不重写正文。
 - 每章带入本书完整文风、前 10 章正文全文，使用新的原生会话。
-- 逐章保存、暂停／停止／恢复，切换中转站和模型沿用 Harness 原生设置。
+- 单书与书库启动前可选本批写作模型、该模型支持的思考强度；默认带入当前会话配置，可改选，按界面显示值启动并保存；正文与独立标题使用同一选择，暂停恢复保留原批设置。
+- 模型列表来自 Harness 原生配置；可在运行中为新加入的书选其他模型，不改变已有书的模型或主会话设置。
 
 ![书库按钮与示例小说](docs/书库界面示例.png)
 
@@ -22,13 +23,13 @@
 2. 在 Harness「插件 → 添加插件 → 包名或地址」粘贴下面的公开插件安装直链：
 
 ```text
-https://github.com/HeyFagao/long-serial-harness/releases/download/v0.1.26-serial.7/oh-story-dsh-0.1.26-serial.7.tgz
+https://github.com/HeyFagao/long-serial-harness/releases/download/v0.1.26-serial.8/oh-story-dsh-0.1.26-serial.8.tgz
 ```
 
-3. 安装后保存当前工作并重新打开 Harness。在「设置 → 模型」添加自己的中转站，选定写作模型。
+3. 安装后保存当前工作并重新打开 Harness。在「设置 → 模型」添加自己的中转站和模型；在工作台「写作模型」选择本批模型与适用的思考强度。
 4. 添加一个空文件夹工作区作为书库，打开长篇工作台并批量选择最终输出文件，然后开始生成。
 
-仓库和发布附件均已公开，无需 GitHub 登录。网络无法直接安装时，从 [v0.1.26-serial.7 发布页](https://github.com/HeyFagao/long-serial-harness/releases/tag/v0.1.26-serial.7) 下载 `long-serial-partner-0.1.26-serial.7.zip` 并解压，按包内说明运行安装脚本或使用本地 `.tgz` 完整路径。不要把源码仓库根目录当作插件安装包。
+仓库和发布附件均已公开，无需 GitHub 登录。网络无法直接安装时，从 [v0.1.26-serial.8 发布页](https://github.com/HeyFagao/long-serial-harness/releases/tag/v0.1.26-serial.8) 下载 `long-serial-partner-0.1.26-serial.8.zip` 并解压，按包内说明运行安装脚本或使用本地 `.tgz` 完整路径。不要把源码仓库根目录当作插件安装包。
 
 ## 使用与验证
 
