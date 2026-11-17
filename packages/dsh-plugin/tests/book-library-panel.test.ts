@@ -1,11 +1,54 @@
 import { describe, expect, it, vi } from "vitest";
 import type { LibraryBook, LibraryImportResult } from "../src/serial-library.js";
 import type { LibraryQueueBook } from "../src/serial-library-runtime.js";
-import { canOpenLibraryBook, decodeLibraryText, libraryQueueControls, registerLibraryResults } from "../src/client/book-library-panel.js";
+import { canOpenLibraryBook, decodeLibraryText, libraryBookControls, libraryQueueControls, libraryStartSelection, registerLibraryResults } from "../src/client/book-library-panel.js";
 
 const book = (id: string): LibraryBook => ({ id, title: `书${id}`, filename: `${id}.txt`, absolutePath: `/library/${id}`, relativePath: `小说项目/${id}`, totalChapters: 100, completedChapters: 0, status: "ready" });
 const imported = (id: string): LibraryImportResult => ({ filename: `${id}.txt`, status: "imported", book: book(id) });
 const queued = (status: LibraryQueueBook["status"]): LibraryQueueBook => ({ id: "book", title: "书", absolutePath: "/library/book", ownerSessionId: "book-session", startChapter: 11, targetChapter: 20, status, completedChapters: 3 });
+
+describe("selected generation and independent book controls", () => {
+  it("never turns an empty or stale explicit selection into all books", () => {
+    expect(libraryStartSelection([book("ready")], [], "selected", null)).toMatchObject({ ids: [], reason: expect.stringContaining("勾选") });
+    expect(libraryStartSelection([book("ready")], ["missing"], "selected", null).ids).toEqual([]);
+  });
+  it("excludes archived and deleting IDs while targeting only the checked normal books", () => {
+    const books = [book("a"), book("b"), { ...book("archived"), status: "archived" }, { ...book("deleted"), status: "deleting" }];
+    expect(libraryStartSelection(books, ["a", "archived", "deleted", "stale"], "selected", null).ids).toEqual(["a"]);
+    expect(libraryStartSelection(books, [], "all", null).ids).toEqual(["a", "b"]);
+  });
+  it("allows a selected ready book to start while another book is running", () => {
+    const task = { status: "running" as const, books: [{ ...queued("running"), id: "active" }] };
+    expect(libraryStartSelection([book("ready"), book("active")], ["ready"], "selected", task)).toEqual({ ids: ["ready"] });
+    expect(libraryStartSelection([book("ready"), book("active")], [], "all", task)).toEqual({ ids: ["ready"] });
+  });
+  it("does not silently start only part of a mixed ready and unfinished selection", () => {
+    for (const status of ["pending", "running", "pausing", "paused", "failed"] as const) {
+      const task = { status: "running" as const, books: [{ ...queued(status), id: "unfinished" }] };
+      const selection = libraryStartSelection([book("ready"), book("unfinished")], ["ready", "unfinished"], "selected", task);
+      expect(selection.ids).toEqual([]); expect(selection.reason).toContain("书unfinished");
+    }
+  });
+  it("keeps a final saved body with a pending title out of completed-book generation", () => {
+    const completeBody = { ...book("book"), completedChapters: 100, status: "running" };
+    const controls = libraryBookControls(completeBody, queued("running"), "running");
+    expect(controls).toMatchObject({ canStart: false, canPause: true, label: "生成中" });
+    expect(libraryBookControls(completeBody, queued("paused"), "running")).toMatchObject({ canStart: false, canResume: true, label: "已单独暂停" });
+  });
+  it("distinguishes per-book pause, global pause and an independent single-book task", () => {
+    expect(libraryBookControls(book("book"), queued("pausing"), "running")).toMatchObject({ canPause: false, canResume: false, label: "本章后暂停" });
+    expect(libraryBookControls(book("book"), queued("paused"), "running")).toMatchObject({ canPause: false, canResume: true });
+    expect(libraryBookControls(book("book"), queued("running"), "paused")).toMatchObject({ canPause: false, canResume: true, label: "本批已暂停" });
+    expect(libraryBookControls({ ...book("book"), status: "pausing" }, queued("pausing"), "paused")).toMatchObject({ canPause: false, canResume: true, label: "本批已暂停" });
+    expect(libraryBookControls({ ...book("book"), status: "pausing" }, queued("pausing"), "stopped")).toMatchObject({ canStart: false, canResume: true });
+    expect(libraryBookControls({ ...book("book"), status: "paused" })).toMatchObject({ canStart: false, canPause: false, canResume: false, reason: expect.stringContaining("打开本书") });
+  });
+  it("allows an explicitly stopped queue to start a fresh target or resume the old one", () => {
+    const stopped = { ...book("book"), status: "stopped" };
+    expect(libraryBookControls(stopped, queued("running"), "stopped")).toMatchObject({ canStart: true, canResume: true });
+    expect(libraryStartSelection([stopped], ["book"], "selected", { status: "stopped", books: [queued("running")] })).toEqual({ ids: ["book"] });
+  });
+});
 
 describe("library recovery ownership", () => {
   it("offers explicit recovery for a stopped batch with unfinished books", () => {
@@ -29,6 +72,10 @@ describe("library recovery ownership", () => {
     expect(blocked.canStop).toBe(true);
     expect(libraryQueueControls({ status: "completed", ownerSessionId: "owner", books: [queued("failed")] }, "owner").resumeLabel).toBe("重试失败项目");
     for (const status of ["stopped", "completed"] as const) expect(libraryQueueControls({ status, ownerSessionId: "owner", books: [queued("completed"), queued("skipped")] }, "owner").resumeLabel).toBeUndefined();
+  });
+  it("does not offer global resume when every unfinished book was paused individually", () => {
+    expect(libraryQueueControls({ status: "paused", ownerSessionId: "owner", books: [queued("paused"), queued("completed")] }, "owner").resumeLabel).toBeUndefined();
+    expect(libraryQueueControls({ status: "paused", ownerSessionId: "owner", books: [queued("paused"), queued("running")] }, "owner").resumeLabel).toBe("继续本批项目");
   });
 });
 

@@ -11,6 +11,7 @@ import { buildFileTree, type FileTreeNode } from "./file-tree.js";
 import { JsonlPreview } from "./jsonl-preview.js";
 import { MarkdownPreview } from "./markdown-preview.js";
 import { endpoint } from "./workbench-ui.js";
+import { isInternalRecordPath } from "../novel-paths.js";
 import { SerialPanel } from "./serial-panel.js";
 import { BookLibraryPanel, type NativeBookNavigation } from "./book-library-panel.js";
 import { openSerialChapterSession, type SerialWorkspaceNavigation } from "./serial-navigation.js";
@@ -77,9 +78,11 @@ function NovelWorkbench({ sessionId, blank, openSerialSession, bookNavigation }:
   }, [sessionId, version]);
   useEffect(() => { if (!open) return; const timer = setInterval(reload, 5000); return () => { clearInterval(timer); }; }, [open, reload]);
   const files = useMemo(() => workspace?.files.filter(file => file.kind === "text") ?? [], [workspace]);
+  const isBookProject = files.some(file => file.path === "追踪/书项目.json" || file.path.startsWith("大纲/") || file.path.startsWith("正文/"));
+  const readOnlyRecord = selected !== undefined && isInternalRecordPath(selected);
   useEffect(() => {
     if (selected !== undefined || files.length === 0) return;
-    const first = files.find(file => file.path.startsWith("正文/")) ?? files.find(file => file.path === "大纲/大纲规划.md") ?? files[0];
+    const first = files.find(file => file.path.startsWith("正文/")) ?? files.find(file => file.path === "大纲/大纲规划.md") ?? files.find(file => !isInternalRecordPath(file.path));
     if (first !== undefined) setSelected(first.path);
   }, [files, selected]);
   const diskVersion = files.find(file => file.path === selected)?.version;
@@ -104,7 +107,7 @@ function NovelWorkbench({ sessionId, blank, openSerialSession, bookNavigation }:
     if (workspace !== undefined) { try { globalThis.localStorage.setItem(`oh-story.novel-open.${workspace.cwd}`, String(value)); } catch { /* Session-local choice still works. */ } }
   };
   const save = async (): Promise<void> => {
-    if (selected === undefined || saving.current.has(selected)) return;
+    if (selected === undefined || isInternalRecordPath(selected) || saving.current.has(selected)) return;
     const path = selected;
     const submitted = draftRef.current[path];
     if (submitted === undefined || submitted.content === submitted.saved) return;
@@ -126,31 +129,34 @@ function NovelWorkbench({ sessionId, blank, openSerialSession, bookNavigation }:
   };
   const draft = selected === undefined ? undefined : drafts[selected];
   const dirty = draft !== undefined && draft.content !== draft.saved;
-  return <section className="novel-workbench" aria-label="长篇连载工作台" data-open={open ? "true" : "false"}>
-    <style>{styles}{serialStyles}</style>
-    <header className="novel-header"><div><strong>长篇连载生成器</strong><span>导入最终输出 · 逐章生成 · 自动保存</span></div><button type="button" onClick={() => { setOpen(!open); }}>{open ? "收起工作台" : "打开长篇工作台"}</button></header>
-    {open && <>
-      {error !== undefined && <p className="novel-error" role="alert">{error}</p>}
-      <div className="novel-layout">
-        <aside className="novel-controls">
-          <BookLibraryPanel sessionId={sessionId} navigation={bookNavigation} onImported={reload} onAvailabilityChange={setArchived} />
-          {!archived && files.some(file => file.path.startsWith("大纲/") || file.path.startsWith("正文/")) && <SerialPanel sessionId={sessionId} onWorkspaceChanged={reload} onOpenSession={openSerialSession} welcome />}
-          <section className="novel-model-card"><h2>模型与中转站</h2><p className="novel-muted">在下方 Harness 模型选择器中切换写作模型。新增中转站请打开「设置 → 模型」。</p></section>
-        </aside>
+  const reading = (
         <section className="novel-reading" aria-label="章节与正文">
-          <header className="novel-reading-toolbar"><h2>章节与资料</h2><button type="button" onClick={reload}>刷新项目文件</button></header>
+          <header className="novel-reading-toolbar"><h2>{isBookProject ? "章节与资料" : "运行记录（只读）"}</h2><button type="button" onClick={reload}>刷新项目文件</button></header>
           <div className="novel-document-layout">
             <nav className="novel-file-tree" aria-label="小说项目文件">
               {GROUPS.map(group => { const grouped = files.filter(file => file.path.startsWith(`${group}/`)); return grouped.length === 0 ? null : <details key={group} open={group === "正文"}><summary>{group}<small>{grouped.length}</small></summary><FileNodes nodes={buildFileTree(grouped, group)} selected={selected} onSelect={setSelected} /></details>; })}
               {files.length === 0 && <p className="novel-muted">导入后，这里会出现每章大纲和正文。</p>}
             </nav>
             <div className="novel-editor">
-              <div className="novel-file-toolbar"><strong title={selected}>{selected ?? "正文预览"}{dirty ? " · 未保存" : ""}</strong><div role="group" aria-label="文稿查看方式"><button type="button" aria-pressed={mode === "preview"} onClick={() => { setMode("preview"); }}>预览</button><button type="button" aria-pressed={mode === "source"} onClick={() => { setMode("source"); }}>编辑</button></div>{mode === "source" && <button type="button" disabled={!dirty || draft?.saving === true} onClick={() => { void save(); }}>{draft?.saving === true ? "保存中…" : "保存"}</button>}</div>
+              <div className="novel-file-toolbar"><strong title={selected}>{selected ?? "正文预览"}{dirty ? " · 未保存" : ""}</strong>{!readOnlyRecord && <div role="group" aria-label="文稿查看方式"><button type="button" aria-pressed={mode === "preview"} onClick={() => { setMode("preview"); }}>预览</button><button type="button" aria-pressed={mode === "source"} onClick={() => { setMode("source"); }}>编辑</button></div>}{readOnlyRecord && <span className="novel-readonly-label">只读记录 · 工作台自动维护</span>}{mode === "source" && !readOnlyRecord && <button type="button" disabled={!dirty || draft?.saving === true} onClick={() => { void save(); }}>{draft?.saving === true ? "保存中…" : "保存"}</button>}</div>
               {(fileError !== undefined || draft?.error !== undefined) && <div className="novel-error" role="alert">{fileError ?? draft?.error}<button type="button" onClick={() => { void reloadFile(); }}>重新读取磁盘版本（放弃本页改动）</button></div>}
-              {selected === undefined ? <div className="novel-empty"><strong>从已有最终输出开始</strong><p>导入书稿后，选择 10 章、20 章、50 章或生成全本。</p><p>每章自动关联本书完整文风和前 10 章正文。</p></div> : draft === undefined ? <p className="novel-muted">正在读取文稿…</p> : mode === "source" ? <textarea className="novel-source" aria-label={`${selected} 编辑内容`} value={draft.content} onChange={event => { const content = event.target.value; setDrafts(current => ({ ...current, [selected]: { ...(current[selected] ?? draft), content } })); }} /> : <div className="novel-prose">{selected.endsWith(".jsonl") ? <JsonlPreview content={draft.content} label={selected} /> : <MarkdownPreview content={draft.content} label={selected} />}</div>}
+              {selected === undefined ? <div className="novel-empty"><strong>{isBookProject ? "从左侧选择章节" : "运行记录仅用于排查问题"}</strong><p>{isBookProject ? "这里可以预览和编辑正文、大纲及设定。" : "日常选书、生成、导出都在上方完成，无需修改这些文件。"}</p></div> : draft === undefined ? <p className="novel-muted">正在读取文稿…</p> : mode === "source" && !readOnlyRecord ? <textarea className="novel-source" aria-label={`${selected} 编辑内容`} value={draft.content} onChange={event => { const content = event.target.value; setDrafts(current => ({ ...current, [selected]: { ...(current[selected] ?? draft), content } })); }} /> : <div className="novel-prose">{selected.endsWith(".jsonl") ? <JsonlPreview content={draft.content} label={selected} /> : <MarkdownPreview content={draft.content} label={selected} />}</div>}
             </div>
           </div>
         </section>
+  );
+  return <section className="novel-workbench" aria-label="长篇连载工作台" data-open={open ? "true" : "false"}>
+    <style>{styles}{serialStyles}</style>
+    <header className="novel-header"><div><strong>长篇连载生成器</strong><span>导入最终输出 · 逐章生成 · 自动保存</span></div><button type="button" onClick={() => { setOpen(!open); }}>{open ? "收起工作台" : "打开长篇工作台"}</button></header>
+    {open && <>
+      {error !== undefined && <p className="novel-error" role="alert">{error}</p>}
+      <div className="novel-layout" data-view={isBookProject ? "book" : "library"}>
+        <aside className="novel-controls">
+          <BookLibraryPanel sessionId={sessionId} navigation={bookNavigation} onImported={reload} onAvailabilityChange={setArchived} />
+          {!archived && files.some(file => file.path.startsWith("大纲/") || file.path.startsWith("正文/")) && <SerialPanel sessionId={sessionId} onWorkspaceChanged={reload} onOpenSession={openSerialSession} welcome />}
+          <section className="novel-model-card"><h2>模型与中转站</h2><p className="novel-muted">在下方 Harness 模型选择器中切换写作模型。新增中转站请打开「设置 → 模型」。</p></section>
+        </aside>
+        {isBookProject ? reading : files.length > 0 && <details className="novel-library-records"><summary>查看运行记录</summary>{reading}</details>}
       </div>
       <p className="novel-native-note">运行日志与模型设置沿用下方 Harness 会话；当前章节的独立会话可从生成进度中打开。</p>
     </>}

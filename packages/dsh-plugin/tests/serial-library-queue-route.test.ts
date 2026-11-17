@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { LibraryQueueAdapter, LibraryTask } from "../src/serial-library-runtime.js";
 import { registerLibraryQueueRoute } from "../src/serial-library-queue-route.js";
 
-const state = vi.hoisted(() => ({ stored: null as LibraryTask | null, owners: [] as string[] }));
+const state = vi.hoisted(() => ({ stored: null as LibraryTask | null, owners: [] as string[], calls: [] as { action: string; args: unknown[] }[] }));
 vi.mock("../src/serial-library-runtime.js", async original => ({
   ...await original<object>(),
   SerialLibraryRuntime: class {
@@ -12,7 +12,9 @@ vi.mock("../src/serial-library-runtime.js", async original => ({
     constructor(private readonly adapter: LibraryQueueAdapter) { state.owners.push(adapter.ownerSessionId); }
     async restore() { this.task = await this.adapter.load(); return this.task; }
     snapshot() { return this.task; }
-    async start() { return { ownerSessionId: this.adapter.ownerSessionId, status: "running" }; }
+    async start(...args: unknown[]) { state.calls.push({ action: "start", args }); return { ownerSessionId: this.adapter.ownerSessionId, status: "running" }; }
+    async pauseBooks(...args: unknown[]) { state.calls.push({ action: "pauseBooks", args }); return { ownerSessionId: this.adapter.ownerSessionId, status: "running" }; }
+    async resumeBooks(...args: unknown[]) { state.calls.push({ action: "resumeBooks", args }); return { ownerSessionId: this.adapter.ownerSessionId, status: "running" }; }
     dispose() {}
   }
 }));
@@ -45,7 +47,27 @@ function stored(status: LibraryTask["status"]): LibraryTask {
 }
 
 describe("library queue owner cache", () => {
-  beforeEach(() => { state.stored = null; state.owners = []; });
+  beforeEach(() => { state.stored = null; state.owners = []; state.calls = []; });
+
+  it("passes exact selected IDs and fifty chapters to the runtime", async () => {
+    const request = harness(); const ids = ["a".repeat(64), "b".repeat(64)];
+    const result = await request("owner-a", "POST", { action: "start", count: 50, ids, concurrency: "all", style: "selected-style" });
+    expect(result.status).toBe(200);
+    expect(state.calls).toEqual([{ action: "start", args: [50, { style: "selected-style" }, "all", ids] }]);
+  });
+
+  it.each(["pauseBooks", "resumeBooks"])("routes %s only to the explicitly selected books", async action => {
+    const request = harness(); const ids = ["a".repeat(64)];
+    expect((await request("owner-a", "POST", { action, ids })).status).toBe(200);
+    expect(state.calls).toEqual([{ action, args: [ids] }]);
+  });
+
+  it("rejects empty or malformed selections instead of falling back to all books", async () => {
+    const request = harness();
+    expect((await request("owner-a", "POST", { action: "start", count: 10, ids: [] })).status).toBe(400);
+    expect((await request("owner-a", "POST", { action: "pauseBooks", ids: ["missing"] })).status).toBe(400);
+    expect(state.calls).toEqual([]);
+  });
 
   it.each(["completed", "stopped"] as const)("allows another ordinary session to start after %s", async status => {
     state.stored = stored(status);

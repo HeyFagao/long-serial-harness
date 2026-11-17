@@ -11,6 +11,7 @@ import { zstdDecompressSync } from "node:zlib";
 import { chromium, type Browser, type Page, type Response as BrowserResponse } from "@playwright/test";
 import { unzipSync, strFromU8 } from "fflate";
 import { ORIGINAL_SYSTEM_PROMPT, ORIGINAL_SYSTEM_PROMPT_SHA256 } from "../packages/dsh-plugin/src/original-prompts.js";
+import { AUTHOR_CHAPTER_TITLE_PROMPT } from "../packages/dsh-plugin/src/wechat-title-author-prompt.js";
 import type { LibraryBook, LibrarySnapshot } from "../packages/dsh-plugin/src/serial-library.js";
 import type { LibraryTask } from "../packages/dsh-plugin/src/serial-library-runtime.js";
 import { deterministicNativeOutput } from "./serial-fixtures/native-output.js";
@@ -23,9 +24,28 @@ const digest = (value: string | Buffer): string => createHash("sha256").update(v
 const sleep = (milliseconds: number): Promise<void> => new Promise(done => setTimeout(done, milliseconds));
 const keys = Array.from({ length: 10 }, (_, index) => `SMOKEBOOK${String(index + 1).padStart(2, "0")}`);
 const deletionKeys = ["SMOKEBOOK11", "SMOKEBOOK12"] as const;
-const totalFor = (key: string): number => keys.includes(key) && keys.indexOf(key) < 2 ? 32 : 11;
+const selectionKeys = ["SMOKEBOOK13", "SMOKEBOOK14", "SMOKEBOOK15"] as const;
+const selectionTotals: Readonly<Record<string, number>> = { SMOKEBOOK13: 12, SMOKEBOOK14: 3, SMOKEBOOK15: 2 };
+const selectionAccepted: Readonly<Record<string, number>> = { SMOKEBOOK13: 10, SMOKEBOOK14: 3, SMOKEBOOK15: 2 };
+const baseChapters = 152;
+const selectedChapters = 15;
+const totalAcceptedChapters = baseChapters + selectedChapters;
+const totalFor = (key: string): number => selectionTotals[key] ?? (keys.includes(key) && keys.indexOf(key) < 2 ? 32 : 11);
 const chapterPath = (chapter: number): string => `正文/第${String(chapter).padStart(3, "0")}章.md`;
 const titleFor = (key: string): string => `回归小说${key.slice(-2)}`;
+function titleCandidates(chapter: number): readonly string[] {
+  const candidates = [`第${String(chapter)}本账刚核清，无名信却送来了原始契约`, `她合上第${String(chapter)}本账册，一封无名信让旧案再起波澜`,
+    `第${String(chapter)}次核账刚结束，她寻找的契约竟被送上门`, `沈宁核清第${String(chapter)}本旧账，无名来信藏着关键物证`, `第${String(chapter)}本账册背后，那张失踪的契约终于出现`];
+  assert(candidates.every(title => [...title].length >= 15 && [...title].length <= 25));
+  return candidates;
+}
+function checkExportedTitle(text: string): void {
+  const firstLine = text.replace(/^\uFEFF/u, "").split(/\r?\n/u)[0]!;
+  const number = /^第(\d+)本账刚核清/u.exec(firstLine)?.[1]; assert(number !== undefined, "TXT must begin with the selected chapter title");
+  assert.equal(firstLine, titleCandidates(Number(number))[0]);
+  assert([...firstLine].length >= 15 && [...firstLine].length <= 25);
+  assert(!/coreHook|titleStrategy|topThree|candidates|番茄标签配置|【最终标签】/u.test(text), "Title analysis or alternatives leaked into the chapter TXT");
+}
 function redact(value: string): string { return value.replace(/([?&]token=)[^\s"'<>]+/gu, "$1[REDACTED]"); }
 function command(program: string, args: readonly string[], env: NodeJS.ProcessEnv = process.env): string {
   const result = spawnSync(program, args, { cwd: root, env, encoding: "utf8", stdio: "pipe" });
@@ -43,7 +63,8 @@ interface Answer { readonly key: string; readonly chapter: number; readonly sess
 interface ModelFixture { server: Server; baseURL: string; books: Map<string, LibraryBook>; answers: Answer[]; titles: Answer[]; titleRetried: boolean; waiting: Set<string>; holds: Set<string>; failures: string[]; requests: number; shortDraft?: { readonly text: string; readonly sessionId: string }; rewritePassed: boolean }
 function blocks(message: WireMessage): readonly Block[] { return Array.isArray(message.content) ? message.content as Block[] : typeof message.content === "string" ? [{ type: "text", text: message.content }] : []; }
 async function assertPrompt(book: LibraryBook, key: string, chapter: number, prompt: string): Promise<void> {
-  assert(!prompt.includes("【微信公众号小说长标题】"), "Title instructions leaked into writing request");
+  assert(!prompt.includes("【微信公众号小说长标题】") && !prompt.includes("【微信公众号小说章节标题】") && !prompt.includes("【独立标题任务】")
+    && !prompt.includes(AUTHOR_CHAPTER_TITLE_PROMPT.slice(0, 120)), "Title instructions leaked into writing request");
   assert(prompt.startsWith(ORIGINAL_SYSTEM_PROMPT), "The original SYSTEM prompt was replaced or shortened");
   assert.equal(digest(ORIGINAL_SYSTEM_PROMPT), ORIGINAL_SYSTEM_PROMPT_SHA256);
   assert(prompt.includes("【本章细纲】") && prompt.includes("【发散等级】"), "Original USER template missing");
@@ -124,6 +145,7 @@ async function startModel(): Promise<ModelFixture> {
           assert.equal(titlePrompts.length, 1); assert.equal(matching.length, 0);
           const prompt = titlePrompts[0]!;
           assert(!prompt.includes(ORIGINAL_SYSTEM_PROMPT) && !prompt.includes("【本章细纲】") && !prompt.includes("_STYLE_START"), "Title request inherited writing context");
+          assert(prompt.includes(AUTHOR_CHAPTER_TITLE_PROMPT.replace("{{步骤 1.output}}", "本次材料见下方 chapter_body 内的当前章正文。")), "Author-supplied title prompt was omitted or rewritten");
           const key = /SMOKEBOOK\d{2}/u.exec(prompt)?.[0]; assert(key !== undefined && model.books.has(key));
           const chapter = Number(/章号：(\d+)/u.exec(prompt)?.[1]);
           const prose = await readFile(join(model.books.get(key)!.absolutePath, chapterPath(chapter)), "utf8");
@@ -133,7 +155,10 @@ async function startModel(): Promise<ModelFixture> {
           assert(!model.answers.some(item => item.sessionId === sessionId));
           if (!model.titleRetried) { text = "模拟标题格式失败"; model.titleRetried = true; }
           else {
-            text = JSON.stringify({ title: `她核清第${String(chapter)}本账册，门外的无名信却送来了失踪的原始契约`, evidence: [prose.split("\n").find(line => line.includes("沈宁抵达"))!.slice(0, 40)] });
+            const candidates = titleCandidates(chapter);
+            text = JSON.stringify({ coreHook: "核清旧账后收到一直寻找的原始契约", titleStrategy: "用无名来信与关键物证制造悬念", candidates, topThree: candidates.slice(0, 3),
+              tags: { category: "悬疑惊悚", plots: ["推理", "大女主"], roles: ["女配", "女总裁"], emotion: "爽文", background: "古代" },
+              evidence: [prose.split("\n").find(line => line.includes("账册合拢时"))!.slice(0, 80)] });
             model.titles.push({ key, chapter, sessionId, text });
           }
           assert.equal(await readFile(join(model.books.get(key)!.absolutePath, chapterPath(chapter)), "utf8"), prose);
@@ -191,8 +216,43 @@ async function waitNativeRequest(origin: string, sessionId: string, model: Model
   }, `native text request ${identity}`);
 }
 async function clickQueue(page: Page, name: string): Promise<void> {
+  if (["本章后暂停所有项目", "继续本批项目", "停止所有项目"].includes(name)) {
+    const details = page.locator("details.book-library-queue");
+    await details.waitFor({ state: "attached", timeout: 20_000 });
+    if (await details.getAttribute("open") === null) await details.locator("summary").first().click();
+  }
   const response = page.waitForResponse(item => item.url().includes("/oh-story/library/queue?") && item.request().method() === "POST", { timeout: 30_000 });
   await page.getByRole("button", { name, exact: true }).click({ timeout: 20_000 }); assert.equal((await response).status(), 200);
+}
+async function checkLibraryLayout(page: Page): Promise<void> {
+  const layout = page.locator('.novel-layout[data-view="library"]');
+  const bounds = await layout.boundingBox(); const controls = await layout.locator(":scope > .novel-controls").boundingBox();
+  assert(bounds !== null && controls !== null && controls.width >= bounds.width - 2, "Library controls remained in the narrow book-editor sidebar");
+  await page.getByRole("list", { name: "小说项目列表" }).scrollIntoViewIfNeeded();
+  await page.screenshot({ path: join(evidence, "library-import.png"), animations: "disabled" });
+  await page.setViewportSize({ width: 720, height: 1000 });
+  await waitFor(async () => await layout.evaluate(element => element.scrollWidth <= element.clientWidth + 1), "narrow library without horizontal overflow");
+  await page.getByRole("list", { name: "小说项目列表" }).scrollIntoViewIfNeeded();
+  await page.screenshot({ path: join(evidence, "library-import-narrow.png"), animations: "disabled" });
+  await page.setViewportSize({ width: 1440, height: 1000 });
+}
+async function checkReadonlyLibraryRecords(page: Page): Promise<void> {
+  const records = page.locator("details.novel-library-records");
+  await records.waitFor({ state: "attached", timeout: 20_000 });
+  assert.equal(await records.getAttribute("open"), null, "Internal records opened automatically");
+  assert.equal(await records.locator('button[aria-current="true"]').count(), 0, "An internal JSON record was selected automatically");
+  await records.locator(":scope > summary").click();
+  const tracking = records.locator("nav > details");
+  if (await tracking.getAttribute("open") === null) await tracking.locator(":scope > summary").click();
+  await records.getByRole("button", { name: "追踪/书库任务.json", exact: true }).click();
+  await records.getByText("只读记录 · 工作台自动维护", { exact: true }).waitFor({ state: "visible" });
+  await records.locator(".novel-prose").waitFor({ state: "visible" });
+  assert.equal(await records.getByRole("button", { name: "编辑", exact: true }).count(), 0);
+  assert.equal(await records.getByRole("button", { name: "保存", exact: true }).count(), 0);
+  assert.equal(await records.locator("textarea").count(), 0);
+  await page.screenshot({ path: join(evidence, "library-readonly-records.png"), animations: "disabled" });
+  await records.locator(":scope > summary").click();
+  assert.equal(await records.getAttribute("open"), null);
 }
 async function assertImportContainment(origin: string, sessionId: string, library: string, temporary: string): Promise<void> {
   const outside = join(temporary, "outside-import-target"); await mkdir(outside);
@@ -208,8 +268,7 @@ async function assertImportContainment(origin: string, sessionId: string, librar
     assert.deepEqual(await readdir(outside), ["sentinel.txt"]); assert.equal(await readFile(join(outside, "sentinel.txt"), "utf8"), "outside directory must remain untouched\n");
   } finally { await rm(link); }
 }
-async function checkBook(book: LibraryBook, key: string): Promise<void> {
-  const total = totalFor(key);
+async function checkBook(book: LibraryBook, key: string, total = totalFor(key)): Promise<void> {
   const ledger = JSON.parse(await readFile(join(book.absolutePath, "追踪/_tracking-state.json"), "utf8")) as { readonly kind: string; readonly schema_version: number; readonly last_committed_chapter: number; readonly wordcount_records: Record<string, { readonly actual: number; readonly body_sha256: string }>; readonly original_state: { readonly recent: readonly { readonly n: number; readonly title: string }[] } };
   assert.equal(ledger.kind, "serial-original"); assert.equal(ledger.schema_version, 1); assert.equal(ledger.last_committed_chapter, total); assert.equal(Object.keys(ledger.wordcount_records).length, total);
   assert.deepEqual([...new Set(JSON.stringify(ledger.original_state).match(/SMOKEBOOK\d{2}/gu))], [key], "Another book contaminated the state ledger");
@@ -220,12 +279,15 @@ async function checkBook(book: LibraryBook, key: string): Promise<void> {
     assert(prose.includes(key) && !prose.includes("【状态变更】")); assert(change.startsWith("【状态变更】") && change.includes(key));
     assert.deepEqual([...new Set(prose.match(/SMOKEBOOK\d{2}/gu))], [key]);
     const record = ledger.wordcount_records[String(chapter)]!; assert(record.actual >= 2300 && record.actual <= 2500); assert.equal(record.body_sha256, digest(prose));
+    const headline = JSON.parse(await readFile(join(book.absolutePath, `追踪/公众号标题/第${String(chapter).padStart(3, "0")}章.json`), "utf8")) as { readonly title: string; readonly candidates: readonly string[]; readonly topThree: readonly string[]; readonly bodySha256: string };
+    assert.deepEqual(headline.candidates, titleCandidates(chapter)); assert.deepEqual(headline.topThree, titleCandidates(chapter).slice(0, 3));
+    assert.equal(headline.title, titleCandidates(chapter)[0]); assert.equal(headline.bodySha256, digest(prose));
   }
 }
-async function checkNativeChildren(home: string, model: ModelFixture): Promise<void> {
+async function checkNativeChildren(home: string, model: ModelFixture, total = baseChapters): Promise<void> {
   const directory = join(home, "sessions"); const files = await readdir(directory, { recursive: true });
-  assert.equal(new Set(model.answers.map(answer => answer.sessionId)).size, 152);
-  assert.equal(new Set([...model.answers, ...model.titles].map(answer => answer.sessionId)).size, 304);
+  assert.equal(new Set(model.answers.map(answer => answer.sessionId)).size, total);
+  assert.equal(new Set([...model.answers, ...model.titles].map(answer => answer.sessionId)).size, total * 2);
   for (const answer of [...model.answers, ...model.titles]) {
     const file = files.find(path => path.endsWith(`${answer.sessionId}/session.v4.jsonl.zstd`)); assert(file !== undefined);
     const lines = zstdDecompressSync(await readFile(join(directory, file))).toString("utf8").trim().split("\n");
@@ -257,6 +319,9 @@ async function main(): Promise<void> {
     const tarball = resolve(configuredTarball); const pluginSha256 = digest(await readFile(tarball)); await cp(tarball, join(evidence, "novel-plugin-tested.tgz"));
     const entries = command("tar", ["-tzf", tarball]).trim().split("\n");
     assert(!entries.some(path => /(?:\/SKILL\.md$|\/roles\/|\/skills\/|\/knowledge\/|\/drama\/|\/novel-to-game\/|\/video-recap\/|\.map$)/u.test(path)), "Novel package still contains removed knowledge or source maps");
+    const pluginMetadata = JSON.parse(command("tar", ["-xOf", tarball, "package/package.json"])) as { readonly version: string };
+    assert(typeof pluginMetadata.version === "string" && pluginMetadata.version !== "");
+    assert(command("tar", ["-xOf", tarball, "package/README.md"]).includes(pluginMetadata.version), "Packaged README does not document this plugin version");
     try { await readFile(bin); } catch {
       await mkdir(installation, { recursive: true }); await writeFile(join(installation, "package.json"), JSON.stringify({ private: true, dependencies: { "@deepseek-ai/dsh": version } }));
       await writeFile(join(installation, "pnpm-workspace.yaml"), "packages:\n  - .\nnodeLinker: hoisted\nallowBuilds:\n  '@deepseek-ai/dsh-subprocess-local': true\n  '@google/genai': false\n  koffi: true\n  node-addon-require-builtin: false\n  node-pty: true\n  protobufjs: false\n");
@@ -311,7 +376,7 @@ async function main(): Promise<void> {
     }
     assert.equal(new Set(registered.values()).size, 10); assert.equal(await page.getByRole("list", { name: "小说项目列表" }).getByRole("listitem").count(), 10);
     for (const name of ["短剧", "游戏", "视频"]) assert.equal(await page.getByRole("tab", { name, exact: true }).count(), 0);
-    await page.screenshot({ path: join(evidence, "library-import.png"), animations: "disabled" });
+    await checkLibraryLayout(page);
     await page.getByRole("list", { name: "小说项目列表" }).getByRole("listitem").filter({ hasText: titleFor(keys[0]!) }).getByRole("button", { name: "打开", exact: true }).click();
     await page.getByRole("button", { name: "← 回到书库总览", exact: true }).waitFor({ state: "visible", timeout: 20_000 });
     const openedBookSession = await page.locator("[data-conversation-session]").first().getAttribute("data-conversation-session"); assert(openedBookSession !== null && openedBookSession !== sessionId);
@@ -322,7 +387,7 @@ async function main(): Promise<void> {
     // the already materialized owner before testing that owner's durable queue.
     await page.getByRole("treeitem").filter({ hasText: "书库验收会话" }).first().click();
     await page.locator(`[data-conversation-session="${sessionId}"]`).waitFor({ state: "visible", timeout: 20_000 });
-    await page.getByRole("button", { name: "所有项目新增 10 章", exact: true }).waitFor({ state: "visible", timeout: 20_000 });
+    await page.getByRole("button", { name: "开始批量生成", exact: true }).waitFor({ state: "visible", timeout: 20_000 });
     await assertImportContainment(origin, sessionId, libraryPath, temporary);
     if (process.env.LIBRARY_IMPORT_ONLY === "1") {
       const report = { ok: true, phase: "import-only", dshVersion: version, pluginSha256, importedBooks: 10, registeredNativeWorkspaces: 10, separateProjectDirectories: 10, sourceBytesExact: true, outsideSymlinkImport: "rejected-without-outside-writes", novelOnlyPackageAndUI: "passed", nativeOwnerTurn: "passed", chapterGeneration: "not run", realPaidModel: false };
@@ -331,11 +396,14 @@ async function main(): Promise<void> {
     }
     await page.getByLabel("书间并发模式").selectOption("custom");
     await page.getByLabel("同时生成的书数").fill("1");
+    await page.getByLabel("生成范围", { exact: true }).selectOption("all");
+    await page.getByRole("radio", { name: "新增 10 章", exact: true }).check();
     const blocked = model.books.get(keys[9]!)!; const blockedStyle = join(blocked.absolutePath, "设定/文风.md"); const style = await readFile(blockedStyle); await rm(blockedStyle);
-    model.holds.add(`${keys[0]!}/1`); await clickQueue(page, "所有项目新增 10 章");
+    model.holds.add(`${keys[0]!}/1`); await clickQueue(page, "开始批量生成");
     const started = (await queue(origin, sessionId))!; assert.equal(started.count, 10);
     const repeated = await Promise.allSettled([queue(origin, sessionId, { action: "start", count: 10 }), queue(origin, sessionId, { action: "start", count: 10 })]); assert(repeated.every(result => result.status === "rejected" || result.value?.id === started.id));
     await waitNativeRequest(origin, sessionId, model, `${keys[0]!}/1`);
+    await checkReadonlyLibraryRecords(page);
     await clickQueue(page, "本章后暂停所有项目"); model.holds.delete(`${keys[0]!}/1`);
     const paused = await waitQueue(origin, sessionId, task => task.status === "paused"); assert.equal(paused.books.reduce((sum, book) => sum + book.completedChapters, 0), 1);
     await sleep(400); assert.equal(model.answers.length, 1);
@@ -372,7 +440,7 @@ async function main(): Promise<void> {
       const chapterFiles = Object.keys(chapterZip).filter(name => name.startsWith("第")); assert.equal(chapterFiles.length, totalFor(key));
       for (const name of chapterFiles) {
         const text = strFromU8(chapterZip[name]!); assert(!text.includes("【状态变更】"));
-        assert(text.includes(`书名：《${titleFor(key)}》`)); assert(text.includes("门外的无名信"));
+        assert(text.includes(`书名：《${titleFor(key)}》`)); checkExportedTitle(text);
         assert.deepEqual([...new Set(text.match(/SMOKEBOOK\d{2}/gu))], [key]);
       }
     }
@@ -404,7 +472,7 @@ async function main(): Promise<void> {
       for (const filename of names) {
         const txt = strFromU8(chapters[filename]!);
         const bookKeys = [...new Set(txt.match(/SMOKEBOOK\d{2}/gu))]; assert.equal(bookKeys.length, 1);
-        assert(txt.includes("书名：《") && txt.includes("门外的无名信")); assert(!txt.includes("【状态变更】"));
+        assert(txt.includes("书名：《")); checkExportedTitle(txt); assert(!txt.includes("【状态变更】"));
       }
     }
     assert.equal(chapterTxtCount, 152);
@@ -412,6 +480,100 @@ async function main(): Promise<void> {
     const librarySnapshot = async (): Promise<LibrarySnapshot> => {
       const response = await dshFetch(`${origin}/oh-story/library?sessionId=${encodeURIComponent(sessionId)}`); assert.equal(response.status, 200); return await response.json() as LibrarySnapshot;
     };
+
+    // Selected generation must never pick up another imported book. Short
+    // outlines cap ancillary work; book13 still proves an exact +10 target.
+    for (const key of selectionKeys) await writeFile(join(inputFiles, `${key}.txt`), sourceFor(key));
+    const selectedImport = await api<LibrarySnapshot>(origin, "library", sessionId, { files: selectionKeys.map(key => ({ filename: `${key}.txt`, text: sourceFor(key) })) });
+    assert.equal(selectedImport.books.length, 13);
+    for (const key of selectionKeys) {
+      const book = selectedImport.books.find(item => item.filename === `${key}.txt`); assert(book !== undefined);
+      await rpc(origin, "workspace/create", { request: { path: book.absolutePath } });
+      model.books.set(key, book);
+    }
+    const selectedIds = selectionKeys.map(key => model!.books.get(key)!.id);
+    const firstSelected = selectionKeys[0]; const secondSelected = selectionKeys[1]; const appendedSelected = selectionKeys[2];
+    for (const identity of [`${firstSelected}/1`, `${firstSelected}/2`, `${secondSelected}/1`, `${secondSelected}/2`, `${secondSelected}/3`, `${appendedSelected}/1`]) model.holds.add(identity);
+    await waitFor(async () => await reopened.getByRole("list", { name: "小说项目列表" }).getByRole("listitem").count() === 13, "three selected-scope fixture books visible");
+    await reopened.getByRole("button", { name: "取消选择", exact: true }).click();
+    await reopened.getByRole("checkbox", { name: `选择 ${titleFor(firstSelected)}`, exact: true }).check();
+    await reopened.getByRole("checkbox", { name: `选择 ${titleFor(secondSelected)}`, exact: true }).check();
+    await reopened.getByLabel("生成范围", { exact: true }).selectOption("selected");
+    await reopened.getByRole("radio", { name: "新增 10 章", exact: true }).check();
+    await reopened.getByLabel("书间并发模式").selectOption("all");
+    await clickQueue(reopened, "开始批量生成");
+    const selectedStart = (await queue(origin, sessionId))!;
+    assert.deepEqual(selectedStart.books.map(book => book.id).sort(), selectedIds.slice(0, 2).sort());
+    assert.equal(selectedStart.books.find(book => book.id === selectedIds[0])?.targetChapter, 10);
+    assert.equal(selectedStart.books.find(book => book.id === selectedIds[1])?.targetChapter, 3);
+    await waitNativeRequest(origin, sessionId, model, `${firstSelected}/1`);
+    await waitNativeRequest(origin, sessionId, model, `${secondSelected}/1`);
+    assert(!model.answers.some(answer => answer.key === appendedSelected) && !model.waiting.has(`${appendedSelected}/1`));
+    assert(await absent(join(model.books.get(appendedSelected)!.absolutePath, "追踪/连载任务.json")), "Unselected book received a serial task");
+
+    await clickQueue(reopened, `暂停 ${titleFor(firstSelected)}`);
+    model.holds.delete(`${firstSelected}/1`); model.holds.delete(`${secondSelected}/1`);
+    await waitQueue(origin, sessionId, task => task.books.find(book => book.id === selectedIds[0])?.status === "paused"
+      && task.books.find(book => book.id === selectedIds[1])?.status === "running");
+    await waitNativeRequest(origin, sessionId, model, `${secondSelected}/2`);
+    model.holds.delete(`${secondSelected}/2`);
+    await waitNativeRequest(origin, sessionId, model, `${secondSelected}/3`);
+    const individuallyPaused = (await queue(origin, sessionId))!;
+    assert.equal(individuallyPaused.books.find(book => book.id === selectedIds[0])?.completedChapters, 1);
+    assert.equal(individuallyPaused.books.find(book => book.id === selectedIds[1])?.completedChapters, 2);
+    assert(!model.waiting.has(`${firstSelected}/2`), "An individually paused book kept dispatching chapters");
+    assert(await absent(join(model.books.get(appendedSelected)!.absolutePath, "追踪/连载任务.json")));
+
+    // The third book is admitted only on this explicit selection, while book14
+    // is still writing. count50 is accepted and capped to its two-chapter outline.
+    const appended = (await queue(origin, sessionId, { action: "start", count: 50, concurrency: "all", ids: [selectedIds[2]] }))!;
+    assert.equal(appended.id, selectedStart.id);
+    assert.equal(appended.books.find(book => book.id === selectedIds[0])?.targetChapter, 10);
+    assert.equal(appended.books.find(book => book.id === selectedIds[0])?.status, "paused");
+    assert.equal(appended.books.find(book => book.id === selectedIds[2])?.targetChapter, 2);
+    await waitNativeRequest(origin, sessionId, model, `${appendedSelected}/1`);
+    model.holds.delete(`${appendedSelected}/1`);
+    await waitQueue(origin, sessionId, task => task.books.find(book => book.id === selectedIds[2])?.status === "completed");
+    assert.equal(model.answers.filter(answer => answer.key === firstSelected).length, 1, "Appending another book resumed a paused book");
+
+    await clickQueue(reopened, `继续 ${titleFor(firstSelected)}`);
+    const selectedResume = (await queue(origin, sessionId))!;
+    assert.equal(selectedResume.books.find(book => book.id === selectedIds[0])?.startChapter, 1);
+    assert.equal(selectedResume.books.find(book => book.id === selectedIds[0])?.targetChapter, 10, "Resume extended the selected +10 target");
+    await waitNativeRequest(origin, sessionId, model, `${firstSelected}/2`);
+    model.holds.delete(`${firstSelected}/2`); model.holds.delete(`${secondSelected}/3`);
+    const selectedDone = await waitQueue(origin, sessionId, task => task.status === "completed");
+    assert.equal(selectedDone.books.length, 3);
+    for (const key of selectionKeys) {
+      const count = selectionAccepted[key]!;
+      assert.deepEqual(model.answers.filter(answer => answer.key === key).map(answer => answer.chapter), Array.from({ length: count }, (_, index) => index + 1));
+      await checkBook(model.books.get(key)!, key, count);
+    }
+    assert(await absent(join(model.books.get(firstSelected)!.absolutePath, chapterPath(11))), "Selected +10 wrote an eleventh chapter");
+    assert.equal(model.answers.filter(answer => keys.includes(answer.key)).length, baseChapters);
+    assert.equal(model.answers.length, totalAcceptedChapters); assert.equal(model.titles.length, totalAcceptedChapters);
+    await checkNativeChildren(home, model, totalAcceptedChapters);
+    const selectedExport = await dshFetch(`${origin}/oh-story/library?sessionId=${encodeURIComponent(sessionId)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "export", ids: selectedIds }) });
+    assert.equal(selectedExport.status, 200);
+    const selectedExportBytes = new Uint8Array(await selectedExport.arrayBuffer());
+    await writeFile(join(evidence, "library-selection-export.zip"), selectedExportBytes);
+    const selectedZip = unzipSync(selectedExportBytes);
+    const selectedZipNames = Object.keys(selectedZip).filter(name => name.endsWith(".zip")); assert.equal(selectedZipNames.length, 3);
+    let selectedTxtCount = 0;
+    for (const name of selectedZipNames) {
+      const chapters = unzipSync(selectedZip[name]!);
+      for (const filename of Object.keys(chapters).filter(filename => filename.startsWith("第"))) {
+        const txt = strFromU8(chapters[filename]!); checkExportedTitle(txt); selectedTxtCount += 1;
+        const identities = [...new Set(txt.match(/SMOKEBOOK\d{2}/gu))]; assert.equal(identities.length, 1);
+        assert(selectionKeys.some(key => key === identities[0]));
+      }
+    }
+    assert.equal(selectedTxtCount, selectedChapters);
+    const selectedCleanup = await api<LibrarySnapshot & { readonly results: readonly { readonly ok: boolean }[] }>(origin, "library", sessionId, { action: "delete", ids: selectedIds });
+    assert(selectedCleanup.results.every(result => result.ok)); assert.equal(selectedCleanup.books.length, 10);
+    await waitFor(async () => (await Promise.all(selectionKeys.map(key => absent(model!.books.get(key)!.absolutePath)))).every(Boolean)
+      && ((await librarySnapshot()).deletingBooks?.length ?? 0) === 0, "selected-generation fixture projects removed", 60_000);
+    process.stdout.write(`selected-scope passed: ${String(selectedChapters)} extra chapters, independent pause/resume, append and count50 cap\n`);
 
     // Keep all completed-book assertions above; only these disposable additions
     // exercise deletion while one native request runs and another book waits.
@@ -475,7 +637,7 @@ async function main(): Promise<void> {
     assert((await removedAdditions()).every(Boolean), "A stopped writer recreated a deleted book");
     assert.deepEqual(await readdir(deletionOutside), ["sentinel.txt"]);
     assert.equal(await readFile(deletionSentinel, "utf8"), "outside deletion target must remain untouched\n");
-    assert.equal(model.answers.length, 152); assert.equal(model.titles.length, 152);
+    assert.equal(model.answers.length, totalAcceptedChapters); assert.equal(model.titles.length, totalAcceptedChapters);
     assert.equal(model.failures.length, 0, model.failures.join("\n"));
     assert.deepEqual(await Promise.all(keys.map(key => readFile(join(model!.books.get(key)!.absolutePath, chapterPath(1)), "utf8"))), proseBefore);
     for (const key of keys) await checkBook(model.books.get(key)!, key);
@@ -514,12 +676,36 @@ async function main(): Promise<void> {
     assert.equal(finalSnapshot.deletingBooks?.length ?? 0, 0);
     assert.deepEqual(await readdir(join(libraryPath, "小说项目")), []);
     assert.equal(await readFile(librarySentinel, "utf8"), sentinelText);
-    for (const key of keys) assert.equal(await readFile(join(inputFiles, `${key}.txt`), "utf8"), sourceFor(key));
+    for (const key of [...keys, ...selectionKeys]) assert.equal(await readFile(join(inputFiles, `${key}.txt`), "utf8"), sourceFor(key));
     assert.equal(await absent(join(libraryPath, "追踪/书库任务.json")), false, "Shared library state was removed with a selected book");
     assert.equal((await queue(origin, deletionSession.sessionId))?.ownerSessionId, sessionId, "Deletion took ownership of another session's completed queue");
-    assert.equal(model.answers.length, 152); assert.equal(model.titles.length, 152); assert.equal(model.failures.length, 0, model.failures.join("\n"));
+    assert.equal(model.answers.length, totalAcceptedChapters); assert.equal(model.titles.length, totalAcceptedChapters); assert.equal(model.failures.length, 0, model.failures.join("\n"));
     await reopened.screenshot({ path: join(evidence, "library-deleted.png"), animations: "disabled" }); assert.equal(pageErrors.length, 0, pageErrors.join("\n"));
-    const report = { ok: true, simultaneousNativeRequests: 10, dshVersion: version, pluginSha256, provider: "local-deterministic-text-fixture", realPaidModel: false, importedBooks: 10, deletionFixtureBooks: 2, registeredNativeWorkspaces: 10, separateProjectDirectories: 10, batches: [{ count: 10, accepted: 100 }, { count: 20, accepted: 48 }, { count: "all", accepted: 4 }], acceptedChapters: 152, freshNativeChapterSessions: 152, independentTitleSessions: 152, titleContextIsolation: "passed-current-chapter-only", titleRetryWithoutRewritingProse: "passed", chapterTxtFiles: 152, hostCommittedTextAndState: "passed", originalSystemSha256: ORIGINAL_SYSTEM_PROMPT_SHA256, originalRewriteAndBackup: "passed", fullStyleAndPreviousTen: "passed", bookIsolation: "passed", exportedBooks: 10, batchTxtZipDownload: "passed-10-book-zips-152-chapter-txts", backgroundDeletion: "passed-running-and-pending-books-physically-removed", deletionAcknowledgmentMs, failedDeletionAutoRetry: "passed-hidden-symlink-failure-then-automatic-recovery", outsideDeletionTarget: "preserved", deletedQueueResurrection: "prevented-on-resume-and-new-batch", uiPermanentDeletion: "passed-10-books-no-confirmation-no-recycle", crossSessionCompletedBookDeletion: "passed-without-taking-queue-ownership", libraryAndOriginalInputPreservation: "passed", failedBookIsolationAndRetry: "passed", pauseResume: "passed", stopResumeFixedTargets: "passed", duplicateStart: "passed", nativeHostRestart: "passed", browserCloseAndReopen: "passed", novelOnlyPackageAndUI: "passed", outsideSymlinkImport: "rejected-without-outside-writes", modelToolCalls: 0, literaryQuality: "not assessed" };
+    const report = {
+      ok: true, simultaneousNativeRequests: 10, dshVersion: version, pluginVersion: pluginMetadata.version, pluginSha256,
+      provider: "local-deterministic-text-fixture", realPaidModel: false,
+      importedBooks: 15, baseBooks: 10, selectedFixtureBooks: 3, deletionFixtureBooks: 2,
+      registeredNativeWorkspaces: 15, separateProjectDirectories: 15,
+      batches: [{ count: 10, accepted: 100 }, { count: 20, accepted: 48 }, { count: "all", accepted: 4 }],
+      baseAcceptedChapters: baseChapters, selectedAcceptedChapters: selectedChapters,
+      acceptedChapters: totalAcceptedChapters, freshNativeChapterSessions: totalAcceptedChapters, independentTitleSessions: totalAcceptedChapters,
+      authorTitlePromptPreserved: "passed", fiveTitleCandidatesAndRanking: "passed", selectedTitleLength: "passed-15-to-25-characters",
+      titleContextIsolation: "passed-current-chapter-only", titleRetryWithoutRewritingProse: "passed", chapterTxtFiles: totalAcceptedChapters,
+      selectedUiStart: "passed-only-two-checked-books", unselectedBookDispatch: "none-before-explicit-selection",
+      selectedTenChapterTarget: "passed-exactly-10-of-12", individualPause: "passed-other-book-continued", individualResume: "passed-original-target-unchanged",
+      appendSelectedWhileRunning: "passed", selectedCount50: "passed-capped-to-two-chapter-outline",
+      hostCommittedTextAndState: "passed", originalSystemSha256: ORIGINAL_SYSTEM_PROMPT_SHA256, originalRewriteAndBackup: "passed",
+      fullStyleAndPreviousTen: "passed", bookIsolation: "passed", exportedBooks: 13,
+      batchTxtZipDownload: "passed-10-book-zips-152-chapter-txts", selectedBookExport: "passed-3-book-zips-15-chapter-txts",
+      backgroundDeletion: "passed-running-and-pending-books-physically-removed", deletionAcknowledgmentMs,
+      failedDeletionAutoRetry: "passed-hidden-symlink-failure-then-automatic-recovery", outsideDeletionTarget: "preserved",
+      deletedQueueResurrection: "prevented-on-resume-and-new-batch", uiPermanentDeletion: "passed-10-books-no-confirmation-no-recycle",
+      crossSessionCompletedBookDeletion: "passed-without-taking-queue-ownership", libraryAndOriginalInputPreservation: "passed",
+      failedBookIsolationAndRetry: "passed", pauseResume: "passed", stopResumeFixedTargets: "passed", duplicateStart: "passed",
+      nativeHostRestart: "passed", browserCloseAndReopen: "passed", novelOnlyPackageAndUI: "passed",
+      fullWidthLibrary: "passed", narrowLibraryOverflow: "none", advancedRecordsDefault: "collapsed-without-auto-selected-json", internalRecordEditor: "read-only",
+      outsideSymlinkImport: "rejected-without-outside-writes", modelToolCalls: 0, literaryQuality: "not assessed"
+    };
     await writeFile(join(evidence, "library-smoke.json"), `${JSON.stringify(report, null, 2)}\n`); for (const name of ["library-failure.log", "library-failure.png", "library-failure-aria.txt"]) await rm(join(evidence, name), { force: true });
     process.stdout.write(`${JSON.stringify(report)}\n`); passed = true;
   } catch (error) {

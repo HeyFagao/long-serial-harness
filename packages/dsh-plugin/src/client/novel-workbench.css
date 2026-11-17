@@ -19,3 +19,10 @@
 [data-conversation-content][data-content-phase] [data-conversation-scroll]:has(.novel-workbench[data-open="true"]) { justify-content:flex-start; }
 @media(max-width:900px) { .novel-layout { grid-template-columns:minmax(240px,290px) minmax(0,1fr); }.novel-document-layout { grid-template-columns:120px minmax(0,1fr); }.novel-prose { padding:15px; } }
 @media(max-width:650px) { .novel-layout { display:block; }.novel-controls { max-height:none; border-right:0; border-bottom:1px solid var(--dsw-alias-border-l2,#d9e1dc); }.novel-header { padding:12px; }.novel-header span { display:none; }.novel-document-layout { min-height:360px; height:60vh; grid-template-columns:110px minmax(0,1fr); }.novel-workbench { margin-top:8px; } }
+
+.novel-layout[data-view="library"] { grid-template-columns:minmax(0,1fr); }
+.novel-layout[data-view="library"] .novel-controls { max-height:none; overflow:visible; border-right:0; }
+.novel-library-records { border-top:1px solid var(--dsw-alias-border-l2,#d9e1dc); }
+.novel-library-records>summary { padding:12px 18px; cursor:pointer; color:var(--dsw-alias-label-secondary,#708078); }
+.novel-library-records .novel-document-layout { min-height:280px; height:420px; max-height:65vh; }
+.novel-readonly-label { color:var(--dsw-alias-label-secondary,#708078); font-size:10px; }

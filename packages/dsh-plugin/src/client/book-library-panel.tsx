@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ChangeEvent } from "react";
 import type { LibraryBook, LibraryImportResult, LibraryInputFile, LibrarySnapshot } from "../serial-library.js";
-import type { LibraryCount, LibraryTask } from "../serial-library-runtime.js";
+import type { LibraryCount, LibraryQueueBook, LibraryTask } from "../serial-library-runtime.js";
 import { endpoint } from "./workbench-ui.js";
 import libraryStyles from "./book-library.css?inline";
 
@@ -46,6 +46,41 @@ export function canOpenLibraryBook(book: LibraryBook): boolean {
   return book.absolutePath.trim() !== "" && book.totalChapters > 0 && !["incomplete", "archived", "deleting", "delete_failed"].includes(book.status);
 }
 
+export function libraryBookControls(book: LibraryBook, reservation?: Pick<LibraryQueueBook, "status">, queueStatus?: LibraryTask["status"]): {
+  readonly canStart: boolean; readonly canPause: boolean; readonly canResume: boolean; readonly label: string; readonly reason?: string;
+} {
+  const unavailable = !canOpenLibraryBook(book);
+  if (unavailable) return { canStart: false, canPause: false, canResume: false, label: STATUS[book.status] ?? book.status, reason: "请先完成导入或处理书项目记录。" };
+  // A saved final body can still be waiting for its independent title. Reservation state comes first.
+  const unfinished = reservation !== undefined && !["completed", "skipped"].includes(reservation.status);
+  const stoppedReservation = unfinished && queueStatus === "stopped";
+  if (unfinished && !stoppedReservation) {
+    const interrupted = queueStatus !== undefined && !["running", "pausing", "completed"].includes(queueStatus);
+    const canPause = !interrupted && (reservation.status === "pending" || reservation.status === "running");
+    const canResume = reservation.status === "paused" || reservation.status === "failed" || (interrupted && ["pending", "running", "pausing"].includes(reservation.status));
+    const label = ({ pending: "排队中", running: "生成中", pausing: "本章后暂停", paused: "已单独暂停", failed: "需要处理" } as Record<string, string>)[reservation.status] ?? reservation.status;
+    return { canStart: false, canPause, canResume, label: interrupted && ["pending", "running", "pausing"].includes(reservation.status) ? "本批已暂停" : label, reason: canResume ? "已有未完成批次，请点“继续所选书”，会按原目标接着写。" : "已有生成批次；可暂停所选书，或等本批完成后再新增章节。" };
+  }
+  if (["running", "pausing", "paused", "blocked"].includes(book.status)) return { canStart: false, canPause: false, canResume: stoppedReservation, label: STATUS[book.status] ?? book.status, reason: stoppedReservation ? "原批尚未结束，请继续所选书并核对原目标。" : "本书有独立生成任务，请打开本书继续或停止原任务。" };
+  if (book.completedChapters >= book.totalChapters) return { canStart: false, canPause: false, canResume: stoppedReservation, label: stoppedReservation ? "原批未完成" : "已完本", reason: stoppedReservation ? "原批仍有未完成步骤，请继续原批。" : "已写完全部已导入章纲，可直接导出。" };
+  return { canStart: true, canPause: false, canResume: stoppedReservation, label: stoppedReservation ? "已停止" : book.completedChapters > 0 ? "可继续新增" : "待生成" };
+}
+
+/** Never let an empty/stale selection fall through to the server's legacy all-books default. */
+export function libraryStartSelection(books: readonly LibraryBook[], selectedIds: readonly string[], scope: "selected" | "all", task: Pick<LibraryTask, "books" | "status"> | null | undefined): { readonly ids: readonly string[]; readonly reason?: string } {
+  const available = books.filter(book => !["archived", "deleting", "delete_failed"].includes(book.status));
+  const eligible = (book: LibraryBook) => libraryBookControls(book, task?.books.find(item => item.id === book.id), task?.status);
+  if (scope === "all") {
+    const ids = available.filter(book => eligible(book).canStart).map(book => book.id);
+    return { ids, ...(ids.length === 0 ? { reason: "目前没有可新增章节的书。已有任务可继续，已完本的书可导出。" } : {}) };
+  }
+  const selected = available.filter(book => selectedIds.includes(book.id));
+  if (selected.length === 0) return { ids: [], reason: "请先在下方勾选要更新的书；也可切换到“全部可新增的书”。" };
+  const blocked = selected.find(book => !eligible(book).canStart);
+  if (blocked !== undefined) return { ids: [], reason: `《${blocked.title}》${eligible(blocked).reason ?? "暂时不能新增章节。"} 可用“选择可新增”快速筛选。` };
+  return { ids: selected.map(book => book.id) };
+}
+
 async function waitForWorkspaceCleanup(cleanup: Promise<void>): Promise<boolean> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -89,7 +124,7 @@ export function libraryQueueControls(task: Pick<LibraryTask, "status" | "ownerSe
   const differentOwner = task !== undefined && task !== null && task.ownerSessionId !== sessionId;
   if (task === undefined || task === null || differentOwner) return { canStart, differentOwner, canPause: false, canStop: false };
   let resumeLabel: string | undefined;
-  if (task.status === "paused" || task.status === "blocked") resumeLabel = "继续本批项目";
+  if ((task.status === "paused" || task.status === "blocked") && task.books.some(book => ["pending", "running", "pausing", "failed"].includes(book.status))) resumeLabel = "继续本批项目";
   else if (task.status === "stopped" && task.books.some(book => book.status !== "completed" && book.status !== "skipped")) resumeLabel = "恢复这批项目";
   else if (task.status === "completed" && task.books.some(book => book.status === "failed")) resumeLabel = "重试失败项目";
   return { canStart, differentOwner, canPause: task.status === "running", canStop: !canStart, ...(resumeLabel === undefined ? {} : { resumeLabel }) };
@@ -120,6 +155,12 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
   const [loadError, setLoadError] = useState<string>();
   const [queueError, setQueueError] = useState<string>();
   const [concurrency, setConcurrency] = useState("all");
+  const concurrencyDirty = useRef(false);
+  const [generationScope, setGenerationScope] = useState<"selected" | "all">("selected");
+  const [generationCount, setGenerationCount] = useState<LibraryCount>(10);
+  const [generationError, setGenerationError] = useState<string>();
+  const [generationNotice, setGenerationNotice] = useState<string>();
+  const [bookSearch, setBookSearch] = useState("");
   const [task, setTask] = useState<LibraryTask | null>();
   const [pending, setPending] = useState<string>();
   const [notice, setNotice] = useState<string>();
@@ -171,7 +212,10 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
     const controller = new AbortController();
     const stamp = queueRevision.current;
     void fetch(endpoint("library/queue", sessionId), { signal: controller.signal }).then(responseJson<{ readonly task: LibraryTask | null }>).then(value => {
-      if (!controller.signal.aborted && stamp === queueRevision.current) { setTask(value.task); setQueueError(undefined); }
+      if (!controller.signal.aborted && stamp === queueRevision.current) {
+        setTask(value.task); setQueueError(undefined);
+        if (!concurrencyDirty.current && value.task !== null) setConcurrency(String(value.task.concurrency ?? 1));
+      }
     }).catch((reason: unknown) => { if (!controller.signal.aborted && stamp === queueRevision.current) setQueueError(reason instanceof Error ? reason.message : String(reason)); });
     return () => { controller.abort(); };
   }, [refresh, sessionId, snapshot?.isBookProject]);
@@ -251,6 +295,8 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
       setSelected(current => current.filter(file => failedNames.has(file.filename)));
       setPending("register");
       const importedBooks = value.results.flatMap(result => result.status !== "failed" && result.book !== undefined ? [result.book] : []);
+      setCheckedBooks(importedBooks.map(book => book.id));
+      setGenerationScope("selected");
       // Explicitly importing a deleted book again authorizes a new native project entry.
       for (const book of importedBooks) {
         registrationGeneration.current.set(book.id, (registrationGeneration.current.get(book.id) ?? 0) + 1);
@@ -293,14 +339,29 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
     } catch (reason: unknown) { if (mounted.current) setError(reason instanceof Error ? reason.message : String(reason)); }
     finally { if (mounted.current) setPending(undefined); }
   };
-  const queueAction = async (action: "start" | "pause" | "resume" | "stop", count?: LibraryCount): Promise<void> => {
+  const queueAction = async (action: "start" | "pause" | "resume" | "stop" | "pauseBooks" | "resumeBooks", count?: LibraryCount, ids?: readonly string[]): Promise<void> => {
     if (pending !== undefined) return;
+    if ((action === "start" || action === "pauseBooks" || action === "resumeBooks") && (ids === undefined || ids.length === 0)) { setGenerationError("请先选择要操作的书。"); return; }
     queueRevision.current += 1;
-    setPending(`queue-${action}`); setError(undefined);
+    setPending(`queue-${action}`); setError(undefined); setGenerationError(undefined); setGenerationNotice(undefined);
     try {
-      const value = await responseJson<{ readonly task: LibraryTask | null }>(await fetch(endpoint("library/queue", sessionId), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action, concurrency: concurrency === "all" ? "all" : Number(concurrency), ...(count === undefined ? {} : { count }) }) }));
-      if (mounted.current) { setTask(value.task); setQueueError(undefined); onImported(); }
-    } catch (reason: unknown) { if (mounted.current) setError(reason instanceof Error ? reason.message : String(reason)); }
+      if (action === "start") {
+        const targets = (snapshot?.books ?? []).filter(book => ids!.includes(book.id));
+        if (targets.length !== ids!.length) throw new Error("所选书项目已变化，请刷新后重新勾选。");
+        await registerBooks(targets.filter(book => registrationsRef.current[book.id]?.workspaceId === undefined));
+        if (!mounted.current) return;
+        const failed = targets.find(book => registrationsRef.current[book.id]?.workspaceId === undefined);
+        if (failed !== undefined) throw new Error(`《${failed.title}》尚未完成 Harness 项目登记，请在书卡上重试登记后开始。`);
+      }
+      const value = await responseJson<{ readonly task: LibraryTask | null }>(await fetch(endpoint("library/queue", sessionId), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action, concurrency: concurrency === "all" ? "all" : Number(concurrency), ...(count === undefined ? {} : { count }), ...(ids === undefined ? {} : { ids: [...new Set(ids)] }) }) }));
+      if (mounted.current) {
+        setTask(value.task); setQueueError(undefined); onImported();
+        if (action === "start" && value.task !== null) { concurrencyDirty.current = false; setConcurrency(String(value.task.concurrency ?? 1)); }
+        if (action === "start") setGenerationNotice(`已启动 ${String(ids!.length)} 本书，${count === "all" ? "各自写至已导入大纲结尾" : `每本新增 ${String(count)} 章`}${count === "all" ? "。" : "，不足时写至大纲结尾。"}`);
+        else if (action === "pauseBooks") setGenerationNotice(`已暂停所选 ${String(ids!.length)} 本书的后续派发；正在写的章节保存后暂停，其他书继续。`);
+        else if (action === "resumeBooks") setGenerationNotice(`已继续所选 ${String(ids!.length)} 本书，沿用原批目标，不额外增加章数。`);
+      }
+    } catch (reason: unknown) { if (mounted.current) setGenerationError(reason instanceof Error ? reason.message : String(reason)); }
     finally { queueRevision.current += 1; if (mounted.current) { setPending(undefined); refreshing(); } }
   };
   const openQueueOwner = async (): Promise<void> => {
@@ -390,6 +451,41 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
   const differentOwner = queueControls.differentOwner;
   const failedBooks = visibleTaskBooks.filter(book => book.status === "failed").length;
   const doneBooks = visibleTaskBooks.filter(book => book.status === "completed" || book.status === "skipped").length;
+  const controlsForBook = (book: LibraryBook) => libraryBookControls(book, visibleTaskBooks.find(item => item.id === book.id), task?.status);
+  const normalSelectedIds = visibleSelectedIds.filter(id => visibleBooks.some(book => book.id === id));
+  const startSelection = libraryStartSelection(visibleBooks, normalSelectedIds, generationScope, task);
+  const currentOwner = task === undefined || task === null || !differentOwner;
+  const controlsAllowed = task !== undefined && task !== null && currentOwner;
+  const pauseIds = visibleBooks.filter(book => normalSelectedIds.includes(book.id) && controlsForBook(book).canPause).map(book => book.id);
+  const resumeIds = visibleBooks.filter(book => normalSelectedIds.includes(book.id) && controlsForBook(book).canResume).map(book => book.id);
+  const validConcurrency = concurrency === "all" || (Number.isSafeInteger(Number(concurrency)) && Number(concurrency) >= 1);
+  const activeOtherOwner = differentOwner && task !== undefined && task !== null && !["completed", "stopped"].includes(task.status);
+  const selectionNeedsOwner = differentOwner && pauseIds.length + resumeIds.length > 0;
+  const startReason = visibleBooks.length === 0 ? "请先批量导入小说，再选择本次生成的章节数。" : task === undefined ? "正在读取生成状态…" : queueError !== undefined ? "暂时无法读取生成状态，请点刷新后重试。"
+    : activeOtherOwner ? "这批书由另一个书库会话启动，请先回到任务会话操作。"
+    : task?.status === "blocked" ? "本批遇到需要处理的问题，请先查看下方提示，再继续原批或停止后新增。"
+    : !validConcurrency ? "并发数请填写正整数。" : startSelection.reason;
+  const searchedBooks = visibleBooks.filter(book => book.title.toLocaleLowerCase().includes(bookSearch.trim().toLocaleLowerCase()));
+  const selectedOutsideSearch = normalSelectedIds.filter(id => !searchedBooks.some(book => book.id === id)).length;
+  const generationPrefix = generationScope === "all" ? "全部" : "所选";
+  const startLabel = `${generationPrefix} ${String(startSelection.ids.length)} 本${generationCount === "all" ? "写至完本" : `各新增 ${String(generationCount)} 章`}`;
+  const renderBook = (book: LibraryBook) => {
+    const controls = controlsForBook(book);
+    const reservation = visibleTaskBooks.find(item => item.id === book.id);
+    return <article key={book.id} role="listitem" className="book-library-book" data-selected={checkedBooks.includes(book.id) ? "true" : "false"} data-state={reservation?.status ?? book.status}>
+      {!snapshot?.isBookProject && <input type="checkbox" aria-label={`选择 ${book.title}`} checked={checkedBooks.includes(book.id)} disabled={busy} onChange={event => { const checked = event.target.checked; setGenerationScope("selected"); setCheckedBooks(current => checked ? [...new Set([...current, book.id])] : current.filter(id => id !== book.id)); }} />}
+      <div className="book-library-book-copy"><strong title={book.title}>{book.title}</strong><span>{book.completedChapters} / {book.totalChapters} 章 · {controls.label}</span>
+        {reservation !== undefined && !["completed", "skipped"].includes(reservation.status) && <span>原批目标：第 {reservation.targetChapter} 章</span>}
+      </div>
+      {!snapshot?.isBookProject && <div className="book-library-book-actions">
+        {controls.canPause && controlsAllowed && <button type="button" aria-label={`暂停 ${book.title}`} disabled={busy} onClick={() => { void queueAction("pauseBooks", undefined, [book.id]); }}>暂停</button>}
+        {controls.canResume && controlsAllowed && <button type="button" aria-label={`继续 ${book.title}`} disabled={busy} onClick={() => { void queueAction("resumeBooks", undefined, [book.id]); }}>继续</button>}
+        <button type="button" disabled={busy || !canOpenLibraryBook(book)} onClick={() => { void openBook(book); }}>{pending === book.id ? "正在打开…" : "打开"}</button>
+      </div>}
+      {book.error !== undefined && <details className="book-library-book-error"><summary>查看本书提示</summary><p className="book-library-error">{book.error}</p></details>}
+      {registrations[book.id]?.error !== undefined && <div className="book-library-error">文件已保存，Harness 项目登记未完成：{registrations[book.id]?.error}<button type="button" disabled={busy || !canOpenLibraryBook(book)} onClick={() => { void retryRegister(book); }}>重试登记项目</button></div>}
+    </article>;
+  };
   return <section className="book-library-panel" aria-label="小说书库">
     <style>{libraryStyles}</style>
     <header className="book-library-heading"><h2>{snapshot?.isBookProject ? "当前书项目" : "小说书库"}</h2><button type="button" disabled={busy} onClick={refreshing}>刷新</button></header>
@@ -406,40 +502,57 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
     {notice !== undefined && <p className="book-library-notice" role="status">{notice}</p>}
     {visibleResults.some(result => result.status === "failed") && <details className="book-library-results" open><summary>导入问题 · {visibleResults.filter(result => result.status === "failed").length} 项</summary><ul>{visibleResults.filter(result => result.status === "failed").map((result, index) => <li key={`${result.filename}:${String(index)}`}><strong>{result.filename}</strong><span>{result.error}</span></li>)}</ul></details>}
     {snapshot !== undefined && !snapshot.isBookProject && <section className="book-library-batch" aria-label="书库批量生成">
-      <h3>所有项目一键生成</h3>
-      <p className="book-library-note">书与书同时生成，每本书内部逐章续写；各书文风和前文独立关联。</p>
-      {queueError !== undefined && <p className="book-library-error" role="alert">{queueError}</p>}
-      <label>书间并发 <select aria-label="书间并发模式" disabled={busy || !queueControls.canStart} value={concurrency === "all" ? "all" : "custom"} onChange={event => { setConcurrency(event.target.value === "all" ? "all" : "1"); }}><option value="all">全部项目同时生成（不限并发）</option><option value="custom">自定义并发数</option></select></label>
-      {concurrency !== "all" && <input aria-label="同时生成的书数" type="number" min="1" step="1" disabled={busy || !queueControls.canStart} value={concurrency} onChange={event => { setConcurrency(event.target.value); }} />}
-      <div className="book-library-batch-starts">
-        <button type="button" disabled={busy || !queueControls.canStart || !visibleBooks.some(canOpenLibraryBook) || task === undefined || queueError !== undefined} onClick={() => { void queueAction("start", 10); }}>所有项目新增 10 章</button>
-        <button type="button" disabled={busy || !queueControls.canStart || !visibleBooks.some(canOpenLibraryBook) || task === undefined || queueError !== undefined} onClick={() => { void queueAction("start", 20); }}>所有项目新增 20 章</button>
-        <button className="book-library-primary" type="button" disabled={busy || !queueControls.canStart || !visibleBooks.some(canOpenLibraryBook) || task === undefined || queueError !== undefined} onClick={() => { void queueAction("start", "all"); }}>所有项目写至完本</button>
+      <div className="book-library-batch-heading"><div><h3>选择书籍与生成</h3><p className="book-library-note">勾选需要更新的书，再选择每本新增章数。暂停和继续只影响所选书，其他书照常生成。</p></div><strong className="book-library-selected-count" aria-live="polite">已选 {visibleSelectedIds.length} 本</strong></div>
+      <div className="book-library-selection-dock">
+        <div className="book-library-selection-tools">
+          <input type="search" aria-label="搜索书名" placeholder="搜索书名" value={bookSearch} onChange={event => { setBookSearch(event.target.value); }} />
+          <div className="book-library-queue-actions">
+            <button type="button" disabled={busy} onClick={() => { setCheckedBooks(searchedBooks.map(book => book.id)); setGenerationScope("selected"); }}>{bookSearch.trim() === "" ? "全选书项目" : "全选搜索结果"}</button>
+            <button type="button" disabled={busy} onClick={() => { setCheckedBooks(searchedBooks.filter(book => controlsForBook(book).canStart).map(book => book.id)); setGenerationScope("selected"); }}>选择可新增</button>
+            <button type="button" disabled={busy} onClick={() => { setCheckedBooks(searchedBooks.filter(book => book.completedChapters >= book.totalChapters && controlsForBook(book).label === "已完本").map(book => book.id)); setGenerationScope("selected"); }}>选择已完本</button>
+            <button type="button" disabled={busy} onClick={() => { setCheckedBooks([]); setGenerationScope("selected"); }}>取消选择</button>
+          </div>
+        </div>
+        <div className="book-library-generation-options">
+          <label>生成范围<select aria-label="生成范围" disabled={busy} value={generationScope} onChange={event => { setGenerationScope(event.target.value === "all" ? "all" : "selected"); setGenerationError(undefined); }}><option value="selected">所选书籍</option><option value="all">全部可新增的书</option></select></label>
+          <fieldset className="book-library-chapter-options"><legend>每本书本次写</legend>{([10, 20, 50, "all"] as const).map(count => <label key={count} data-checked={generationCount === count ? "true" : "false"}><input type="radio" name={`library-count-${sessionId}`} value={count} checked={generationCount === count} disabled={busy} onChange={() => { setGenerationCount(count); }} />{count === "all" ? "写至完本" : `新增 ${String(count)} 章`}</label>)}</fieldset>
+          <label>书间并发<select aria-label="书间并发模式" disabled={busy} value={concurrency === "all" ? "all" : "custom"} onChange={event => { concurrencyDirty.current = true; setConcurrency(event.target.value === "all" ? "all" : "1"); }}><option value="all">同时生成（不限并发）</option><option value="custom">自定义并发数</option></select></label>
+          {concurrency !== "all" && <label>同时写几本<input aria-label="同时生成的书数" type="number" min="1" step="1" disabled={busy} value={concurrency} onChange={event => { concurrencyDirty.current = true; setConcurrency(event.target.value); }} /></label>}
+        </div>
+        <div className="book-library-generation-actions">
+          <button className="book-library-primary" aria-label="开始批量生成" type="button" disabled={busy || startReason !== undefined || startSelection.ids.length === 0} onClick={() => { void queueAction("start", generationCount, startSelection.ids); }}>{pending === "queue-start" ? "正在启动所选书…" : startLabel}</button>
+          <button type="button" disabled={busy || !controlsAllowed || pauseIds.length === 0} onClick={() => { void queueAction("pauseBooks", undefined, pauseIds); }}>暂停所选书</button>
+          <button type="button" disabled={busy || !controlsAllowed || resumeIds.length === 0} onClick={() => { void queueAction("resumeBooks", undefined, resumeIds); }}>继续所选书</button>
+        </div>
+        {generationScope === "all" && <p className="book-library-note">本次仅启动全书库中可新增的 {startSelection.ids.length} 本；正在写、单独暂停和待处理的书保持原状态。</p>}
+        {startReason !== undefined && <p className="book-library-note" role="status">{startReason}</p>}
+        {normalSelectedIds.length > 0 && <p className="book-library-note">所选书中：可暂停 {pauseIds.length} 本，可继续 {resumeIds.length} 本。暂停会写完并保存当前章；继续沿用原批目标。</p>}
+        {selectedOutsideSearch > 0 && <p className="book-library-note">另有 {selectedOutsideSearch} 本已勾选书不在当前搜索结果中，仍包含在所选操作里。</p>}
+        {selectionNeedsOwner && !activeOtherOwner && <p className="book-library-note">所选书的原批属于另一会话，请返回任务会话继续。</p>}
+        {(activeOtherOwner || selectionNeedsOwner) && navigation.openSession !== undefined && <button type="button" disabled={busy} onClick={() => { void openQueueOwner(); }}>回到书库任务会话</button>}
+        <div aria-live="polite">{generationNotice !== undefined && <p className="book-library-notice" role="status">{generationNotice}</p>}{(generationError !== undefined || queueError !== undefined) && <p className="book-library-error" role="alert">{generationError ?? queueError}</p>}</div>
       </div>
-      {task !== undefined && task !== null && visibleTaskBooks.length > 0 && <div className="book-library-queue" data-status={task.status}>
-        <div className="book-library-queue-heading"><strong>{STATUS[task.status] ?? task.status}</strong><span>{doneBooks} / {visibleTaskBooks.length} 本完成{failedBooks > 0 ? ` · ${String(failedBooks)} 本待处理` : ""}</span></div>
-        <p>本批书间并发：{task.concurrency === "all" ? "全部项目" : task.concurrency ?? 1} · 生成中 {visibleTaskBooks.filter(book => book.status === "running").length} 本</p>
+      <div className="book-library-books" role="list" aria-label="小说项目列表">{searchedBooks.map(renderBook)}</div>
+      {searchedBooks.length === 0 && <p className="book-library-empty">{visibleBooks.length === 0 ? "这里还没有书项目。批量导入后，每本书会出现在这里和 Harness 工作区列表中。" : "没有匹配的书名。清空搜索可查看全部书籍。"}</p>}
+      {task !== undefined && task !== null && visibleTaskBooks.length > 0 && <details className="book-library-queue" data-status={task.status} open={task.status === "blocked"}>
+        <summary><strong>{STATUS[task.status] ?? task.status}</strong> · 本批 {doneBooks} / {visibleTaskBooks.length} 本完成{failedBooks > 0 ? ` · ${String(failedBooks)} 本待处理` : ""} · 查看本批进度</summary>
+        <p className="book-library-note">本批并发：{task.concurrency === "all" ? "全部项目" : task.concurrency ?? 1} · 生成中 {visibleTaskBooks.filter(book => book.status === "running").length} 本 · 单独暂停 {visibleTaskBooks.filter(book => book.status === "paused" || book.status === "pausing").length} 本</p>
         <progress aria-label="本批书项目进度" value={doneBooks} max={visibleTaskBooks.length} />
         {task.error !== undefined && visibleTaskBooks.length === task.books.length && <p className="book-library-error" role="alert">{task.error}</p>}
-        {differentOwner && <p className="book-library-note">本批由另一个书库会话启动，请回到该会话管理任务。</p>}
+        {differentOwner && <p className="book-library-note">本批由另一个书库会话启动，继续或控制原批请返回任务会话。</p>}
         <div className="book-library-queue-actions">
-          {differentOwner && navigation.openSession !== undefined && <button type="button" disabled={busy} onClick={() => { void openQueueOwner(); }}>回到书库任务会话</button>}
+          {differentOwner && !activeOtherOwner && !selectionNeedsOwner && navigation.openSession !== undefined && <button type="button" disabled={busy} onClick={() => { void openQueueOwner(); }}>回到书库任务会话</button>}
           {queueControls.canPause && <button type="button" disabled={busy} onClick={() => { void queueAction("pause"); }}>本章后暂停所有项目</button>}
           {queueControls.resumeLabel !== undefined && <button type="button" disabled={busy} onClick={() => { void queueAction("resume"); }}>{queueControls.resumeLabel}</button>}
           {queueControls.canStop && <button type="button" disabled={busy} onClick={() => { void queueAction("stop"); }}>停止所有项目</button>}
         </div>
         {task.status === "pausing" && <p className="book-library-note">当前章保存后暂停，不再启动下一章或下一本。</p>}
-        <details className="book-library-queue-details" open={task.status === "blocked" || failedBooks > 0}><summary>查看各书进度</summary><ol aria-label="本批项目进度">{visibleTaskBooks.map(book => <li key={book.id} data-active={book.status === "running" ? "true" : "false"}><strong>{book.title}</strong><span>{book.status === "skipped" ? "已达到大纲末尾" : `第 ${String(book.startChapter)}—${String(book.targetChapter)} 章 · 本批已保存 ${String(book.completedChapters)} 章`}</span><em>{({ pending: "等待开始", running: "生成中", completed: "完成", failed: "需要处理", skipped: "无需新增" } as const)[book.status]}</em>{book.error !== undefined && <p className="book-library-error">{book.error}</p>}</li>)}</ol></details>
-        <p className="book-library-note">本批已保存在 Harness。关闭页面不会停止生成；退出应用后可在这里继续。</p>
-      </div>}
+        <ol className="book-library-queue-progress" aria-label="本批项目进度">{visibleTaskBooks.map(book => <li key={book.id} data-active={book.status === "running" ? "true" : "false"}><strong>{book.title}</strong><span>{book.status === "skipped" ? "已达到大纲末尾" : `第 ${String(book.startChapter)}—${String(book.targetChapter)} 章 · 本批已保存 ${String(book.completedChapters)} 章`}</span><em>{({ pending: "等待开始", running: "生成中", pausing: "本章后暂停", paused: "已单独暂停", completed: "完成", failed: "需要处理", skipped: "无需新增" } as const)[book.status]}</em>{book.error !== undefined && <p className="book-library-error">{book.error}</p>}</li>)}</ol>
+        <p className="book-library-note">关闭页面不会停止生成；退出应用后可在这里继续。单独暂停的书需要勾选后继续。</p>
+      </details>}
     </section>}
     {snapshot !== undefined && !snapshot.isBookProject && <section className="book-library-manage" aria-label="批量导出与整理">
       <h3>导出与整理</h3>
-      <div className="book-library-queue-actions">
-        <button type="button" disabled={busy} onClick={() => { setCheckedBooks(visibleBooks.map(book => book.id)); }}>全选书项目</button>
-        <button type="button" disabled={busy} onClick={() => { setCheckedBooks(visibleBooks.filter(book => book.totalChapters > 0 && book.completedChapters >= book.totalChapters && book.status === "completed").map(book => book.id)); }}>选择已完本</button>
-        <button type="button" disabled={busy} onClick={() => { setCheckedBooks([]); }}>取消选择</button>
-      </div>
       <p>已选 {visibleSelectedIds.length} 本</p>
       <div className="book-library-queue-actions">
         <button type="button" disabled={busy || visibleSelectedIds.length === 0} onClick={() => { void manageBooks("export", visibleSelectedIds); }}>{pending === "export" ? "正在打包正文…" : "批量导出 TXT"}</button>
@@ -453,14 +566,13 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
         {manageError !== undefined && <p className="book-library-error" role="alert">{manageError}</p>}
       </div>
       {visibleArchivedBooks.length > 0 && <details><summary>旧版回收站 · {visibleArchivedBooks.length} 本</summary><p className="book-library-note">旧版移入回收站的书仍占用磁盘。可勾选后导出或永久删除；新版删除不再保留回收站副本。</p>{visibleArchivedBooks.map(book => <article key={book.id}>
-        <input type="checkbox" aria-label={`选择旧版回收站中的 ${book.title}`} checked={checkedBooks.includes(book.id)} disabled={busy} onChange={event => { const checked = event.target.checked; setCheckedBooks(current => checked ? [...new Set([...current, book.id])] : current.filter(id => id !== book.id)); }} />
+        <input type="checkbox" aria-label={`选择旧版回收站中的 ${book.title}`} checked={checkedBooks.includes(book.id)} disabled={busy} onChange={event => { const checked = event.target.checked; setGenerationScope("selected"); setCheckedBooks(current => checked ? [...new Set([...current, book.id])] : current.filter(id => id !== book.id)); }} />
         <strong>{book.title}</strong><span>已保存 {book.completedChapters} 章</span>
         <button type="button" disabled={busy} aria-label={`永久删除 ${book.title}`} onClick={() => { void manageBooks("delete", [book.id]); }}>永久删除</button>
         <button type="button" disabled={busy} aria-label={`导出 ${book.title}`} onClick={() => { void manageBooks("export", [book.id]); }}>导出TXT</button>
       </article>)}</details>}
 
     </section>}
-    {snapshot !== undefined && <div className="book-library-books" role="list" aria-label="小说项目列表">{visibleBooks.map(book => <article key={book.id} role="listitem" className="book-library-book">{!snapshot.isBookProject && <input type="checkbox" aria-label={`选择 ${book.title}`} checked={checkedBooks.includes(book.id)} disabled={busy} onChange={event => { const checked = event.target.checked; setCheckedBooks(current => checked ? [...new Set([...current, book.id])] : current.filter(id => id !== book.id)); }} />}<div><strong title={book.title}>{book.title}</strong><span>{book.completedChapters} / {book.totalChapters} 章 · {STATUS[book.status] ?? book.status}</span></div>{!snapshot.isBookProject && <button type="button" disabled={busy || !canOpenLibraryBook(book)} onClick={() => { void openBook(book); }}>{pending === book.id ? "正在打开…" : "打开"}</button>}{book.error !== undefined && <p className="book-library-error">{book.error}</p>}{registrations[book.id]?.error !== undefined && <div className="book-library-error">文件已保存，Harness 项目登记未完成：{registrations[book.id]?.error}<button type="button" disabled={busy || !canOpenLibraryBook(book)} onClick={() => { void retryRegister(book); }}>重试登记项目</button></div>}</article>)}</div>}
-    {snapshot !== undefined && visibleBooks.length === 0 && <p className="book-library-empty">这里还没有书项目。批量导入后，每本书会出现在这里和 Harness 工作区列表中。</p>}
+    {snapshot?.isBookProject === true && <div className="book-library-books" role="list" aria-label="小说项目列表">{visibleBooks.map(renderBook)}</div>}
   </section>;
 }

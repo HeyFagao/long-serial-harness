@@ -15,3 +15,8 @@ export function editableNovelPath(path: string): boolean {
   const dot = filename.lastIndexOf(".");
   return dot > 0 && TEXT_EXTENSIONS.has(filename.slice(dot).toLowerCase());
 }
+
+/** Machine records remain readable, but the public document editor must not rewrite them. */
+export function isInternalRecordPath(path: string): boolean {
+  return safeNovelRelativePath(path) && path.startsWith("追踪/") && /\.(?:json|jsonl)$/iu.test(path);
+}

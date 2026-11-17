@@ -6,7 +6,7 @@ import type {} from "@deepseek-ai/dsh-host-webserver";
 import type { SandboxPolicyService } from "@deepseek-ai/dsh-sandbox-policy";
 import { SessionId } from "@deepseek-ai/dsh-session";
 import type {} from "@deepseek-ai/dsh-typert-registry";
-import { editableNovelPath, safeNovelRelativePath, NOVEL_DIRECTORIES, NOVEL_ROOT_FILES } from "./novel-paths.js";
+import { editableNovelPath, isInternalRecordPath, safeNovelRelativePath, NOVEL_DIRECTORIES, NOVEL_ROOT_FILES } from "./novel-paths.js";
 import { isTrustedWorkspaceRequest } from "./workspace-request-trust.js";
 
 const NOVEL_DIRECTORY_SET: ReadonlySet<string> = new Set(NOVEL_DIRECTORIES);
@@ -237,6 +237,7 @@ async function handle(context: Context, request: IncomingMessage, response: Serv
       const realm = await workspaceRealm(context, url);
       const path = url.searchParams.get("path");
       if (path === null) throw new WorkspaceHttpError(400, "缺少文件路径。");
+      if (isInternalRecordPath(path)) throw new WorkspaceHttpError(403, "运行记录由工作台自动维护，只能查看。");
       const input = await jsonBody(request, options.maxBytes * 6 + 1_024);
       if (typeof input.content !== "string") throw new WorkspaceHttpError(400, "content 必须是字符串。");
       if (typeof input.baseVersion !== "string" || input.baseVersion === "") throw new WorkspaceHttpError(400, "baseVersion 必须是有效版本。");

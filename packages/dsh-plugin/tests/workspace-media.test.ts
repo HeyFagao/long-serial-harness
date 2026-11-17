@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { assertCreativePath } from "../src/workspace-route.js";
 
 describe("novel workspace document boundary", () => {
-  it("keeps novel outlines, style, prose and tracking editable", () => {
+  it("keeps novel outlines, style, prose and tracking readable", () => {
     for (const name of [
       "大纲/细纲_第001章.md", "设定/文风.md", "正文/第001章.md",
       "追踪/连载任务.json", "追踪/连载上下文/batch-1/child-1.json", "参考资料/参考.txt",

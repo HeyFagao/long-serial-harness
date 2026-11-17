@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { serialPanelActions, type SerialPanelTaskState } from "../src/client/serial-panel-state.js";
+import { serialPanelActions, serialProgressText, type SerialPanelTaskState } from "../src/client/serial-panel-state.js";
 
 const task = (status: SerialPanelTaskState["status"], overrides: Partial<SerialPanelTaskState> = {}): SerialPanelTaskState => ({ ownerSessionId: "original-owner", status, nextChapter: 4, targetChapter: 10, ...overrides });
 
@@ -26,5 +26,19 @@ describe("native owner controls after a batch ends", () => {
   });
   it("allows the first batch without inventing a historical owner", () => {
     expect(serialPanelActions(null, "new-owner")).toMatchObject({ canStartNewBatch: true, differentOwner: false, canResume: false, retryStop: false });
+  });
+});
+
+
+describe("independent title progress labels", () => {
+  it.each(["paused", "stopped"] as const)("does not claim a %s title is still generating", status => {
+    const label = serialProgressText({ status, phase: "title", nextChapter: 7 });
+    expect(label).toContain("正文已保存");
+    expect(label).toContain("标题已暂停");
+    expect(label).not.toContain("正在独立生成");
+  });
+  it("distinguishes title retry from body rewrite", () => {
+    expect(serialProgressText({ status: "blocked", phase: "title", nextChapter: 7 })).toContain("正文不会重写");
+    expect(serialProgressText({ status: "running", phase: "title", nextChapter: 7 })).toContain("正在独立生成第 7 章");
   });
 });

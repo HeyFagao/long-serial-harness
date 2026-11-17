@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { endpoint } from "./workbench-ui.js";
-import { serialPanelActions } from "./serial-panel-state.js";
+import { serialPanelActions, serialProgressText } from "./serial-panel-state.js";
 
 interface SerialTaskView {
   readonly id: string;
@@ -195,7 +195,8 @@ export function SerialPanel({ sessionId, onWorkspaceChanged, onOpenSession, welc
       {task !== undefined && task !== null && <div className="oh-serial-progress-card">
         <div className="oh-serial-progress-caption"><span>本批第 {task.startChapter}—{task.targetChapter} 章</span><strong>{done}<small> / {total} 章已验收</small></strong></div>
         <progress max={total || 1} value={done} aria-label="本批已验收章节" />
-        <div className="oh-serial-progress-meta"><span>{task.status === "completed" ? "本批章节已保存并通过检查" : task.status === "stopped" ? `本批已停止 · 下一章为第 ${String(task.nextChapter)} 章` : task.phase === "title" ? `正文已保存 · 正在独立生成第 ${String(task.nextChapter)} 章公众号标题 · 第 ${String(task.titleActive?.attempt ?? 1)} 次尝试` : task.active !== undefined ? `正在处理第 ${String(task.active.chapter)} 章 · 第 ${String(task.active.attempt)} 次尝试` : `下一章：第 ${String(task.nextChapter)} 章`}</span><span>{progress}%</span></div>
+        <div className="oh-serial-progress-meta"><span>{serialProgressText(task)}</span><span>{progress}%</span></div>
+        {task.phase === "title" && <p className="oh-serial-note">本章标题完成后即可导出；已完成标题的前面章节可以先导出。</p>}
         {task.error !== undefined && <div className="oh-serial-task-error" role="alert">{task.error}</div>}
         {differentSession && <p className="oh-serial-note">这批任务属于另一会话。恢复或管理原批次请点击「回到任务会话」；已结束的历史批次不影响你在当前会话开始新批次。</p>}
         {task.status === "blocked" && <p className="oh-serial-note">请先查看上方错误；点击「查看当前章会话」查看日志、轨迹并处理审批。处理后点击「重试并继续」，已验收章节会保留。</p>}

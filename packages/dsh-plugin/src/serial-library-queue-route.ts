@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Context } from "@deepseek-ai/cordis";
 import type { FsVersion } from "@deepseek-ai/dsh-fs";
-import { listLibraryBooks } from "./serial-library.js";
+import { listLibraryBooks, selectedLibraryIds } from "./serial-library.js";
 import { captureLibraryOwnerContext, ensureLibraryBookRealm, type LibraryOwnerContext } from "./serial-library-native.js";
 import { assertLibraryTask, assertLibraryConcurrency, SerialLibraryRuntime, type LibraryQueueAdapter, type LibraryTask } from "./serial-library-runtime.js";
 import { getSerialRuntime } from "./serial-route.js";
@@ -51,7 +51,7 @@ export function createLibraryQueueAdapter(context: Context, realm: WorkspaceReal
       const currentLibrary = await listLibraryBooks(realm);
       const current = [...currentLibrary.books, ...(currentLibrary.deletingBooks ?? [])].find(item => item.id === book.id);
       if (current === undefined || current.absolutePath !== book.absolutePath) throw new WorkspaceHttpError(409, "书项目已移动或不属于当前书库，未继续写作。");
-      const bookRealm = await ensureLibraryBookRealm(context, realm, book.absolutePath, book.ownerSessionId, task.ownerContext as LibraryOwnerContext);
+      const bookRealm = await ensureLibraryBookRealm(context, realm, book.absolutePath, book.ownerSessionId, (book.ownerContext ?? task.ownerContext) as LibraryOwnerContext);
       const holder = await getSerialRuntime(context, bookRealm);
       if (holder.ownerSessionId !== book.ownerSessionId) throw new WorkspaceHttpError(409, "这本书已有其他会话的未完成任务，请先处理原任务。");
       return holder.runtime;
@@ -143,12 +143,14 @@ export function registerLibraryQueueRoute(context: Context, options: { readonly 
       let task: LibraryTask;
       switch (input.action) {
         case "start": {
-          if (input.count !== 10 && input.count !== 20 && input.count !== "all") throw new WorkspaceHttpError(400, "请选择所有项目新增 10 章、20 章或写至完本。");
+          if (input.count !== 10 && input.count !== 20 && input.count !== 50 && input.count !== "all") throw new WorkspaceHttpError(400, "请选择新增 10、20、50 章或写至完本。");
           const concurrency = input.concurrency ?? "all";
           assertLibraryConcurrency(concurrency);
-          task = await holder.runtime.start(input.count, generationOptions(input), concurrency);
+          task = await holder.runtime.start(input.count, generationOptions(input), concurrency, input.ids === undefined ? undefined : selectedLibraryIds(input.ids));
           break;
         }
+        case "pauseBooks": task = await holder.runtime.pauseBooks(selectedLibraryIds(input.ids)); break;
+        case "resumeBooks": task = await holder.runtime.resumeBooks(selectedLibraryIds(input.ids)); break;
         case "pause": task = await holder.runtime.pause(); break;
         case "resume": task = await holder.runtime.resume(); break;
         case "stop": task = await holder.runtime.stop(); break;

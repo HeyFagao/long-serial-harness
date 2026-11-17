@@ -89,6 +89,222 @@ function fixture(lengths: readonly number[]) {
 }
 
 describe("durable multi-book generation", () => {
+  it("writes exactly ten selected chapters and supports fifty without touching unselected books", async () => {
+    const f = fixture([100, 100, 100]); const queue = new SerialLibraryRuntime(f.adapter);
+    await queue.start(10, {}, "all", ["0", "2"]); await until(() => queue.snapshot()?.status === "completed");
+    expect(f.totals).toEqual([10, 0, 10]); expect(f.starts.map(book => book.book)).toEqual(["0", "2"]);
+    await queue.start(50, {}, "all", ["1"]); await until(() => queue.snapshot()?.status === "completed");
+    expect(f.totals).toEqual([10, 50, 10]); expect(f.starts.at(-1)).toEqual({ book: "1", from: 1, to: 50 }); queue.dispose();
+  });
+
+  it("rejects empty, unknown and mixed invalid selections before creating a batch", async () => {
+    const f = fixture([20, 20]); const queue = new SerialLibraryRuntime(f.adapter);
+    await expect(queue.start(10, {}, "all", [])).rejects.toThrow("勾选");
+    await expect(queue.start(10, {}, "all", ["0", "missing"])).rejects.toThrow("不在当前书库");
+    expect(f.saved()).toBeNull(); expect(f.starts).toEqual([]); queue.dispose();
+  });
+
+  it("appends selected books during generation without changing old targets or captured settings", async () => {
+    const f = fixture([100, 100, 100]); f.hold(true); let model = "first";
+    f.adapter.captureContext = async () => ({ model });
+    const queue = new SerialLibraryRuntime(f.adapter);
+    await queue.start(10, { style: "first-style" }, "all", ["0", "1"]);
+    await until(() => f.starts.length === 2); const old = queue.snapshot()!;
+    model = "second"; await queue.start(20, { style: "second-style" }, "all", ["2"]);
+    await until(() => f.starts.length === 3);
+    const current = queue.snapshot()!;
+    expect(current.id).toBe(old.id); expect(current.books.slice(0, 2)).toEqual(old.books);
+    expect(current.books[2]).toMatchObject({ targetChapter: 20, count: 20, generation: { style: "second-style" }, ownerContext: { model: "second" } });
+    expect(current.ownerContext).toEqual({ model: "first" }); expect(current.generation).toEqual({ style: "first-style" });
+    await expect(queue.start(10, {}, "all", ["0"])).rejects.toThrow("继续所选书");
+    f.hold(false); await until(() => queue.snapshot()?.status === "completed"); expect(f.totals).toEqual([10, 10, 20]); queue.dispose();
+  });
+
+  it("pauses only selected running books and resumes their original target", async () => {
+    const f = fixture([30, 30]); f.hold(true); const queue = new SerialLibraryRuntime(f.adapter);
+    await queue.start(10, {}, "all"); await until(() => f.starts.length === 2);
+    const id = queue.snapshot()!.id; await queue.pauseBooks(["0"]);
+    await until(() => queue.snapshot()?.books[0]?.status === "paused");
+    expect(queue.snapshot()?.status).toBe("running"); expect([...f.owners.values()][1]?.status).toBe("running");
+    f.hold(false); await until(() => queue.snapshot()?.status === "paused"); expect(f.totals).toEqual([0, 10]);
+    await queue.resumeBooks(["0"]); await until(() => queue.snapshot()?.status === "completed");
+    expect(f.totals).toEqual([10, 10]); expect(f.starts).toHaveLength(2); expect(queue.snapshot()?.id).toBe(id); queue.dispose();
+  });
+
+  it("pauses pending books before they obtain a model slot", async () => {
+    const f = fixture([20, 20, 20]); f.hold(true); const queue = new SerialLibraryRuntime(f.adapter);
+    await queue.start(10, {}, 1); await until(() => f.starts.length === 1); await queue.pauseBooks(["1"]);
+    expect(queue.snapshot()?.books[1]?.status).toBe("paused"); f.hold(false);
+    await until(() => queue.snapshot()?.status === "paused"); expect(f.totals).toEqual([10, 0, 10]);
+    expect(f.starts.map(book => book.book)).toEqual(["0", "2"]);
+    await queue.resumeBooks(["1"]); await until(() => queue.snapshot()?.status === "completed"); expect(f.totals).toEqual([10, 10, 10]); queue.dispose();
+  });
+
+  it("keeps individually paused books paused through global pause and resume", async () => {
+    const f = fixture([20, 20]); f.hold(true); const queue = new SerialLibraryRuntime(f.adapter);
+    await queue.start(10, {}, "all"); await until(() => f.starts.length === 2);
+    await queue.pauseBooks(["0"]); await until(() => queue.snapshot()?.books[0]?.status === "paused");
+    await queue.pause(); await until(() => queue.snapshot()?.status === "paused"); await queue.resume();
+    await until(() => [...f.owners.values()][1]?.status === "running");
+    expect([...f.owners.values()][0]?.status).toBe("paused"); f.hold(false);
+    await until(() => queue.snapshot()?.status === "paused"); expect(f.totals).toEqual([0, 10]);
+    await expect(queue.resume()).rejects.toThrow("单独暂停"); queue.dispose();
+  });
+
+  it("treats a pause made in one book's editor as an individual hold", async () => {
+    const f = fixture([20, 20]); f.hold(true); const queue = new SerialLibraryRuntime(f.adapter);
+    await queue.start(10, {}, "all"); await until(() => f.starts.length === 2);
+    [...f.owners.values()][0]!.status = "paused"; f.hold(false);
+    await until(() => queue.snapshot()?.status === "paused");
+    expect(f.totals).toEqual([0, 10]); expect(queue.snapshot()?.books[0]?.status).toBe("paused"); queue.dispose();
+  });
+
+  it("appends a new selection while globally paused without resuming earlier books", async () => {
+    const f = fixture([20, 20, 20]); f.hold(true); const queue = new SerialLibraryRuntime(f.adapter);
+    await queue.start(10, {}, 1, ["0", "1"]); await until(() => f.starts.length === 1);
+    await queue.pause(); await until(() => queue.snapshot()?.status === "paused");
+    await queue.start(10, {}, "all", ["2"]); f.hold(false); await until(() => queue.snapshot()?.status === "paused");
+    expect(f.totals).toEqual([0, 0, 10]); expect(f.starts.map(book => book.book)).toEqual(["0", "2"]);
+    await queue.resumeBooks(["0", "1"]); await until(() => queue.snapshot()?.status === "completed"); expect(f.totals).toEqual([10, 10, 10]); queue.dispose();
+  });
+
+  it("selectively resumes a global hold without starting unselected reservations", async () => {
+    const f = fixture([20, 20]); f.hold(true); const queue = new SerialLibraryRuntime(f.adapter);
+    await queue.start(10, {}, 1); await until(() => f.starts.length === 1);
+    await queue.pause(); await until(() => queue.snapshot()?.status === "paused");
+    await queue.resumeBooks(["1"]); f.hold(false); await until(() => queue.snapshot()?.status === "paused");
+    expect(f.totals).toEqual([0, 10]); expect(queue.snapshot()?.books[0]?.status).toBe("paused"); queue.dispose();
+  });
+
+  it("does not hide an unselected live writer when cancellation of a blocked queue failed", async () => {
+    const f = fixture([20, 20]); f.hold(true); const queue = new SerialLibraryRuntime(f.adapter);
+    await queue.start(10, {}, 1); await until(() => f.starts.length === 1);
+    f.failStop("native cancellation unavailable"); await queue.stop(); expect(queue.snapshot()?.status).toBe("blocked");
+    const before = queue.snapshot();
+    await expect(queue.resumeBooks(["1"])).rejects.toThrow("native cancellation unavailable");
+    expect(queue.snapshot()).toEqual(before); expect(f.starts.map(book => book.book)).toEqual(["0"]);
+    expect([...f.owners.values()][0]?.status).toBe("running");
+    f.failStop(); await queue.resumeBooks(["1"]); f.hold(false); await until(() => queue.snapshot()?.status === "paused");
+    expect(f.totals).toEqual([0, 10]); expect([...f.owners.values()][0]?.status).toBe("stopped"); queue.dispose();
+  });
+
+  it("starts a fresh selected batch after all previous reservations finished", async () => {
+    const f = fixture([20, 20, 20]); const queue = new SerialLibraryRuntime(f.adapter);
+    await queue.start(10, {}, "all"); await until(() => queue.snapshot()?.status === "completed");
+    const oldId = queue.snapshot()!.id;
+    await queue.start(10, {}, "all", ["1"]); await until(() => queue.snapshot()?.status === "completed");
+    expect(queue.snapshot()?.id).not.toBe(oldId); expect(queue.snapshot()?.books.map(book => book.id)).toEqual(["1"]);
+    expect(f.totals).toEqual([10, 20, 10]); queue.dispose();
+  });
+
+  it("preserves explicit pause intent after restart and does not extend resumed targets", async () => {
+    const f = fixture([20, 20]); f.hold(true); const first = new SerialLibraryRuntime(f.adapter);
+    await first.start(10, {}, "all"); await until(() => f.starts.length === 2);
+    await first.pauseBooks(["0"]); await until(() => first.snapshot()?.books[0]?.status === "paused"); first.dispose();
+    for (const task of f.owners.values()) task.status = "paused";
+    const recovered = new SerialLibraryRuntime(f.adapter); await recovered.restore(); await recovered.resume(); f.hold(false);
+    await until(() => recovered.snapshot()?.status === "paused"); expect(f.totals).toEqual([0, 10]);
+    await recovered.resumeBooks(["0"]); await until(() => recovered.snapshot()?.status === "completed");
+    expect(f.totals).toEqual([10, 10]); expect(f.starts).toHaveLength(2); recovered.dispose();
+  });
+
+  it("keeps a pausing native request in its concurrency slot and stops it with the queue", async () => {
+    const f = fixture([20, 20, 20]); f.hold(true); const baseController = f.adapter.controller;
+    f.adapter.controller = async (book, task) => {
+      const inner = await baseController(book, task);
+      return { ...inner, async pause() { const current = f.owners.get(book.ownerSessionId)!; current.status = "pausing"; return structuredClone(current); } };
+    };
+    const queue = new SerialLibraryRuntime(f.adapter); await queue.start(10, {}, 2);
+    await until(() => f.starts.length === 2); await queue.pauseBooks(["0"]);
+    expect(queue.snapshot()?.books[0]?.status).toBe("pausing");
+    await expect(queue.resumeBooks(["0"])).rejects.toThrow("正在完成当前章");
+    await new Promise(resolve => setTimeout(resolve, 10)); expect(f.starts).toHaveLength(2);
+    await queue.stop(); expect(new Set(f.stops)).toEqual(new Set(["0", "1"])); queue.dispose();
+  });
+
+  it("still blocks shared provider failures discovered while a selected book pauses", async () => {
+    const f = fixture([20, 20]); f.hold(true); const queue = new SerialLibraryRuntime(f.adapter);
+    await queue.start(10, {}, "all"); await until(() => f.starts.length === 2);
+    const failed = [...f.owners.values()][0]!; failed.status = "blocked"; failed.error = "HTTP 429";
+    await queue.pauseBooks(["0"]);
+    expect(queue.snapshot()?.status).toBe("blocked"); expect(queue.snapshot()?.books[0]?.status).toBe("paused");
+    expect([...f.owners.values()].every(task => task.status === "stopped")).toBe(true); queue.dispose();
+  });
+
+  it("recognizes completion instead of leaving a selected final chapter paused", async () => {
+    const f = fixture([1, 20]); f.hold(true); const queue = new SerialLibraryRuntime(f.adapter);
+    await queue.start(10, {}, "all"); await until(() => f.starts.length === 2);
+    const finished = [...f.owners.values()][0]!; finished.status = "completed"; finished.completed = [1]; finished.nextChapter = 2;
+    await queue.pauseBooks(["0"]);
+    expect(queue.snapshot()?.books[0]).toMatchObject({ status: "completed", completedChapters: 1 });
+    expect(queue.snapshot()?.status).toBe("running"); queue.dispose();
+  });
+
+  it("uses per-book generation options when a later selection joins a live batch", async () => {
+    const f = fixture([20, 20]); f.hold(true); const baseController = f.adapter.controller;
+    const used: { id: string; style?: string }[] = [];
+    f.adapter.controller = async (book, task) => {
+      const inner = await baseController(book, task);
+      return { ...inner, async start(options) { used.push({ id: book.id, ...(options.style === undefined ? {} : { style: options.style }) }); return inner.start(options); } };
+    };
+    const queue = new SerialLibraryRuntime(f.adapter); await queue.start(10, { style: "first" }, "all", ["0"]);
+    await until(() => f.starts.length === 1); await queue.start(10, { style: "second" }, "all", ["1"]);
+    await until(() => f.starts.length === 2); expect(used).toEqual([{ id: "0", style: "first" }, { id: "1", style: "second" }]); queue.dispose();
+  });
+
+  it("keeps an explicit pause recoverable when the other running book is deleted", async () => {
+    const f = fixture([20, 20]); f.hold(true); const queue = new SerialLibraryRuntime(f.adapter);
+    await queue.start(10, {}, "all"); await until(() => f.starts.length === 2);
+    await queue.pauseBooks(["0"]); await until(() => queue.snapshot()?.books[0]?.status === "paused");
+    await queue.excludeBookForDeletion("1");
+    expect(queue.snapshot()?.status).toBe("paused"); expect(queue.snapshot()?.books.map(book => book.id)).toEqual(["0"]);
+    f.hold(false); await queue.resumeBooks(["0"]); await until(() => queue.snapshot()?.status === "completed");
+    expect(f.totals).toEqual([10, 0]); queue.dispose();
+  });
+
+  it("finishes a persisted individual pause after restart without resuming that book", async () => {
+    const f = fixture([20, 20]); f.hold(true); const baseController = f.adapter.controller;
+    f.adapter.controller = async (book, task) => {
+      const inner = await baseController(book, task);
+      return { ...inner, async pause() { const current = f.owners.get(book.ownerSessionId)!; current.status = "pausing"; return structuredClone(current); } };
+    };
+    const first = new SerialLibraryRuntime(f.adapter); await first.start(10, {}, "all"); await until(() => f.starts.length === 2);
+    await first.pauseBooks(["0"]); expect(first.snapshot()?.books[0]?.status).toBe("pausing"); first.dispose();
+    for (const task of f.owners.values()) task.status = "paused";
+    const recovered = new SerialLibraryRuntime(f.adapter); await recovered.restore(); await recovered.resumeBooks(["1"]); f.hold(false);
+    await until(() => recovered.snapshot()?.status === "paused");
+    expect(f.totals).toEqual([0, 10]); expect(f.retries.map(item => item.book)).toEqual(["1"]);
+    expect(recovered.snapshot()?.books[0]?.status).toBe("paused"); recovered.dispose();
+  });
+
+  it("resumes the same individually pausing book after restart without waking its neighbor", async () => {
+    const f = fixture([20, 20]); f.hold(true); const baseController = f.adapter.controller;
+    f.adapter.controller = async (book, task) => {
+      const inner = await baseController(book, task);
+      return { ...inner, async pause() { const current = f.owners.get(book.ownerSessionId)!; current.status = "pausing"; return structuredClone(current); } };
+    };
+    const first = new SerialLibraryRuntime(f.adapter); await first.start(10, {}, "all"); await until(() => f.starts.length === 2);
+    await first.pauseBooks(["0"]); first.dispose(); for (const task of f.owners.values()) task.status = "paused";
+    const recovered = new SerialLibraryRuntime(f.adapter); await recovered.restore();
+    expect(recovered.snapshot()?.books[0]?.status).toBe("pausing"); await recovered.resumeBooks(["0"]); f.hold(false);
+    await until(() => recovered.snapshot()?.status === "paused");
+    expect(f.totals).toEqual([10, 0]); expect(f.retries.map(item => item.book)).toEqual(["0"]);
+    expect(f.starts).toHaveLength(2); expect(recovered.snapshot()?.books[0]?.targetChapter).toBe(10); recovered.dispose();
+  });
+
+  it("refuses cold selected resume while the selected native task is still pausing", async () => {
+    const f = fixture([20, 20]); f.hold(true); const baseController = f.adapter.controller;
+    f.adapter.controller = async (book, task) => {
+      const inner = await baseController(book, task);
+      return { ...inner, async pause() { const current = f.owners.get(book.ownerSessionId)!; current.status = "pausing"; return structuredClone(current); } };
+    };
+    const first = new SerialLibraryRuntime(f.adapter); await first.start(10, {}, "all"); await until(() => f.starts.length === 2);
+    await first.pauseBooks(["0"]); first.dispose();
+    const recovered = new SerialLibraryRuntime(f.adapter); await recovered.restore(); const before = recovered.snapshot();
+    await expect(recovered.resumeBooks(["0"])).rejects.toThrow("仍在完成当前章");
+    expect(recovered.snapshot()).toEqual(before); expect(f.retries).toEqual([]); expect(f.starts).toHaveLength(2); recovered.dispose();
+  });
+
   it("removes one running reservation without stopping concurrent books or bringing it back on resume", async () => {
     const f = fixture([20, 20, 20]); f.hold(true); const queue = new SerialLibraryRuntime(f.adapter);
     await queue.start(10, {}, "all"); await until(() => f.saved()?.books.every(book => book.serialTaskId !== undefined) === true);
