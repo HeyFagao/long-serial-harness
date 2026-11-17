@@ -8,6 +8,7 @@ import { SessionId } from "@deepseek-ai/dsh-session";
 import type {} from "@deepseek-ai/dsh-typert-registry";
 import { editableNovelPath, isInternalRecordPath, safeNovelRelativePath, NOVEL_DIRECTORIES, NOVEL_ROOT_FILES } from "./novel-paths.js";
 import { isTrustedWorkspaceRequest } from "./workspace-request-trust.js";
+import { SERIAL_PLUGIN_VERSION } from "./plugin-version.js";
 
 const NOVEL_DIRECTORY_SET: ReadonlySet<string> = new Set(NOVEL_DIRECTORIES);
 const NOVEL_ROOT_FILE_SET: ReadonlySet<string> = new Set(NOVEL_ROOT_FILES);
@@ -222,7 +223,7 @@ async function handle(context: Context, request: IncomingMessage, response: Serv
       const files = await listFiles(realm);
       const trackingError = await metadataError(realm, files, "追踪/_tracking-state.json", options.maxBytes);
       const metadataErrors = trackingError === undefined ? [] : [trackingError];
-      send(response, 200, { cwd: realm.cwd, files, games: [], videos: [], metadataErrors, welcomeGuide: options.welcomeGuide?.() ?? true });
+      send(response, 200, { cwd: realm.cwd, files, games: [], videos: [], metadataErrors, pluginVersion: SERIAL_PLUGIN_VERSION, welcomeGuide: options.welcomeGuide?.() ?? true });
       return;
     }
     if (url.pathname === "/oh-story/file" && request.method === "GET") {

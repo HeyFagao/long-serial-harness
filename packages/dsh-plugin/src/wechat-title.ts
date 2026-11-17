@@ -17,9 +17,9 @@ export const WECHAT_CHAPTER_TITLE_PROMPT = `【微信公众号小说章节标题
 ${AUTHOR_CHAPTER_TITLE_PROMPT.replace("{{步骤 1.output}}", "本次材料见下方 chapter_body 内的当前章正文。")}
 
 【交付格式】
-将上面要求的简短核心爆点、标题策略、5个候选、前三推荐和7个标签写入一个JSON对象；不输出详细思考过程。正文已保存，候选与标签只用于独立标题记录，不会插入正文或TXT。
+将上面要求的简短核心爆点、标题策略、5个候选、前三推荐和7个标签写入一个JSON对象；不输出详细思考过程。正文已保存，五个候选单独记录并列在每章TXT开头供作者选择；标签与分析不插入正文或TXT。
 格式：{"coreHook":"本章核心爆点","titleStrategy":"简短标题策略","candidates":["候选一","候选二","候选三","候选四","候选五"],"topThree":["第一推荐","第二推荐","第三推荐"],"tags":{"category":"主分类","plots":["情节一","情节二"],"roles":["角色一","角色二"],"emotion":"情绪","background":"背景"},"evidence":["支持第一推荐标题的本章连续原文"]}
-五个候选互不相同；前三推荐必须选自这五个候选，按推荐顺序排列。系统自动取前三推荐的第一项，作为每章TXT的第一行。标题字符串不带序号、书名号或解释。标签只从作者提供的标签池选择，合计1个主分类、2个情节、2个角色、1个情绪、1个背景。
+五个候选互不相同；前三推荐必须选自这五个候选，按推荐顺序排列。五个候选按1—5编号放在每章TXT开头，供作者自行选用；前三推荐的第一项仅用作章节文件名。标题字符串不带序号、书名号或解释。标签只从作者提供的标签池选择，合计1个主分类、2个情节、2个角色、1个情绪、1个背景。
 evidence至少一段、最多五段，每段8—80个字符，必须是本章正文中的连续原文，并支持第一推荐标题。不要输出Markdown代码块、小说续写或JSON以外的内容。`;
 
 export interface WechatTitleTags {
@@ -98,8 +98,6 @@ export function parseWechatTitleOutput(text: string | undefined, prose: string):
   if (value === undefined || !Array.isArray(value.evidence)) throw new Error("缺少标题或正文依据");
   const evidence = value.evidence as unknown[];
   if (evidence.length < 1 || evidence.length > 5 || !evidence.every(item => typeof item === "string" && [...item].length >= 8 && [...item].length <= 80 && prose.includes(item))) throw new Error("标题依据不是本章正文中的原文片段");
-  // Keep compatibility with an already-dispatched serial.4/5 title call during an upgrade.
-  if (value.candidates === undefined && value.topThree === undefined) return { title: cleanTitle(value.title), evidence: evidence as string[] };
   const candidates = titleList(value.candidates, 5, "候选标题");
   const topThree = titleList(value.topThree, 3, "前三推荐");
   if (!topThree.every(title => candidates.includes(title))) throw new Error("前三推荐必须来自五个候选标题");

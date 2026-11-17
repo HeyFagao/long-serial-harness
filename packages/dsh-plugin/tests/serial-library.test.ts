@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { unzipSync, strFromU8 } from "fflate";
 import { exportLibraryBooks, importLibraryBooks, listLibraryBooks, recycleLibraryBooks, realmForLibraryBook, selectedLibraryIds, validateLibraryInputs, type LibraryBook, type LibraryInputFile } from "../src/serial-library.js";
 import { commitOriginalOutput } from "../src/serial-output.js";
+import { exportSerialChapters } from "../src/serial-route.js";
 import type { WorkspaceRealm } from "../src/workspace-route.js";
 
 function library() {
@@ -78,6 +79,33 @@ describe("book recycling and TXT export", () => {
     expect(test.files.get(`${book.absolutePath}/正文/第001章.md`)).toBe(prose);
     test.files.set(titlePath, JSON.stringify({ ...title, bodySha256: "wrong" }));
     await expect(exportLibraryBooks(test.realm, [book.id])).rejects.toThrow("标题与正文不一致");
+  });
+  it("exports all saved title candidates through single-book and batch paths without changing records", async () => {
+    const test = library(); const book = (await importLibraryBooks(test.realm, [source(1)])).books[0]!;
+    await writeChapter(test, book);
+    const prose = test.files.get(`${book.absolutePath}/正文/第001章.md`)!;
+    const candidates = ["她取回了那把旧钥匙，却发现刻着另一个人的编号", "旧钥匙上多了陌生编号，她终于察觉有人来过", "她拿回以为丢失的钥匙，柄上的编号却变了", "明明是她保管的旧钥匙，为何刻着别人的编号", "她走进屋里取来旧钥匙，却被陌生编号绊住脚"];
+    const record = { chapter: 1, title: candidates[3], candidates, topThree: [candidates[3], candidates[0], candidates[1]], coreHook: "不应进入TXT的分析", tags: { category: "悬疑惊悚" }, bodySha256: createHash("sha256").update(prose).digest("hex") };
+    const titlePath = `${book.absolutePath}/追踪/公众号标题/第001章.json`;
+    test.files.set(titlePath, JSON.stringify(record));
+    const before = new Map(test.files);
+    const child = await realmForLibraryBook(test.realm, book.relativePath);
+    expect((await exportSerialChapters(child)).chapters[0]).toMatchObject({ headline: record.title, headlineCandidates: candidates });
+    const outer = unzipSync(await exportLibraryBooks(test.realm, [book.id]));
+    const inner = unzipSync(outer[Object.keys(outer).find(name => name.endsWith(".zip"))!]!);
+    const filename = Object.keys(inner).find(name => name.startsWith("第001章"))!;
+    const chapter = strFromU8(inner[filename]!).replace(/^\uFEFF/u, "");
+    expect(filename).toContain(record.title);
+    expect(chapter.split("\r\n").slice(0, 7)).toEqual(["本章备选标题（任选一个用于发布）", ...candidates.map((title, index) => `${String(index + 1)}. ${title}`), ""]);
+    expect(chapter).toContain("书名：《第1本书》\r\n第1章\r\n\r\n");
+    expect(chapter).not.toContain(record.coreHook); expect(chapter).not.toContain("悬疑惊悚");
+    expect(test.files).toEqual(before);
+    for (const invalid of [candidates.slice(0, 4), [...candidates.slice(0, 4), candidates[0]], [...candidates.slice(0, 4), "假标题\n混入内容"]]) {
+      test.files.set(titlePath, JSON.stringify({ ...record, candidates: invalid }));
+      await expect(exportSerialChapters(child)).rejects.toThrow("候选标题记录无效");
+    }
+    test.files.set(titlePath, JSON.stringify({ ...record, bodySha256: "wrong" }));
+    await expect(exportSerialChapters(child)).rejects.toThrow("标题与正文不一致");
   });
   it("recycles and restores a completed book without changing its source, prose or progress", async () => {
     const test = library();

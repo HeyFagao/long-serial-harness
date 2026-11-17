@@ -543,12 +543,17 @@ export async function exportSerialChapters(realm: WorkspaceRealm): Promise<Expor
     if (bytes > 64 * 1024 * 1024) throw new WorkspaceHttpError(413, "合并正文超过 64 MB，请分卷导出。");
     const headlineRaw = await optionalText(realm, `追踪/公众号标题/第${String(chapter).padStart(3, "0")}章.json`);
     let headline: string | undefined;
+    let headlineCandidates: string[] | undefined;
     if (headlineRaw !== undefined) {
-      const saved = JSON.parse(headlineRaw) as { chapter?: number; bodySha256?: string; title?: string };
+      const saved = JSON.parse(headlineRaw) as { chapter?: number; bodySha256?: string; title?: string; candidates?: unknown };
       if (saved.chapter !== chapter || saved.bodySha256 !== createHash("sha256").update(prose!).digest("hex") || typeof saved.title !== "string" || saved.title.trim() === "") throw new WorkspaceHttpError(409, `第${String(chapter)}章公众号标题与正文不一致，暂不导出。`);
       headline = saved.title;
+      if (saved.candidates !== undefined) {
+        if (!Array.isArray(saved.candidates) || saved.candidates.length !== 5 || !saved.candidates.every((candidate: unknown) => typeof candidate === "string" && candidate.trim() !== "" && !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(candidate)) || new Set(saved.candidates).size !== 5 || !saved.candidates.includes(saved.title)) throw new WorkspaceHttpError(409, `第${String(chapter)}章公众号候选标题记录无效，暂不导出。`);
+        headlineCandidates = saved.candidates as string[];
+      }
     }
-    chapters.push({ number: chapter, prose: prose!.trim(), ...(headline === undefined ? {} : { headline }) });
+    chapters.push({ number: chapter, prose: prose!.trim(), ...(headline === undefined ? {} : { headline }), ...(headlineCandidates === undefined ? {} : { headlineCandidates }) });
   }
   if (chapters.length === 0) throw new WorkspaceHttpError(409, "还没有可导出的已完成章节；若正文已保存但标题未完成，请先恢复标题任务。");
   const outline = await outlineSummary(realm);

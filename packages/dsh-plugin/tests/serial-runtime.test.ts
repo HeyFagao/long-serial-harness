@@ -174,6 +174,50 @@ describe("native serial scheduler", () => {
     expect(f.requests).toHaveLength(1); expect(done.has(1)).toBe(true); runtime.dispose();
   });
 
+  it.each(["paused", "completed"] as const)("uses the current title workflow for new chapters of a legacy %s task", async status => {
+    const f = fixture(3); f.complete.add(1);
+    f.setDisk({ schemaVersion: 1, id: "pre-title-workflow", ownerSessionId: "owner", cwd: "/book", status,
+      startChapter: 1, targetChapter: status === "completed" ? 1 : 3, nextChapter: 2,
+      completed: [1], completedSessions: { "1": "legacy-body-child" }, attempts: { "1": 1 },
+      maxAttempts: 6, updatedAt: "before-upgrade" });
+    const titles: SerialActive[] = []; const done = new Set<number>(); const state = f.adapter.state;
+    f.adapter.state = async active => titles.some(title => title.sessionId === active?.sessionId)
+      ? { running: false, pendingInput: false, lastTurnReason: "completed", requestKnown: true }
+      : active !== undefined && !f.childIds.includes(active.sessionId)
+        ? { running: false, pendingInput: false, requestKnown: false } : state(active);
+    f.adapter.inspectTitle = async chapter => done.has(chapter);
+    f.adapter.dispatchTitle = async active => { expect(f.complete.has(active.chapter)).toBe(true); titles.push({ ...active }); };
+    f.adapter.finalizeTitle = async active => { done.add(active.chapter); return { ok: true }; };
+    const runtime = new SerialRuntime(f.adapter); await runtime.restore();
+    if (status === "completed") await runtime.start({ count: 2 }); else await runtime.resume();
+    await eventually(() => runtime.snapshot()?.status === "completed");
+    expect(f.requests).toHaveLength(2);
+    expect(titles.map(title => title.chapter)).toEqual([2, 3]);
+    expect([...done]).toEqual([2, 3]);
+    expect(f.complete.has(1)).toBe(true); runtime.dispose();
+  });
+
+  it("adds the current independent title stage to an old in-flight chapter already saved before upgrade", async () => {
+    const f = fixture(3); f.complete.add(1); f.complete.add(2);
+    f.setDisk({ schemaVersion: 1, id: "legacy-in-flight", ownerSessionId: "owner", cwd: "/book", status: "paused",
+      startChapter: 1, targetChapter: 3, nextChapter: 2, completed: [1], completedSessions: { "1": "legacy-one" },
+      attempts: { "1": 1, "2": 1 }, active: { chapter: 2, sessionId: "legacy-two", requestId: "legacy-request", attempt: 1, dispatched: true },
+      maxAttempts: 6, updatedAt: "before-upgrade" });
+    const titles: SerialActive[] = []; const done = new Set<number>(); const state = f.adapter.state;
+    f.adapter.state = async active => titles.some(title => title.sessionId === active?.sessionId)
+      ? { running: false, pendingInput: false, lastTurnReason: "completed", requestKnown: true }
+      : active !== undefined && !f.childIds.includes(active.sessionId)
+        ? { running: false, pendingInput: false, requestKnown: false } : state(active);
+    f.adapter.inspectTitle = async chapter => done.has(chapter);
+    f.adapter.dispatchTitle = async active => { expect(f.complete.has(active.chapter)).toBe(true); titles.push({ ...active }); };
+    f.adapter.finalizeTitle = async active => { done.add(active.chapter); return { ok: true }; };
+    const runtime = new SerialRuntime(f.adapter); await runtime.restore(); await runtime.resume();
+    await eventually(() => runtime.snapshot()?.status === "completed");
+    expect(f.requests).toHaveLength(1);
+    expect(titles.map(title => title.chapter)).toEqual([2, 3]);
+    expect(runtime.snapshot()?.completedSessions["2"]).toBe("legacy-two"); runtime.dispose();
+  });
+
   it("stops the title child and resumes it after a cold restore, preserving the prose request", async () => {
     const f = fixture(1); const titles: SerialActive[] = []; const states = new Map<string, SerialObservation>();
     const state = f.adapter.state; let done = false;

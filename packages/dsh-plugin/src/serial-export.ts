@@ -1,7 +1,7 @@
 import { strToU8, zipSync } from "fflate";
 import { readChapterHeadline } from "./wechat-title.js";
 
-export interface ExportChapter { readonly number: number; readonly prose: string; readonly headline?: string }
+export interface ExportChapter { readonly number: number; readonly prose: string; readonly headline?: string; readonly headlineCandidates?: readonly string[] }
 export interface ExportBook { readonly title: string; readonly totalChapters: number; readonly chapters: readonly ExportChapter[] }
 
 export function safeExportName(title: string): string {
@@ -13,12 +13,14 @@ export function safeExportName(title: string): string {
 /** One ZIP per book, one TXT per chapter. Formatting does not mutate the saved manuscript. */
 export function createChapterZip(book: ExportBook): Uint8Array {
   const entries: Record<string, Uint8Array> = {};
-  const notes = [`书名：《${book.title}》`, `本次导出 ${String(book.chapters.length)} / ${String(book.totalChapters)} 章。`, "每章独立TXT，第一行为标题，随后保留书名、章号和正文。", "标题沿用保存稿件；旧稿不会在导出时重新调用模型或改写。", ""];
+  const notes = [`书名：《${book.title}》`, `本次导出 ${String(book.chapters.length)} / ${String(book.totalChapters)} 章。`, "每章独立TXT，开头列出已保存的五个备选标题，可自行选择一个发布；随后保留书名、章号和正文。", "旧稿只有一个标题时沿用该标题；导出不会重新调用模型或改写。", ""];
   for (const chapter of book.chapters) {
     const parsed = readChapterHeadline(chapter.prose, chapter.number);
     const title = chapter.headline ?? parsed?.title ?? `第${String(chapter.number)}章`;
     const filename = `第${String(chapter.number).padStart(3, "0")}章_${safeExportName(title)}.txt`;
-    const text = `${title}\n书名：《${book.title}》\n第${String(chapter.number)}章\n\n${parsed?.body ?? chapter.prose.trim()}\n`;
+    const titleBlock = chapter.headlineCandidates === undefined ? title
+      : ["本章备选标题（任选一个用于发布）", ...chapter.headlineCandidates.map((candidate, index) => `${String(index + 1)}. ${candidate}`), ""].join("\n");
+    const text = `${titleBlock}\n书名：《${book.title}》\n第${String(chapter.number)}章\n\n${parsed?.body ?? chapter.prose.trim()}\n`;
     entries[filename] = strToU8(`\uFEFF${text.replace(/\r?\n/gu, "\r\n")}`);
     notes.push(`${String(chapter.number).padStart(3, "0")}｜${title}`);
     if (parsed === undefined) notes.push("  旧稿没有可识别标题行，本次保留正文；请人工补题。");

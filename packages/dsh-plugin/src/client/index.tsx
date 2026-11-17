@@ -12,6 +12,8 @@ import { JsonlPreview } from "./jsonl-preview.js";
 import { MarkdownPreview } from "./markdown-preview.js";
 import { endpoint } from "./workbench-ui.js";
 import { isInternalRecordPath } from "../novel-paths.js";
+import { SERIAL_PLUGIN_VERSION } from "../plugin-version.js";
+import { chapterTitlePreview, chapterTitleRecordPath, proseChapterNumber, type ChapterTitlePreview } from "./chapter-title-preview.js";
 import { SerialPanel } from "./serial-panel.js";
 import { BookLibraryPanel, type NativeBookNavigation } from "./book-library-panel.js";
 import { openSerialChapterSession, type SerialWorkspaceNavigation } from "./serial-navigation.js";
@@ -24,7 +26,7 @@ declare module "@deepseek-ai/dsh-client-ui-slots" {
   interface SlotMap { "oh-story.workspace": { kind: "single"; scope: "session" } }
 }
 interface WorkspaceFile { readonly path: string; readonly bytes: number; readonly version: string; readonly kind: "text" | "media" }
-interface WorkspacePayload { readonly cwd: string; readonly files: readonly WorkspaceFile[]; readonly metadataErrors: readonly string[] }
+interface WorkspacePayload { readonly cwd: string; readonly files: readonly WorkspaceFile[]; readonly metadataErrors: readonly string[]; readonly pluginVersion?: string }
 interface FilePayload { readonly path: string; readonly content: string; readonly bytes: number; readonly version: string }
 interface Draft { readonly content: string; readonly saved: string; readonly version: string; readonly saving?: boolean; readonly error?: string }
 interface EditorMemory { selected?: string; drafts: Record<string, Draft>; mode: "preview" | "source" }
@@ -62,6 +64,7 @@ function NovelWorkbench({ sessionId, blank, openSerialSession, bookNavigation }:
   const [workspace, setWorkspace] = useState<WorkspacePayload>();
   const [error, setError] = useState<string>();
   const [fileError, setFileError] = useState<string>();
+  const [titlePreview, setTitlePreview] = useState<{ readonly path: string; readonly savedProse: string; readonly value: ChapterTitlePreview }>();
   const [chosenOpen, setChosenOpen] = useState<boolean>();
   const [version, setVersion] = useState(0);
   const draftRef = useRef(drafts);
@@ -129,6 +132,24 @@ function NovelWorkbench({ sessionId, blank, openSerialSession, bookNavigation }:
   };
   const draft = selected === undefined ? undefined : drafts[selected];
   const dirty = draft !== undefined && draft.content !== draft.saved;
+  const chapter = proseChapterNumber(selected);
+  const titlePath = chapter === undefined ? undefined : chapterTitleRecordPath(chapter);
+  const titleVersion = files.find(file => file.path === titlePath)?.version;
+  useEffect(() => {
+    if (selected === undefined || chapter === undefined || draft === undefined || titlePath === undefined) { setTitlePreview(undefined); return; }
+    const controller = new AbortController();
+    const load = async (): Promise<void> => {
+      const content = titleVersion === undefined ? undefined : (await json<FilePayload>(await fetch(endpoint("file", sessionId, titlePath), { signal: controller.signal }))).content;
+      const value = await chapterTitlePreview(content, chapter, draft.saved);
+      if (!controller.signal.aborted) setTitlePreview({ path: selected, savedProse: draft.saved, value });
+    };
+    void load().catch((reason: unknown) => {
+      if (!controller.signal.aborted) setTitlePreview({ path: selected, savedProse: draft.saved, value: { kind: "invalid", message: `公众号标题暂时无法读取：${reason instanceof Error ? reason.message : String(reason)}` } });
+    });
+    return () => { controller.abort(); };
+  }, [chapter, draft?.saved, selected, sessionId, titlePath, titleVersion]);
+  const currentTitlePreview = titlePreview !== undefined && titlePreview.path === selected && titlePreview.savedProse === draft?.saved ? titlePreview.value : undefined;
+  const versionMismatch = workspace !== undefined && workspace.pluginVersion !== SERIAL_PLUGIN_VERSION;
   const reading = (
         <section className="novel-reading" aria-label="章节与正文">
           <header className="novel-reading-toolbar"><h2>{isBookProject ? "章节与资料" : "运行记录（只读）"}</h2><button type="button" onClick={reload}>刷新项目文件</button></header>
@@ -140,6 +161,7 @@ function NovelWorkbench({ sessionId, blank, openSerialSession, bookNavigation }:
             <div className="novel-editor">
               <div className="novel-file-toolbar"><strong title={selected}>{selected ?? "正文预览"}{dirty ? " · 未保存" : ""}</strong>{!readOnlyRecord && <div role="group" aria-label="文稿查看方式"><button type="button" aria-pressed={mode === "preview"} onClick={() => { setMode("preview"); }}>预览</button><button type="button" aria-pressed={mode === "source"} onClick={() => { setMode("source"); }}>编辑</button></div>}{readOnlyRecord && <span className="novel-readonly-label">只读记录 · 工作台自动维护</span>}{mode === "source" && !readOnlyRecord && <button type="button" disabled={!dirty || draft?.saving === true} onClick={() => { void save(); }}>{draft?.saving === true ? "保存中…" : "保存"}</button>}</div>
               {(fileError !== undefined || draft?.error !== undefined) && <div className="novel-error" role="alert">{fileError ?? draft?.error}<button type="button" onClick={() => { void reloadFile(); }}>重新读取磁盘版本（放弃本页改动）</button></div>}
+              {chapter !== undefined && <section className="novel-chapter-titles" aria-label="公众号备选标题"><h3>公众号备选标题</h3>{currentTitlePreview === undefined ? <p>正在读取独立标题…</p> : currentTitlePreview.kind === "candidates" || currentTitlePreview.kind === "legacy" ? <>{currentTitlePreview.kind === "legacy" && <p>旧版保存的标题；新章将独立生成五个候选。</p>}<ol>{currentTitlePreview.titles.map((title, index) => <li key={`${String(index)}-${title}`}>{title}</li>)}</ol><p>导出的章节 TXT 开头会列出以上标题，发布时任选其一。</p>{dirty && <p>以上标题对应已保存正文，当前编辑尚未保存。</p>}</> : <p>{currentTitlePreview.message}</p>}</section>}
               {selected === undefined ? <div className="novel-empty"><strong>{isBookProject ? "从左侧选择章节" : "运行记录仅用于排查问题"}</strong><p>{isBookProject ? "这里可以预览和编辑正文、大纲及设定。" : "日常选书、生成、导出都在上方完成，无需修改这些文件。"}</p></div> : draft === undefined ? <p className="novel-muted">正在读取文稿…</p> : mode === "source" && !readOnlyRecord ? <textarea className="novel-source" aria-label={`${selected} 编辑内容`} value={draft.content} onChange={event => { const content = event.target.value; setDrafts(current => ({ ...current, [selected]: { ...(current[selected] ?? draft), content } })); }} /> : <div className="novel-prose">{selected.endsWith(".jsonl") ? <JsonlPreview content={draft.content} label={selected} /> : <MarkdownPreview content={draft.content} label={selected} />}</div>}
             </div>
           </div>
@@ -147,7 +169,8 @@ function NovelWorkbench({ sessionId, blank, openSerialSession, bookNavigation }:
   );
   return <section className="novel-workbench" aria-label="长篇连载工作台" data-open={open ? "true" : "false"}>
     <style>{styles}{serialStyles}</style>
-    <header className="novel-header"><div><strong>长篇连载生成器</strong><span>导入最终输出 · 逐章生成 · 自动保存</span></div><button type="button" onClick={() => { setOpen(!open); }}>{open ? "收起工作台" : "打开长篇工作台"}</button></header>
+    <header className="novel-header"><div><strong>长篇连载生成器</strong><span>导入最终输出 · 逐章生成 · 自动保存</span><small className="novel-version">运行版本：{workspace?.pluginVersion ?? (workspace === undefined ? "正在读取…" : "旧版服务")} · 界面 {SERIAL_PLUGIN_VERSION}</small></div><button type="button" onClick={() => { setOpen(!open); }}>{open ? "收起工作台" : "打开长篇工作台"}</button></header>
+    {versionMismatch && <p className="novel-error" role="alert">工作台界面与后台版本不同。请保存当前工作，完全退出并重新打开 Harness，让新版流程生效。</p>}
     {open && <>
       {error !== undefined && <p className="novel-error" role="alert">{error}</p>}
       <div className="novel-layout" data-view={isBookProject ? "book" : "library"}>

@@ -35,7 +35,7 @@ describe("independent WeChat chapter titles", () => {
     expect(() => parseWechatTitleOutput(JSON.stringify({ ...proposed(), topThree: ["她冲进屋里抢走我的存折，还把旧钥匙藏了起来", candidates[0], candidates[1]] }), prose)).toThrow("来自五个候选");
   });
   it("counts new titles as 15–25 visible characters without truncating, with optional outer book-title marks", () => {
-    const parse = (title: string) => parseWechatTitleOutput(JSON.stringify({ title, evidence: proposed().evidence }), prose);
+    const parse = (title: string) => parseWechatTitleOutput(JSON.stringify({ ...proposed(), candidates: [title, ...candidates.slice(1)], topThree: [title, candidates[1], candidates[2]] }), prose);
     expect(parse(`《${"字".repeat(15)}》`).title).toBe("字".repeat(15));
     expect(parse("字".repeat(25)).title).toBe("字".repeat(25));
     expect(parse(`${"字".repeat(7)} ${"字".repeat(8)}`).title).toBe(`${"字".repeat(7)} ${"字".repeat(8)}`);
@@ -53,11 +53,15 @@ describe("independent WeChat chapter titles", () => {
     expect(parsed).not.toHaveProperty("tags"); expect(parsed).not.toHaveProperty("coreHook"); expect(parsed).not.toHaveProperty("titleStrategy");
   });
   it("requires a usable title and source-verbatim evidence, never accepting invented quotations", () => {
-    const result = { title: "婆婆伸手要我的存折，我却先问她要回那把旧钥匙", evidence: ["婆婆把钥匙拍在桌上"] };
-    expect(parseWechatTitleOutput(JSON.stringify(result), prose)).toEqual(result);
+    const result = proposed();
+    expect(parseWechatTitleOutput(JSON.stringify(result), prose)).toEqual({ ...result, title: result.topThree[0] });
     expect(() => parseWechatTitleOutput(JSON.stringify({ ...result, evidence: ["丈夫拿出三百万让我离开"] }), prose)).toThrow("本章正文");
     expect(() => parseWechatTitleOutput("只有一个标题没有依据", prose)).toThrow("JSON");
-    expect(() => parseWechatTitleOutput(JSON.stringify({ ...result, title: "" }), prose)).toThrow("标题为空");
+    expect(() => parseWechatTitleOutput(JSON.stringify({ ...result, candidates: ["", ...candidates.slice(1)] }), prose)).toThrow("标题为空");
+  });
+  it("retries an old single-title response after upgrade instead of silently accepting fewer than five options", () => {
+    expect(() => parseWechatTitleOutput(JSON.stringify({ title: candidates[0], evidence: proposed().evidence }), prose)).toThrow("5个标题");
+    expect(() => parseWechatTitleOutput(JSON.stringify({ ...proposed(), candidates: ["旧钥匙", ...candidates.slice(1)] }), prose)).toThrow("15—25");
   });
   it("exports one chapter per TXT with title, book name and chapter number, keeping source intact", () => {
     const book = { title: "钥匙", totalChapters: 2, chapters: [{ number: 1, prose, headline: "婆婆伸手要我的存折，我却先问她要回那把旧钥匙" }, { number: 2, prose: "第2章 纸条\n\n柜子里留下了一张字条。", headline: "柜子里只剩一张字条，上面写着一个不该出现的名字" }] };
@@ -71,15 +75,18 @@ describe("independent WeChat chapter titles", () => {
     expect(text).not.toContain("柜子里留下了一张字条");
     expect(book).toEqual(before);
   });
-  it("exports only the selected title at the first line, never rankings, analysis or tags", () => {
+  it("exports all five candidates before the body, keeping analysis and tags internal", () => {
     const result = parseWechatTitleOutput(JSON.stringify(proposed()), prose);
-    const book = { title: "钥匙", totalChapters: 1, chapters: [{ number: 1, prose, headline: result.title }] };
+    const book = { title: "钥匙", totalChapters: 1, chapters: [{ number: 1, prose, headline: result.title, headlineCandidates: result.candidates! }] };
+    const before = structuredClone(book);
     const zip = unzipSync(createChapterZip(book));
-    const chapter = strFromU8(zip[Object.keys(zip).find(name => name.startsWith("第001章"))!]!).replace(/^\uFEFF/u, "");
-    expect(chapter.split("\r\n")[0]).toBe(proposed().topThree[0]);
-    for (const hidden of [proposed().coreHook, proposed().titleStrategy, ...candidates.filter(title => title !== result.title), "番茄标签配置", "前三推荐", "婚姻家庭"]) expect(chapter).not.toContain(hidden);
+    const filename = Object.keys(zip).find(name => name.startsWith("第001章"))!;
+    const chapter = strFromU8(zip[filename]!).replace(/^\uFEFF/u, "");
+    expect(filename).toContain(result.title);
+    expect(chapter.split("\r\n").slice(0, 7)).toEqual(["本章备选标题（任选一个用于发布）", ...candidates.map((title, index) => `${String(index + 1)}. ${title}`), ""]);
+    for (const hidden of [proposed().coreHook, proposed().titleStrategy, "番茄标签配置", "前三推荐", "婚姻家庭"]) expect(chapter).not.toContain(hidden);
     expect(chapter).toContain("书名：《钥匙》\r\n第1章\r\n\r\n婆婆把钥匙拍在桌上");
-    expect(book.chapters[0]?.prose).toBe(prose);
+    expect(book).toEqual(before);
   });
   it("preserves previously saved longer headlines on export without applying new-generation limits", () => {
     const headline = "婆婆为了偏心小叔子突然逼我交出保管三年的存折，却把那把旧钥匙拍在了桌上";
