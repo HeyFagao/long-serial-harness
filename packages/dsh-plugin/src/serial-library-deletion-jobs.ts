@@ -1,7 +1,7 @@
 import type { Context } from "@deepseek-ai/cordis";
 import type { FsVersion } from "@deepseek-ai/dsh-fs";
 import { basename, dirname } from "node:path";
-import { listLibraryBooks, realmForLibraryBook, selectedLibraryIds, type LibraryBook, type LibrarySnapshot } from "./serial-library.js";
+import { ensureLibraryOrder, listLibraryBooks, realmForLibraryBook, selectedLibraryIds, type LibraryBook, type LibrarySnapshot } from "./serial-library.js";
 import { purgeLibraryBookFiles } from "./serial-library-delete.js";
 import { getLibraryQueueRuntime } from "./serial-library-queue-route.js";
 import { forgetDeletedBookRuntime, shutdownBookForDeletion } from "./serial-route.js";
@@ -64,6 +64,7 @@ export async function assertBookDeletionNotQueued(realm: WorkspaceRealm): Promis
 export async function enqueueBookDeletion(context: Context, realm: WorkspaceRealm, ids: readonly string[]): Promise<LibrarySnapshot & { results: { id: string; ok: boolean; error?: string }[] }> {
   const results: { id: string; ok: boolean; error?: string }[] = [];
   await withLibraryOperation(context, realm.root.targetKey, async () => {
+    await ensureLibraryOrder(realm);
     const snapshot = await listLibraryBooks(realm);
     if (snapshot.isBookProject) throw new WorkspaceHttpError(409, "请回到书库勾选需要删除的书。");
     const journal = await load(realm);
@@ -126,6 +127,8 @@ export function resumeBookDeletions(context: Context, realm: WorkspaceRealm): vo
   const held = worker;
   let delay: number | undefined;
   const work = async () => {
+    if ((await load(realm)).value.jobs.length === 0) return;
+    await withLibraryOperation(context, realm.root.targetKey, () => ensureLibraryOrder(realm));
     while (!held.disposed) {
       const jobs = (await load(realm)).value.jobs;
       const job = jobs.find(item => item.nextRetryAt === undefined || Date.parse(item.nextRetryAt) <= Date.now());

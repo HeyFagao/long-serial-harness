@@ -6,6 +6,7 @@ import { importLibraryBooks, listLibraryBooks, realmForLibraryBook, type Library
 import { assertBookNotDeleting } from "../src/serial-library-operations.js";
 import type { WorkspaceRealm } from "../src/workspace-route.js";
 import type * as SerialRouteModule from "../src/serial-route.js";
+import { LIBRARY_ORDER_PATH } from "../src/serial-library-order.js";
 
 const native = vi.hoisted(() => ({ queue: vi.fn(), exclude: vi.fn(), shutdown: vi.fn(), purge: vi.fn() }));
 vi.mock("../src/serial-library-queue-route.js", () => ({ getLibraryQueueRuntime: native.queue }));
@@ -69,6 +70,30 @@ beforeEach(() => {
 afterEach(() => { for (const dispose of disposers.splice(0)) dispose(); vi.clearAllTimers(); vi.useRealTimers(); });
 
 describe("durable background book deletion", () => {
+  it("does not bootstrap or write catalogue order when no deletion job exists", async () => {
+    const test = library(); const app = host();
+    await importLibraryBooks(test.realm, [source(1), source(2)]);
+    test.files.delete(`/books/${LIBRARY_ORDER_PATH}`);
+    const before = new Map(test.files);
+    resumeBookDeletions(app.context, test.realm);
+    for (let step = 0; step < 100; step += 1) await Promise.resolve();
+    expect(test.files).toEqual(before); expect(native.queue).not.toHaveBeenCalled();
+  });
+
+  it("freezes legacy numbering before hiding and purging the first book", async () => {
+    const test = library(); const app = host(); const gate = held();
+    const books = (await importLibraryBooks(test.realm, [source(1), source(2)])).books;
+    test.files.delete(`/books/${LIBRARY_ORDER_PATH}`);
+    native.exclude.mockImplementation(async () => gate.promise); native.purge.mockImplementation(test.purge);
+    const accepted = await enqueueBookDeletion(app.context, test.realm, [books[0]!.id]);
+    expect(accepted.books.map(book => book.sequence)).toEqual([2]);
+    const order = JSON.parse(test.files.get(`/books/${LIBRARY_ORDER_PATH}`)!);
+    expect(order.sequences[books[0]!.id]).toBe(1); expect(order.nextSequence).toBe(3);
+    gate.release(); await until(() => test.jobs().length === 0);
+    const appended = await importLibraryBooks(test.realm, [source(3)]);
+    expect(appended.books.map(book => book.sequence)).toEqual([2, 3]);
+  });
+
   it("acknowledges before held cancellation, hides immediately, and leaves the other book untouched", async () => {
     const test = library(); const app = host(); const gate = held();
     const books = (await importLibraryBooks(test.realm, [source(1), source(2)])).books;

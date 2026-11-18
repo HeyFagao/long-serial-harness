@@ -10,6 +10,7 @@ import { jsonBody, mapFsError, readVersionedFile, send, workspaceRealmForSession
 import { isTrustedWorkspaceRequest } from "./workspace-request-trust.js";
 import { DELETION_JOURNAL, deletionJobs, enqueueBookDeletion, resumeBookDeletions } from "./serial-library-deletion-jobs.js";
 import { withLibraryOperation } from "./serial-library-operations.js";
+import { assignLibraryOrder, compareLibraryInputFilenames, extendLibraryOrder, LIBRARY_ORDER_PATH, parseLibraryOrder, type LibraryOrder } from "./serial-library-order.js";
 
 export const LIBRARY_DIRECTORY = "小说项目";
 const BOOK_RECEIPT = "追踪/书项目.json";
@@ -25,6 +26,7 @@ export interface LibraryBook {
   readonly totalChapters: number;
   readonly completedChapters: number;
   readonly status: string;
+  readonly sequence?: number;
   readonly error?: string;
 }
 interface BookReceipt {
@@ -88,6 +90,34 @@ function receiptOf(value: Record<string, unknown>): BookReceipt {
   return value as unknown as BookReceipt;
 }
 
+async function readLibraryOrder(realm: WorkspaceRealm): Promise<{ readonly order: LibraryOrder; readonly version: FsVersion } | undefined> {
+  try {
+    const stored = await readJson(realm, LIBRARY_ORDER_PATH);
+    return stored === undefined ? undefined : { order: parseLibraryOrder(stored.value), version: stored.version };
+  } catch { throw new WorkspaceHttpError(409, "书库顺序记录损坏或无法读取，已保留原文件，未重新编号。"); }
+}
+
+/** Called inside the library mutation lock, before adding, hiding or removing catalogue identities. */
+export async function ensureLibraryOrder(realm: WorkspaceRealm, reserveIds: readonly string[] = []): Promise<LibraryOrder> {
+  const snapshot = await listLibraryBooks(realm);
+  if (snapshot.isBookProject) throw new WorkspaceHttpError(409, "请回到书库总览管理书籍顺序。");
+  const stored = await readLibraryOrder(realm);
+  const all = [...snapshot.books, ...(snapshot.archivedBooks ?? []), ...(snapshot.deletingBooks ?? [])];
+  const derived = assignLibraryOrder(all, stored?.order).order;
+  const next = extendLibraryOrder(derived, reserveIds);
+  if ((stored === undefined && Object.keys(next.sequences).length > 0) || (stored !== undefined && next.nextSequence !== stored.order.nextSequence)) {
+    await realm.fs.writeText(await containedTarget(realm, LIBRARY_ORDER_PATH), `${JSON.stringify(next, null, 2)}\n`, stored === undefined ? { kind: "createIfAbsent" } : { kind: "replaceIfVersion", version: stored.version }, undefined, realm.sandboxPolicy.resolve({ session: realm.agent.session }));
+  }
+  return next;
+}
+
+async function reserveLibrarySequence(realm: WorkspaceRealm, id: string): Promise<void> {
+  const stored = await readLibraryOrder(realm);
+  if (stored?.order.sequences[id] !== undefined) return;
+  const next = extendLibraryOrder(stored?.order, [id]);
+  await realm.fs.writeText(await containedTarget(realm, LIBRARY_ORDER_PATH), `${JSON.stringify(next, null, 2)}\n`, stored === undefined ? { kind: "createIfAbsent" } : { kind: "replaceIfVersion", version: stored.version }, undefined, realm.sandboxPolicy.resolve({ session: realm.agent.session }));
+}
+
 export async function realmForLibraryBook(library: WorkspaceRealm, relativePath: string): Promise<WorkspaceRealm> {
   if (!relativePath.startsWith(`${LIBRARY_DIRECTORY}/`) || relativePath.split("/").length !== 2) throw new WorkspaceHttpError(400, "书项目必须是当前书库内的独立目录。");
   const root = await containedTarget(library, relativePath);
@@ -123,11 +153,12 @@ export async function listLibraryBooks(realm: WorkspaceRealm): Promise<LibrarySn
     return { libraryPath: realm.cwd, parentLibraryPath: receipt.libraryPath, isBookProject: true, books: [await bookView(realm, receipt)], limits: LIBRARY_LIMITS };
   }
   const directory = await containedTarget(realm, LIBRARY_DIRECTORY);
+  const order = await readLibraryOrder(realm);
   const journal = await readJson(realm, DELETION_JOURNAL);
   const deletingBooks: LibraryBook[] = journal === undefined ? [] : deletionJobs(journal.value).map(job => ({ ...job.book, status: "deleting" }));
   const hiddenPaths = new Set(deletingBooks.map(book => book.relativePath));
   const stat = await realm.fs.stat(directory);
-  if (stat === undefined) return { libraryPath: realm.cwd, isBookProject: false, books: [], deletingBooks, limits: LIBRARY_LIMITS };
+  if (stat === undefined) return { libraryPath: realm.cwd, isBookProject: false, books: [], deletingBooks: assignLibraryOrder(deletingBooks, order?.order).books, limits: LIBRARY_LIMITS };
   if (stat.type !== "directory") throw new WorkspaceHttpError(409, "小说项目不是目录，请先处理同名文件。");
   const books: LibraryBook[] = [];
   for (const entry of await realm.fs.listDir(directory)) {
@@ -149,7 +180,8 @@ export async function listLibraryBooks(realm: WorkspaceRealm): Promise<LibrarySn
         error: error instanceof Error ? error.message : "本书记录不可读，请先处理此项目。" });
     }
   }
-  return { libraryPath: realm.cwd, isBookProject: false, books: books.filter(book => book.status !== "archived").sort((a, b) => a.title.localeCompare(b.title, "zh-Hans-CN") || a.id.localeCompare(b.id)), archivedBooks: books.filter(book => book.status === "archived"), deletingBooks, limits: LIBRARY_LIMITS };
+  const ordered = assignLibraryOrder([...books, ...deletingBooks], order?.order).books;
+  return { libraryPath: realm.cwd, isBookProject: false, books: ordered.filter(book => book.status !== "archived" && book.status !== "deleting"), archivedBooks: ordered.filter(book => book.status === "archived"), deletingBooks: ordered.filter(book => book.status === "deleting"), limits: LIBRARY_LIMITS };
 }
 
 export function validateLibraryInputs(value: unknown): readonly LibraryInputFile[] {
@@ -198,6 +230,7 @@ async function importBook(realm: WorkspaceRealm, file: LibraryInputFile): Promis
     if (stored.archivedAt !== undefined) throw new WorkspaceHttpError(409, "这本书已在回收站，请先恢复；重复导入不会覆盖或新建成稿。");
     if (stored.status === "ready") return { filename: file.filename, status: "existing", book: await bookView(child, stored) };
   } else {
+    await reserveLibrarySequence(realm, id);
     await realm.fs.writeText(await containedTarget(child, BOOK_RECEIPT), `${JSON.stringify(receipt, null, 2)}\n`, { kind: "createIfAbsent" }, undefined, realm.sandboxPolicy.resolve({ session: realm.agent.session }));
   }
   await importSerialOutline(child, file.text, title);
@@ -212,15 +245,17 @@ async function importBook(realm: WorkspaceRealm, file: LibraryInputFile): Promis
 export async function importLibraryBooks(realm: WorkspaceRealm, files: readonly LibraryInputFile[]): Promise<LibrarySnapshot & { readonly results: readonly LibraryImportResult[] }> {
   validateLibraryInputs(files);
   if (await readJson(realm, BOOK_RECEIPT) !== undefined) throw new WorkspaceHttpError(409, "当前是单本小说，请先回到书库再批量导入新项目。");
+  await ensureLibraryOrder(realm);
   const results: LibraryImportResult[] = [];
-  for (const file of files) {
+  for (const file of [...files].sort(compareLibraryInputFilenames)) {
     try { results.push(await importBook(realm, file)); }
     catch (reason) {
       const mapped = reason instanceof WorkspaceHttpError ? reason : mapFsError(reason);
       results.push({ filename: file.filename, status: "failed", error: mapped?.message ?? (reason instanceof Error ? reason.message : "本书导入失败。") });
     }
   }
-  return { ...await listLibraryBooks(realm), results };
+  const snapshot = await listLibraryBooks(realm);
+  return { ...snapshot, results: results.map(result => result.book === undefined ? result : { ...result, book: snapshot.books.find(book => book.id === result.book!.id) ?? result.book }) };
 }
 
 export function selectedLibraryIds(value: unknown): readonly string[] {
@@ -230,6 +265,7 @@ export function selectedLibraryIds(value: unknown): readonly string[] {
 
 /** Reversible deletion: only mark the catalogue receipt; manuscripts and native sessions remain intact. */
 export async function recycleLibraryBooks(realm: WorkspaceRealm, ids: readonly string[], restore = false): Promise<LibrarySnapshot & { results: { id: string; ok: boolean; error?: string }[] }> {
+  await ensureLibraryOrder(realm);
   const library = await listLibraryBooks(realm);
   if (library.isBookProject) throw new WorkspaceHttpError(409, "请回到书库总览管理书项目。");
   const queue = await readJson(realm, "追踪/书库任务.json");
@@ -260,19 +296,23 @@ export async function recycleLibraryBooks(realm: WorkspaceRealm, ids: readonly s
 
 /** TXT snapshots contain only committed chapters; failed/empty books are named in the download manifest. */
 export async function exportLibraryBooks(realm: WorkspaceRealm, ids: readonly string[]): Promise<Uint8Array> {
+  await ensureLibraryOrder(realm);
   const library = await listLibraryBooks(realm);
   if (library.isBookProject) throw new WorkspaceHttpError(409, "请回到书库总览批量导出。");
   const entries: Record<string, Uint8Array> = {};
   const notes = ["批量导出说明", "仅导出已保存并通过校验的章节正文。生成中的后续章节不包含在本次快照中。", "导出不删除原稿。", ""];
   let total = 0;
   let exported = 0;
-  for (const [index, id] of selectedLibraryIds(ids).entries()) {
+  const selected = selectedLibraryIds(ids);
+  const candidates = [...library.books, ...(library.archivedBooks ?? [])];
+  const orderedIds = [...selected].sort((left, right) => (candidates.find(book => book.id === left)?.sequence ?? Number.MAX_SAFE_INTEGER) - (candidates.find(book => book.id === right)?.sequence ?? Number.MAX_SAFE_INTEGER));
+  for (const id of orderedIds) {
     const book = [...library.books, ...(library.archivedBooks ?? [])].find(item => item.id === id);
     if (book === undefined) { notes.push(`跳过未知项目 ${id.slice(0, 12)}`); continue; }
     try {
       const text = await exportSerialChapters(await realmForLibraryBook(realm, book.relativePath));
       const complete = text.chapters.length >= book.totalChapters;
-      const filename = `${String(index + 1).padStart(3, "0")}_${folderTitle(book.title)}_${complete ? "全本" : `未完结_已保存${String(text.chapters.length)}章`}.zip`;
+      const filename = `${String(book.sequence).padStart(3, "0")}_${folderTitle(book.title)}_${complete ? "全本" : `未完结_已保存${String(text.chapters.length)}章`}.zip`;
       const data = createChapterZip(text);
       total += text.chapters.reduce((sum, chapter) => sum + Buffer.byteLength(chapter.prose), 0);
       if (total > 128 * 1024 * 1024) throw new WorkspaceHttpError(413, "本次正文合计超过128 MB，请减少勾选数量分批导出。");

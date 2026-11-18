@@ -1,11 +1,12 @@
 import { posix } from "node:path";
 import { createHash } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { unzipSync, strFromU8 } from "fflate";
 import { exportLibraryBooks, importLibraryBooks, listLibraryBooks, recycleLibraryBooks, realmForLibraryBook, selectedLibraryIds, validateLibraryInputs, type LibraryBook, type LibraryInputFile } from "../src/serial-library.js";
 import { commitOriginalOutput } from "../src/serial-output.js";
 import { exportSerialChapters } from "../src/serial-route.js";
 import type { WorkspaceRealm } from "../src/workspace-route.js";
+import { LIBRARY_ORDER_PATH } from "../src/serial-library-order.js";
 
 function library() {
   const files = new Map<string, string>();
@@ -233,7 +234,7 @@ describe("independent multi-book import", () => {
     const result = await importLibraryBooks(test.realm, [{ ...source(1), filename: "../../outside.txt", title: "../../CON\\external" }]);
     expect(result.results[0]?.status).toBe("imported");
     expect(result.books[0]?.relativePath.split("/")).toHaveLength(2);
-    expect([...test.files.keys()].every(path => path.startsWith("/books/小说项目/"))).toBe(true);
+    expect([...test.files.keys()].every(path => path.startsWith("/books/小说项目/") || path === `/books/${LIBRARY_ORDER_PATH}`)).toBe(true);
     expect(() => validateLibraryInputs(Array(51).fill(source(1)))).toThrow("1—50");
     expect(() => validateLibraryInputs([{ filename: "big.txt", text: "长".repeat(700000) }])).toThrow("超过 2 MB");
     expect(() => validateLibraryInputs([{ filename: "bad.txt", text: 123 }])).toThrow("文件名和完整文本");
@@ -255,5 +256,107 @@ describe("independent multi-book import", () => {
     const withInvalidDirectory = await listLibraryBooks(test.realm);
     expect(withInvalidDirectory.books.filter(book => book.status === "ready")).toHaveLength(1);
     expect(withInvalidDirectory.books.find(book => book.title === "旧稿\\备份")?.absolutePath).toBe("");
+  });
+});
+
+describe("fixed library numbering", () => {
+  it("appends each naturally sorted import batch and keeps numbers after reload and duplicate import", async () => {
+    const test = library();
+    const first = await importLibraryBooks(test.realm, [{ ...source(1), filename: "2_旧书.txt", title: "乙旧书" }, { ...source(2), filename: "1_旧书.txt", title: "丁旧书" }]);
+    expect(first.books.map(book => [book.title, book.sequence])).toEqual([["丁旧书", 1], ["乙旧书", 2]]);
+    const secondInputs = [{ ...source(3), filename: "10_新书.txt", title: "阿新十" }, { ...source(4), filename: "2_新书.txt", title: "阿新二" }, { ...source(5), filename: "1_新书.txt", title: "阿新一" }];
+    const second = await importLibraryBooks(test.realm, secondInputs);
+    expect(second.books.map(book => [book.title, book.sequence])).toEqual([["丁旧书", 1], ["乙旧书", 2], ["阿新一", 3], ["阿新二", 4], ["阿新十", 5]]);
+    expect(second.results.map(result => [result.filename, result.book?.sequence])).toEqual([["1_新书.txt", 3], ["2_新书.txt", 4], ["10_新书.txt", 5]]);
+    expect((await listLibraryBooks(test.realm)).books).toEqual(second.books);
+    const before = new Map(test.files);
+    const duplicate = await importLibraryBooks(test.realm, secondInputs);
+    expect(duplicate.results.every(result => result.status === "existing")).toBe(true);
+    expect(duplicate.books).toEqual(second.books); expect(test.files).toEqual(before);
+  });
+
+  it("migrates legacy display order before appending and keeps list GET read-only", async () => {
+    const test = library();
+    const first = await importLibraryBooks(test.realm, [{ ...source(1), title: "乙" }, { ...source(2), title: "甲" }]);
+    test.files.delete(`/books/${LIBRARY_ORDER_PATH}`);
+    const before = new Map(test.files); const count = test.writes();
+    const legacy = await listLibraryBooks(test.realm);
+    const expected = [...first.books].sort((left, right) => left.title.localeCompare(right.title, "zh-Hans-CN") || left.id.localeCompare(right.id));
+    expect(legacy.books.map(book => book.id)).toEqual(expected.map(book => book.id));
+    expect(legacy.books.map(book => book.sequence)).toEqual([1, 2]);
+    expect(test.files).toEqual(before); expect(test.writes()).toBe(count);
+    const appended = await importLibraryBooks(test.realm, [{ ...source(3), title: "阿新书" }]);
+    expect(appended.books.map(book => book.id).slice(0, 2)).toEqual(expected.map(book => book.id));
+    expect(appended.books.at(-1)).toMatchObject({ title: "阿新书", sequence: 3 });
+    const ledger = JSON.parse(test.files.get(`/books/${LIBRARY_ORDER_PATH}`)!);
+    expect(ledger.nextSequence).toBe(4);
+    expect(first.books.map(book => test.files.get(`${book.absolutePath}/追踪/书项目.json`))).toEqual(first.books.map(book => before.get(`${book.absolutePath}/追踪/书项目.json`)));
+  });
+
+  it("uses fixed numbers and sequence order for reversed subset exports", async () => {
+    const test = library(); const books = (await importLibraryBooks(test.realm, [source(1), source(2), source(3)])).books;
+    for (const book of books) await writeChapter(test, book);
+    const subset = unzipSync(await exportLibraryBooks(test.realm, [books[2]!.id, books[0]!.id]));
+    expect(Object.keys(subset).filter(name => name.endsWith(".zip"))).toEqual([expect.stringMatching(/^001_/u), expect.stringMatching(/^003_/u)]);
+    const onlyThird = unzipSync(await exportLibraryBooks(test.realm, [books[2]!.id]));
+    expect(Object.keys(onlyThird).find(name => name.endsWith(".zip"))).toMatch(/^003_/u);
+  });
+
+  it("keeps reserved numbers after a failed valid import and never reuses a deleted number", async () => {
+    const test = library(); test.fail("/大纲/细纲_第002章.md");
+    const first = await importLibraryBooks(test.realm, [source(1), source(2)]);
+    expect(first.books.map(book => book.sequence)).toEqual([1, 2]);
+    expect(first.results[0]?.status).toBe("failed");
+    const retried = await importLibraryBooks(test.realm, [source(1)]);
+    expect(retried.results[0]?.book?.sequence).toBe(1);
+    const removed = first.books[0]!;
+    for (const path of [...test.files.keys()]) if (path.startsWith(`${removed.absolutePath}/`)) { test.files.delete(path); test.versions.delete(path); }
+    const appended = await importLibraryBooks(test.realm, [source(3)]);
+    expect(appended.books.map(book => book.sequence)).toEqual([2, 3]);
+    const recreated = await importLibraryBooks(test.realm, [source(1)]);
+    expect(recreated.results[0]?.book).toMatchObject({ id: removed.id, sequence: 1 });
+    expect(recreated.books.map(book => book.sequence)).toEqual([1, 2, 3]);
+  });
+
+  it("persists legacy archived numbers before hiding a book and keeps them on restore", async () => {
+    const test = library(); const books = (await importLibraryBooks(test.realm, [source(1), source(2)])).books;
+    test.files.delete(`/books/${LIBRARY_ORDER_PATH}`);
+    const archived = await recycleLibraryBooks(test.realm, [books[0]!.id]);
+    expect(archived.books[0]?.sequence).toBe(2); expect(archived.archivedBooks?.[0]?.sequence).toBe(1);
+    const restored = await recycleLibraryBooks(test.realm, [books[0]!.id], true);
+    expect(restored.books.map(book => book.sequence)).toEqual([1, 2]);
+  });
+
+  it("refuses damaged ordering and a failed reservation write without creating or renumbering books", async () => {
+    const test = library(); const initial = await importLibraryBooks(test.realm, [source(1)]);
+    const path = `/books/${LIBRARY_ORDER_PATH}`; const original = test.files.get(path)!;
+    test.files.set(path, JSON.stringify({ schemaVersion: 1, nextSequence: 2, sequences: { [initial.books[0]!.id]: 0 } }));
+    await expect(listLibraryBooks(test.realm)).rejects.toThrow("未重新编号");
+    await expect(importLibraryBooks(test.realm, [source(2)])).rejects.toThrow("未重新编号");
+    test.files.set(path, original); test.fail(LIBRARY_ORDER_PATH);
+    const failed = await importLibraryBooks(test.realm, [source(2)]);
+    expect(failed.results[0]?.status).toBe("failed"); expect(failed.books).toEqual(initial.books);
+    expect(test.files.get(path)).toBe(original);
+  });
+
+  it("does not overwrite a concurrent reservation when the native order CAS conflicts", async () => {
+    const test = library(); const initial = await importLibraryBooks(test.realm, [source(1)]);
+    const path = `/books/${LIBRARY_ORDER_PATH}`;
+    const write = test.realm.fs.writeText.bind(test.realm.fs);
+    const externalId = "d".repeat(64);
+    const intercepted = vi.spyOn(test.realm.fs, "writeText").mockImplementationOnce(async (...args) => {
+      const order = JSON.parse(test.files.get(path)!);
+      order.sequences[externalId] = 2; order.nextSequence = 3;
+      test.files.set(path, JSON.stringify(order)); test.versions.set(path, "external-writer-version");
+      return write(...args);
+    });
+    const conflicted = await importLibraryBooks(test.realm, [source(2)]);
+    intercepted.mockRestore();
+    expect(conflicted.results[0]?.status).toBe("failed");
+    expect(conflicted.books).toEqual(initial.books);
+    expect(JSON.parse(test.files.get(path)!).sequences[externalId]).toBe(2);
+    const retried = await importLibraryBooks(test.realm, [source(2)]);
+    expect(retried.results[0]?.book?.sequence).toBe(3);
+    expect(retried.books.map(book => book.sequence)).toEqual([1, 3]);
   });
 });

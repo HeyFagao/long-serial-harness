@@ -5,6 +5,7 @@ import { endpoint } from "./workbench-ui.js";
 import libraryStyles from "./book-library.css?inline";
 import type { SerialModelSelection } from "../serial-model-selection.js";
 import { GenerationModelPicker, describeGenerationSelection, generationModelFields } from "./generation-model-picker.js";
+import { compareLibraryInputFilenames } from "../serial-library-order.js";
 
 export interface NativeBookNavigation {
   register(path: string, title: string): Promise<string>;
@@ -30,6 +31,21 @@ async function responseJson<T>(response: Response): Promise<T> {
 export function decodeLibraryText(bytes: ArrayBuffer): string {
   try { return new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
   catch { return new TextDecoder("gb18030", { fatal: true }).decode(bytes); }
+}
+
+/** Preview and import use the same natural filename order, without changing source data. */
+export function libraryImportPreviewOrder<T extends Pick<LibraryInputFile, "filename">>(files: readonly T[]): T[] {
+  return [...files].sort(compareLibraryInputFilenames);
+}
+
+/** A book keeps its catalogue number even when other books are hidden or deleted. */
+export function libraryBookNumber(book: Pick<LibraryBook, "sequence">): string | undefined {
+  return book.sequence !== undefined && Number.isSafeInteger(book.sequence) && book.sequence > 0 ? String(book.sequence).padStart(3, "0") : undefined;
+}
+
+export function searchLibraryBooks(books: readonly LibraryBook[], query: string): readonly LibraryBook[] {
+  const needle = query.trim().toLocaleLowerCase();
+  return books.filter(book => book.title.toLocaleLowerCase().includes(needle));
 }
 
 /** Register every successful import without navigating away from the multi-book results. */
@@ -250,7 +266,7 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
       } catch (reason: unknown) { failures.push({ filename: file.name, status: "failed", error: reason instanceof Error ? reason.message : "无法读取文本，请另存为 UTF-8 后重试。" }); }
     }
     if (!mounted.current) return;
-    setSelected(next);
+    setSelected(libraryImportPreviewOrder(next));
     setResults(failures);
     setPending(undefined);
   };
@@ -470,16 +486,17 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
     : activeOtherOwner ? "这批书由另一个书库会话启动，请先回到任务会话操作。"
     : task?.status === "blocked" ? "本批遇到需要处理的问题，请先查看下方提示，再继续原批或停止后新增。"
     : !validConcurrency ? "并发数请填写正整数。" : modelProblem ?? startSelection.reason;
-  const searchedBooks = visibleBooks.filter(book => book.title.toLocaleLowerCase().includes(bookSearch.trim().toLocaleLowerCase()));
+  const searchedBooks = searchLibraryBooks(visibleBooks, bookSearch);
   const selectedOutsideSearch = normalSelectedIds.filter(id => !searchedBooks.some(book => book.id === id)).length;
   const generationPrefix = generationScope === "all" ? "全部" : "所选";
   const startLabel = `${generationPrefix} ${String(startSelection.ids.length)} 本${generationCount === "all" ? "写至完本" : `各新增 ${String(generationCount)} 章`}`;
   const renderBook = (book: LibraryBook) => {
     const controls = controlsForBook(book);
     const reservation = visibleTaskBooks.find(item => item.id === book.id);
+    const number = libraryBookNumber(book);
     return <article key={book.id} role="listitem" className="book-library-book" data-selected={checkedBooks.includes(book.id) ? "true" : "false"} data-state={reservation?.status ?? book.status}>
       {!snapshot?.isBookProject && <input type="checkbox" aria-label={`选择 ${book.title}`} checked={checkedBooks.includes(book.id)} disabled={busy} onChange={event => { const checked = event.target.checked; setGenerationScope("selected"); setCheckedBooks(current => checked ? [...new Set([...current, book.id])] : current.filter(id => id !== book.id)); }} />}
-      <div className="book-library-book-copy"><strong title={book.title}>{book.title}</strong><span>{book.completedChapters} / {book.totalChapters} 章 · {controls.label}</span>
+      <div className="book-library-book-copy"><div className="book-library-book-heading">{number !== undefined && <span className="book-library-book-number" aria-label={`书籍编号 ${number}`}>{number}</span>}<strong title={book.title}>{book.title}</strong></div><span>{book.completedChapters} / {book.totalChapters} 章 · {controls.label}</span>
         {reservation !== undefined && !["completed", "skipped"].includes(reservation.status) && <span>原批目标：第 {reservation.targetChapter} 章</span>}
         {reservation?.generation?.modelSelection !== undefined && <span className="generation-model-snapshot">{describeGenerationSelection(reservation.generation.modelSelection)}</span>}
       </div>
@@ -503,12 +520,12 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
     </> : <>
       <p className="book-library-note">一次选择多份“最终输出”，每个文件创建一本小说、一个独立项目。</p>
       <label className="book-library-upload"><input type="file" accept=".txt,.md,text/plain,text/markdown" multiple disabled={busy} aria-label="批量选择最终输出文件" onChange={event => { void chooseFiles(event); }} /><span>{pending === "read" ? "正在读取…" : "批量选择 TXT / Markdown"}</span><small>可一次导入 10 本，每次最多 {limits.maxFiles} 本</small></label>
-      {selected.length > 0 && <div className="book-library-selection"><strong>待导入 {selected.length} 本</strong><ul>{selected.map(file => <li key={file.key}><span title={file.filename}>{file.filename}</span><input value={file.title ?? ""} maxLength={120} placeholder="书名（留空自动识别）" aria-label={`${file.filename} 书名`} disabled={busy} onChange={event => { const title = event.target.value; setSelected(current => current.map(item => item.key === file.key ? { ...item, title } : item)); }} /><button type="button" disabled={busy} aria-label={`移除 ${file.filename}`} onClick={() => { setSelected(current => current.filter(item => item.key !== file.key)); }}>移除</button></li>)}</ul><button className="book-library-primary" type="button" disabled={busy} onClick={() => { void importFiles(); }}>{pending === "import" ? "正在拆解各本小说…" : pending === "register" ? "正在添加 Harness 项目…" : `导入并创建 ${String(selected.length)} 本小说`}</button></div>}
+      {selected.length > 0 && <div className="book-library-selection"><strong>待导入 {selected.length} 本</strong><p className="book-library-note">本批按文件名顺序导入，数字按 1、2、10 排列；新书接在已有书之后。</p><ul>{selected.map(file => <li key={file.key}><span title={file.filename}>{file.filename}</span><input value={file.title ?? ""} maxLength={120} placeholder="书名（留空自动识别）" aria-label={`${file.filename} 书名`} disabled={busy} onChange={event => { const title = event.target.value; setSelected(current => current.map(item => item.key === file.key ? { ...item, title } : item)); }} /><button type="button" disabled={busy} aria-label={`移除 ${file.filename}`} onClick={() => { setSelected(current => current.filter(item => item.key !== file.key)); }}>移除</button></li>)}</ul><button className="book-library-primary" type="button" disabled={busy} onClick={() => { void importFiles(); }}>{pending === "import" ? "正在拆解各本小说…" : pending === "register" ? "正在添加 Harness 项目…" : `导入并创建 ${String(selected.length)} 本小说`}</button></div>}
     </>}
     {notice !== undefined && <p className="book-library-notice" role="status">{notice}</p>}
     {visibleResults.some(result => result.status === "failed") && <details className="book-library-results" open><summary>导入问题 · {visibleResults.filter(result => result.status === "failed").length} 项</summary><ul>{visibleResults.filter(result => result.status === "failed").map((result, index) => <li key={`${result.filename}:${String(index)}`}><strong>{result.filename}</strong><span>{result.error}</span></li>)}</ul></details>}
     {snapshot !== undefined && !snapshot.isBookProject && <section className="book-library-batch" aria-label="书库批量生成">
-      <div className="book-library-batch-heading"><div><h3>选择书籍与生成</h3><p className="book-library-note">勾选需要更新的书，再选择每本新增章数。暂停和继续只影响所选书，其他书照常生成。</p></div><strong className="book-library-selected-count" aria-live="polite">已选 {visibleSelectedIds.length} 本</strong></div>
+      <div className="book-library-batch-heading"><div><h3>选择书籍与生成</h3><p className="book-library-note">勾选需要更新的书，再选择每本新增章数。暂停和继续只影响所选书，其他书照常生成。</p><p className="book-library-note">按固定编号排列，新书接在末尾；编号与导出一致。</p></div><strong className="book-library-selected-count" aria-live="polite">已选 {visibleSelectedIds.length} 本</strong></div>
       <div className="book-library-selection-dock">
         <div className="book-library-selection-tools">
           <input type="search" aria-label="搜索书名" placeholder="搜索书名" value={bookSearch} onChange={event => { setBookSearch(event.target.value); }} />
@@ -574,7 +591,7 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
       </div>
       {visibleArchivedBooks.length > 0 && <details><summary>旧版回收站 · {visibleArchivedBooks.length} 本</summary><p className="book-library-note">旧版移入回收站的书仍占用磁盘。可勾选后导出或永久删除；新版删除不再保留回收站副本。</p>{visibleArchivedBooks.map(book => <article key={book.id}>
         <input type="checkbox" aria-label={`选择旧版回收站中的 ${book.title}`} checked={checkedBooks.includes(book.id)} disabled={busy} onChange={event => { const checked = event.target.checked; setGenerationScope("selected"); setCheckedBooks(current => checked ? [...new Set([...current, book.id])] : current.filter(id => id !== book.id)); }} />
-        <strong>{book.title}</strong><span>已保存 {book.completedChapters} 章</span>
+        <strong>{libraryBookNumber(book) === undefined ? "" : `${libraryBookNumber(book)} `}{book.title}</strong><span>已保存 {book.completedChapters} 章</span>
         <button type="button" disabled={busy} aria-label={`永久删除 ${book.title}`} onClick={() => { void manageBooks("delete", [book.id]); }}>永久删除</button>
         <button type="button" disabled={busy} aria-label={`导出 ${book.title}`} onClick={() => { void manageBooks("export", [book.id]); }}>导出TXT</button>
       </article>)}</details>}

@@ -27,16 +27,20 @@ const sleep = (milliseconds: number): Promise<void> => new Promise(done => setTi
 const keys = Array.from({ length: 10 }, (_, index) => `SMOKEBOOK${String(index + 1).padStart(2, "0")}`);
 const deletionKeys = ["SMOKEBOOK11", "SMOKEBOOK12"] as const;
 const selectionKeys = ["SMOKEBOOK13", "SMOKEBOOK14", "SMOKEBOOK15"] as const;
+const orderKeys = ["SMOKEBOOK16", "SMOKEBOOK17", "SMOKEBOOK18", "SMOKEBOOK19", "SMOKEBOOK20"] as const;
 const selectionTotals: Readonly<Record<string, number>> = { SMOKEBOOK13: 12, SMOKEBOOK14: 3, SMOKEBOOK15: 2 };
 const selectionAccepted: Readonly<Record<string, number>> = { SMOKEBOOK13: 10, SMOKEBOOK14: 3, SMOKEBOOK15: 2 };
 const baseChapters = 152;
 const selectedChapters = 15;
 const totalAcceptedChapters = baseChapters + selectedChapters;
-const totalFor = (key: string): number => process.env.LIBRARY_MODEL_ONLY === "1" && key === keys[1] ? 2
+const totalFor = (key: string): number => process.env.LIBRARY_ORDER_ONLY === "1" && orderKeys.includes(key as typeof orderKeys[number]) ? 1
+  : process.env.LIBRARY_MODEL_ONLY === "1" && key === keys[1] ? 2
   : process.env.LIBRARY_MODEL_ONLY === "1" && key === keys[2] ? 1
   : selectionTotals[key] ?? (keys.includes(key) && keys.indexOf(key) < 2 ? 32 : 11);
 const chapterPath = (chapter: number): string => `正文/第${String(chapter).padStart(3, "0")}章.md`;
-const titleFor = (key: string): string => `回归小说${key.slice(-2)}`;
+const titleFor = (key: string): string => process.env.LIBRARY_ORDER_ONLY === "1" && orderKeys.includes(key as typeof orderKeys[number])
+  ? ["阿追加一", "阿追加二", "阿追加十", "阿补入十四", "阿再补十五"][orderKeys.indexOf(key as typeof orderKeys[number])]!
+  : `回归小说${key.slice(-2)}`;
 function titleCandidates(chapter: number): readonly string[] {
   const candidates = [`第${String(chapter)}本账刚核清，无名信却送来了原始契约`, `她合上第${String(chapter)}本账册，一封无名信让旧案再起波澜`,
     `第${String(chapter)}次核账刚结束，她寻找的契约竟被送上门`, `沈宁核清第${String(chapter)}本旧账，无名来信藏着关键物证`, `第${String(chapter)}本账册背后，那张失踪的契约终于出现`];
@@ -412,6 +416,115 @@ async function main(): Promise<void> {
     await page.locator(`[data-conversation-session="${sessionId}"]`).waitFor({ state: "visible", timeout: 20_000 });
     await page.getByRole("button", { name: "开始批量生成", exact: true }).waitFor({ state: "visible", timeout: 20_000 });
     await assertImportContainment(origin, sessionId, libraryPath, temporary);
+    if (process.env.LIBRARY_ORDER_ONLY === "1") {
+      const orderFile = join(libraryPath, "追踪/书库顺序.json");
+      const oldIds = keys.map(key => model!.books.get(key)!.id);
+      const oldReceipts = new Map(await Promise.all(keys.map(async key => {
+        const book = model!.books.get(key)!;
+        return [book.id, await readFile(join(book.absolutePath, "追踪/书项目.json"), "utf8")] as const;
+      })));
+      await browser.close(); browser = undefined; await stopDshProcess(child); child = undefined;
+      // Only the isolated fixtures are downgraded: old releases had receipts but
+      // no central order ledger. Merely viewing legacy books must stay read-only.
+      await rm(orderFile, { force: true });
+      logs.length = 0; child = launch(); tokenURL = await authorizeDsh(origin, logs);
+      const legacy = await api<LibrarySnapshot>(origin, "library", sessionId);
+      assert.deepEqual(legacy.books.map(book => book.id), oldIds);
+      assert.deepEqual(legacy.books.map(book => book.sequence), Array.from({ length: 10 }, (_, index) => index + 1));
+      assert(await absent(orderFile), "A read-only legacy library view unexpectedly wrote a numbering ledger");
+      const uploads = [
+        { filename: "10_追加十.txt", text: sourceFor(orderKeys[2]) },
+        { filename: "2_追加二.txt", text: sourceFor(orderKeys[1]) },
+        { filename: "1_追加一.txt", text: sourceFor(orderKeys[0]) }
+      ];
+      const imported = await api<LibrarySnapshot & { readonly results: readonly { readonly status: string; readonly filename: string; readonly book?: LibraryBook }[] }>(origin, "library", sessionId, { files: uploads });
+      assert.equal(imported.books.length, 13); assert(!(await absent(orderFile)));
+      assert.deepEqual(imported.books.slice(0, 10).map(book => book.id), oldIds, "New alphabetically earlier titles interleaved with the legacy books");
+      assert.deepEqual(imported.books.slice(10).map(book => [book.filename, book.sequence]), [[uploads[2]!.filename, 11], [uploads[1]!.filename, 12], [uploads[0]!.filename, 13]]);
+      for (const [index, key] of orderKeys.slice(0, 3).entries()) {
+        const book = imported.books.find(book => book.title === titleFor(key)); assert(book !== undefined); assert.equal(book.sequence, index + 11);
+        model.books.set(key, book); await rpc(origin, "workspace/create", { request: { path: book.absolutePath } });
+      }
+      const duplicates = await api<LibrarySnapshot & { readonly results: readonly { readonly status: string }[] }>(origin, "library", sessionId, { files: [...uploads].reverse() });
+      assert(duplicates.results.every(result => result.status === "existing"));
+      const identity = (books: readonly LibraryBook[]) => books.map(book => [book.id, book.sequence] as const);
+      assert.deepEqual(identity(duplicates.books), identity(imported.books), "A duplicate import renumbered or moved existing books");
+      const exportBooks = [model.books.get(orderKeys[2])!, model.books.get(orderKeys[0])!];
+      await queue(origin, sessionId, { action: "start", count: 10, concurrency: "all", ids: exportBooks.map(book => book.id) });
+      const done = await waitQueue(origin, sessionId, task => task.status === "completed");
+      assert(done.books.every(book => book.status === "completed" && book.completedChapters === 1));
+      assert.equal(model.answers.length, 2); assert.equal(model.titles.length, 2); assert.equal(model.failures.length, 0, model.failures.join("\n"));
+      await checkNativeChildren(home, model, 2);
+      const exportResponse = await dshFetch(`${origin}/oh-story/library?sessionId=${encodeURIComponent(sessionId)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "export", ids: exportBooks.map(book => book.id) }) });
+      assert.equal(exportResponse.status, 200);
+      const exportBytes = new Uint8Array(await exportResponse.arrayBuffer()); const exported = unzipSync(exportBytes);
+      const exportedNames = Object.keys(exported).filter(name => name.endsWith(".zip"));
+      assert.equal(exportedNames.length, 2);
+      assert(exportedNames[0]!.startsWith("011_") && exportedNames[0]!.includes(titleFor(orderKeys[0])), "Subset ZIP reset numbering or followed reverse selected IDs");
+      assert(exportedNames[1]!.startsWith("013_") && exportedNames[1]!.includes(titleFor(orderKeys[2])), "Subset ZIP did not preserve the global book number");
+      for (const name of exportedNames) {
+        const inner = unzipSync(exported[name]!); const chapters = Object.keys(inner).filter(path => path.startsWith("第")); assert.equal(chapters.length, 1);
+        checkExportedTitle(strFromU8(inner[chapters[0]!]!));
+      }
+      await writeFile(join(evidence, "stable-order-subset-export.zip"), exportBytes);
+      const deleted = legacy.books.find(book => book.sequence === 2)!;
+      const beforeDelete = identity((await api<LibrarySnapshot>(origin, "library", sessionId)).books);
+      const deletion = await api<LibrarySnapshot>(origin, "library", sessionId, { action: "delete", ids: [deleted.id] });
+      assert(!deletion.books.some(book => book.id === deleted.id));
+      await waitFor(async () => await absent(deleted.absolutePath), "selected legacy book physically deleted");
+      const afterDelete = await api<LibrarySnapshot>(origin, "library", sessionId);
+      assert.deepEqual(identity(afterDelete.books), beforeDelete.filter(([id]) => id !== deleted.id), "Deleting a book renumbered its neighbors");
+      const next = await api<LibrarySnapshot>(origin, "library", sessionId, { files: [{ filename: "下一本14.txt", text: sourceFor(orderKeys[3]) }] });
+      const fourteenth = next.books.find(book => book.title === titleFor(orderKeys[3])); assert(fourteenth !== undefined); assert.equal(fourteenth.sequence, 14);
+      // Deleting the highest assigned number must not rewind the allocator.
+      await api<LibrarySnapshot>(origin, "library", sessionId, { action: "delete", ids: [fourteenth.id] });
+      await waitFor(async () => await absent(fourteenth.absolutePath), "highest-numbered fixture book physically deleted");
+      const fifteenth = await api<LibrarySnapshot>(origin, "library", sessionId, { files: [{ filename: "下一本15.txt", text: sourceFor(orderKeys[4]) }] });
+      assert.equal(fifteenth.books.find(book => book.title === titleFor(orderKeys[4]))?.sequence, 15, "Deleting the high-water book reused its assigned number");
+      await waitFor(async () => !(await api<LibrarySnapshot>(origin, "library", sessionId)).deletingBooks?.some(book => book.id === deleted.id), "deleted old identity cleanup completed before reimport");
+      const nextBeforeReimport = (JSON.parse(await readFile(orderFile, "utf8")) as { readonly nextSequence: number }).nextSequence;
+      const reimported = await api<LibrarySnapshot>(origin, "library", sessionId, { files: [{ filename: `${keys[1]!}.txt`, text: sourceFor(keys[1]!) }] });
+      assert.equal(reimported.books.find(book => book.id === deleted.id)?.sequence, 2, "Reimporting the same old identity assigned it a different number");
+      assert.equal(reimported.books.find(book => book.title === titleFor(orderKeys[4]))?.sequence, 15);
+      assert.equal((JSON.parse(await readFile(orderFile, "utf8")) as { readonly nextSequence: number }).nextSequence, nextBeforeReimport, "Reimporting an already numbered identity advanced the allocator");
+      const beforeRestart = identity(reimported.books);
+      for (const key of keys.filter(key => model!.books.get(key)!.id !== deleted.id)) {
+        const book: LibraryBook = model.books.get(key)!;
+        assert.equal(await readFile(join(book.absolutePath, "追踪/书项目.json"), "utf8"), oldReceipts.get(book.id), "Ordering migration rewrote an old book receipt");
+        assert.equal(await readFile(join(book.absolutePath, "大纲/导入原稿.md"), "utf8"), sourceFor(key), "Ordering migration rewrote an old source");
+      }
+      await stopDshProcess(child); child = undefined; logs.length = 0; child = launch(); tokenURL = await authorizeDsh(origin, logs);
+      const restored = await api<LibrarySnapshot>(origin, "library", sessionId); assert.deepEqual(identity(restored.books), beforeRestart);
+      browser = await chromium.launch({ channel: process.env.DSH_SMOKE_BROWSER_CHANNEL ?? "chrome", headless: true });
+      const orderPage = await browser.newPage({ viewport: { width: 1440, height: 1000 } }); orderPage.on("pageerror", error => pageErrors.push(error.message));
+      await orderPage.goto(tokenURL, { waitUntil: "networkidle" });
+      const orderNotice = orderPage.getByRole("button", { name: /^(?:Continue|继续)$/u }); if (await orderNotice.isVisible()) await orderNotice.click();
+      const libraryWorkspace = orderPage.getByRole("treeitem").filter({ hasText: "书库集成测试" }).first();
+      await libraryWorkspace.waitFor({ state: "visible", timeout: 20_000 }); if (await libraryWorkspace.getAttribute("aria-expanded") !== "true") await libraryWorkspace.click();
+      await orderPage.getByRole("treeitem").filter({ hasText: "书库验收会话" }).first().click();
+      await orderPage.locator(`[data-conversation-session="${sessionId}"]`).waitFor({ state: "visible", timeout: 20_000 });
+      await orderPage.locator(".novel-version").filter({ hasText: `运行版本：${pluginMetadata.version}` }).waitFor({ state: "visible", timeout: 20_000 });
+      const cards = orderPage.getByRole("list", { name: "小说项目列表" }).getByRole("listitem");
+      await waitFor(async () => await cards.count() === restored.books.length, "persistent imported book ordering in UI");
+      assert.deepEqual(await cards.locator(".book-library-book-number").allTextContents(), restored.books.map(book => String(book.sequence).padStart(3, "0")));
+      for (const book of restored.books) assert.equal(await orderPage.getByRole("checkbox", { name: `选择 ${book.title}`, exact: true }).count(), 1);
+      await orderPage.getByRole("list", { name: "小说项目列表" }).scrollIntoViewIfNeeded();
+      await orderPage.screenshot({ path: join(evidence, "stable-book-order.png"), animations: "disabled" });
+      assert.equal(pageErrors.length, 0, pageErrors.join("\n"));
+      const report = {
+        ok: true, phase: "stable-import-order", dshVersion: version, pluginVersion: pluginMetadata.version, pluginSha256,
+        provider: "local-deterministic-text-fixture", realPaidModel: false,
+        legacyBooks: 10, legacyReadOnlyView: "passed-original-title-order-without-ledger-write", migration: "passed-first-import-persists-old-order-before-new-book-allocation",
+        scrambledImportFilenames: uploads.map(file => file.filename), appendSequences: [11, 12, 13], naturalBatchOrder: "passed-1-2-10", alphabeticallyEarlierTitles: "appended-after-existing-books",
+        duplicateImport: "preserved-original-ids-and-numbers", subsetExport: "passed-global-011-and-013-prefixes-instead-of-subset-renumbering", reverseSelectedIds: "did-not-change-export-order",
+        deletion: "passed-neighbor-numbers-unchanged", sameIdentityReimport: "passed-restored-002-without-renumbering", nextImportAfterDeletion: 14, highestNumberDeletion: "passed-next-number-15-not-reused", restartOrdering: "unchanged",
+        uiBookNumbers: "passed-matched-export-numbers", checkboxLabels: "unchanged", oldBookReceiptsAndSources: "preserved-byte-for-byte",
+        acceptedChapters: 2, freshNativeChapterSessions: 2, independentTitleSessions: 2, exportedBookPrefixes: exportedNames.map(name => name.slice(0, 3)),
+        finalOrder: restored.books.map(book => ({ title: book.title, sequence: book.sequence })), modelToolCalls: 0, literaryQuality: "not assessed"
+      };
+      await writeFile(join(evidence, "order-import-smoke.json"), `${JSON.stringify(report, null, 2)}\n`);
+      process.stdout.write(`${JSON.stringify(report)}\n`); passed = true; return;
+    }
     if (process.env.LIBRARY_MODEL_ONLY === "1") {
       const singleBook = model.books.get(keys[0]!)!; const firstBook = model.books.get(keys[1]!)!; const appendedBook = model.books.get(keys[2]!)!;
       const parentChoice: SerialModelSelection = { provider: "deepseek-official", model: "deepseek-flash", reasoningEffort: "high" };

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { LibraryBook, LibraryImportResult } from "../src/serial-library.js";
 import type { LibraryQueueBook } from "../src/serial-library-runtime.js";
-import { canOpenLibraryBook, decodeLibraryText, libraryBookControls, libraryQueueControls, libraryStartSelection, registerLibraryResults } from "../src/client/book-library-panel.js";
+import { canOpenLibraryBook, decodeLibraryText, libraryBookControls, libraryBookNumber, libraryImportPreviewOrder, libraryQueueControls, libraryStartSelection, registerLibraryResults, searchLibraryBooks } from "../src/client/book-library-panel.js";
 
 const book = (id: string): LibraryBook => ({ id, title: `书${id}`, filename: `${id}.txt`, absolutePath: `/library/${id}`, relativePath: `小说项目/${id}`, totalChapters: 100, completedChapters: 0, status: "ready" });
 const imported = (id: string): LibraryImportResult => ({ filename: `${id}.txt`, status: "imported", book: book(id) });
@@ -86,6 +86,30 @@ describe("batch input decoding", () => {
   });
   it("reads legacy GB18030 files before importing them as text", () => {
     expect(decodeLibraryText(Uint8Array.from([0xd6, 0xd0, 0xce, 0xc4]).buffer)).toBe("中文");
+  });
+});
+
+describe("stable book numbering and import preview", () => {
+  it("previews numeric filenames in the same natural order without changing input contents or names", () => {
+    const inputs = [
+      { filename: "10_新书.txt", text: "十号原文\r\n", title: "十号标题", key: "first" },
+      { filename: "2_新书.md", text: "二号原文\n", title: "二号标题", key: "second" },
+      { filename: "1_新书.txt", text: "一号原文\n", title: "一号标题", key: "third" }
+    ];
+    const original = structuredClone(inputs);
+    const ordered = libraryImportPreviewOrder(inputs);
+    expect(ordered.map(file => file.filename)).toEqual(["1_新书.txt", "2_新书.md", "10_新书.txt"]);
+    expect(ordered).toEqual([inputs[2], inputs[1], inputs[0]]);
+    expect(inputs).toEqual(original);
+  });
+  it("keeps catalogue numbers and order when searching, selecting or omitting other books", () => {
+    const books = [{ ...book("old"), title: "旧书", sequence: 8 }, { ...book("new-a"), title: "新书甲", sequence: 12 }, { ...book("new-b"), title: "新书乙", sequence: 20 }];
+    const found = searchLibraryBooks(books, " 新书 ");
+    expect(found.map(item => [item.id, libraryBookNumber(item)])).toEqual([["new-a", "012"], ["new-b", "020"]]);
+    expect(libraryStartSelection(found, ["new-b", "new-a"], "selected", null).ids).toEqual(["new-a", "new-b"]);
+    expect(searchLibraryBooks([books[2]!], "").map(libraryBookNumber)).toEqual(["020"]);
+    expect(libraryBookNumber({ sequence: 1002 })).toBe("1002");
+    expect(libraryBookNumber({})).toBeUndefined();
   });
 });
 
