@@ -1,9 +1,12 @@
+import { parseFiling, type LibraryFiling } from "./serial-library-folders.js";
+
 /** Pure helpers shared by the import preview and the host catalogue. */
 export const LIBRARY_ORDER_PATH = "追踪/书库顺序.json";
 export interface LibraryOrder {
   readonly schemaVersion: 1;
   readonly nextSequence: number;
   readonly sequences: Readonly<Record<string, number>>;
+  readonly filing?: LibraryFiling;
   /** Includes reserved identities so hiding or restoring a book preserves its position. */
   readonly displayOrder?: readonly string[];
 }
@@ -42,7 +45,8 @@ export function parseLibraryOrder(value: unknown): LibraryOrder {
     schemaVersion: 1,
     nextSequence: Number(object.nextSequence),
     sequences: { ...sequences as Record<string, number> },
-    ...(displayOrder === undefined ? {} : { displayOrder: [...displayOrder as string[]] })
+    ...(displayOrder === undefined ? {} : { displayOrder: [...displayOrder as string[]] }),
+    ...(object.filing === undefined ? {} : { filing: parseFiling(object.filing, sequences) })
   };
 }
 
@@ -56,7 +60,7 @@ export function extendLibraryOrder(order: LibraryOrder | undefined, ids: readonl
     sequences[id] = nextSequence++;
     displayOrder?.push(id);
   }
-  return { schemaVersion: 1, nextSequence, sequences, ...(displayOrder === undefined ? {} : { displayOrder }) };
+  return { ...order, schemaVersion: 1, nextSequence, sequences, ...(displayOrder === undefined ? {} : { displayOrder }) };
 }
 
 export function moveLibraryDisplayOrder(order: LibraryOrder, move: LibraryBookMove): LibraryOrder {
@@ -75,7 +79,9 @@ export function moveLibraryDisplayOrder(order: LibraryOrder, move: LibraryBookMo
 
 export function resetLibraryDisplayOrder(order: LibraryOrder): LibraryOrder {
   if (order.displayOrder === undefined) return order;
-  return { schemaVersion: order.schemaVersion, nextSequence: order.nextSequence, sequences: order.sequences };
+  const reset = { ...order };
+  delete reset.displayOrder;
+  return reset;
 }
 
 export function assignLibraryOrder<T extends { readonly id: string; readonly title: string }>(books: readonly T[], order: LibraryOrder | undefined): { readonly books: readonly (T & { readonly sequence: number })[]; readonly order: LibraryOrder } {

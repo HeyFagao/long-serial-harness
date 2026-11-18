@@ -1,0 +1,88 @@
+{
+  "ok": true,
+  "phase": "library-folders-and-order",
+  "upgradeFrom": "legacy-without-ledger",
+  "legacyView": "all-10-in-ungrouped-until-owner-files-them",
+  "batchImports": "separate-first-and-second-files-with-mixed-duplicates-and-deduplicated-selection",
+  "folders": "named-on-import-existing-target-create-empty-rename-move-two-legacy-books",
+  "folderControls": "only-select-one-folder-collapse-jump-reopen-delete-empty-folder-browser-download-with-renamed-folder-in-filename",
+  "persistence": "names-membership-and-folder-local-manual-order-after-native-and-browser-restart",
+  "nativeFolderVisibility": "every-row-shows-its-folder-fixed-number-and-title",
+  "dshVersion": "0.2.2-rc.3",
+  "pluginVersion": "0.1.26-serial.11",
+  "pluginSha256": "18929d56338a7cdd842733ae1ce7698af831f3ff79957c797d4fb77db8aaf69e",
+  "provider": "local-deterministic-text-fixture",
+  "realPaidModel": false,
+  "legacyBooks": 10,
+  "legacyReadOnlyView": "passed-original-order-without-ledger-write",
+  "migration": "passed-original-sequence-preserved",
+  "scrambledImportFilenames": [
+    "10_追加十.txt",
+    "2_追加二.txt",
+    "1_追加一.txt"
+  ],
+  "appendSequences": [
+    11,
+    12,
+    13
+  ],
+  "naturalBatchOrder": "passed-1-2-10",
+  "alphabeticallyEarlierTitles": "appended-after-existing-books",
+  "actualUiImports": "passed-first-and-second-batch-plus-reimports",
+  "sameTitleBooks": "distinct-workspace-ids-and-readable-labels-without-registration-errors",
+  "nativeSidebarOrdering": "passed-contiguous-after-library-and-ordered-like-book-cards",
+  "upgradeSidebarRepair": "passed-mixed-registry-order-repaired-on-opening-library",
+  "unrelatedWorkspaces": "relative-order-preserved",
+  "manualOrdering": "passed-up-button-drag-cold-restart-and-reset",
+  "staleSessionSync": "passed-old-window-sync-uses-current-saved-order",
+  "duplicateImport": "preserved-original-ids-and-numbers",
+  "subsetExport": "passed-global-011-and-013-prefixes-instead-of-subset-renumbering",
+  "reverseSelectedIds": "did-not-change-export-order",
+  "deletion": "passed-neighbor-numbers-unchanged",
+  "sameIdentityReimport": "passed-restored-002-without-renumbering",
+  "nextImportAfterDeletion": 14,
+  "highestNumberDeletion": "passed-next-number-15-not-reused",
+  "restartOrdering": "unchanged",
+  "uiBookNumbers": "passed-matched-export-numbers",
+  "checkboxLabels": "unchanged",
+  "oldBookReceiptsAndSources": "preserved-byte-for-byte",
+  "acceptedChapters": 3,
+  "freshNativeChapterSessions": 3,
+  "independentTitleSessions": 3,
+  "legacyChapterTitleProseAndState": "byte-identical-after-upgrade-move-and-restart",
+  "exportedBookPrefixes": [
+    "011",
+    "013"
+  ],
+  "finalFolders": [
+    {
+      "name": "主线连载",
+      "numbers": [
+        11,
+        12,
+        13
+      ]
+    },
+    {
+      "name": "第二批",
+      "numbers": [
+        15
+      ]
+    },
+    {
+      "name": "回补批次",
+      "numbers": [
+        2
+      ]
+    },
+    {
+      "name": "历史连载",
+      "numbers": [
+        1,
+        9
+      ]
+    }
+  ],
+  "modelToolCalls": 0,
+  "literaryQuality": "not assessed"
+}

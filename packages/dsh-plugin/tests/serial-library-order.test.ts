@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { addFolder, emptyFiling } from "../src/serial-library-folders.js";
 import { assignLibraryOrder, compareLibraryInputFilenames, extendLibraryOrder, parseLibraryOrder } from "../src/serial-library-order.js";
 
 const id = (number: number) => number.toString(16).padStart(64, "0");
@@ -24,5 +25,26 @@ describe("persistent library sequence helpers", () => {
       { ...good, sequences: { [id(1)]: 1, [id(2)]: 1 } }, { ...good, sequences: { [id(1)]: 0 } }, { ...good, sequences: { notAnIdentity: 1 } },
       { ...good, displayOrder: [id(1)] }, { ...good, displayOrder: [id(1), id(1)] }, { ...good, displayOrder: [id(1), id(3)] }];
     for (const value of invalid) expect(() => parseLibraryOrder(value)).toThrow("未重新编号");
+  });
+});
+
+describe("folder numbering and catalogue integrity", () => {
+  const folderId = "aaaaaaaa-0000-4000-8000-000000000001";
+  it("keeps default batch names distinct even after authors choose a future batch name", () => {
+    const custom = addFolder(emptyFiling, folderId, "第二批").filing;
+    expect(addFolder(custom, "bbbbbbbb-0000-4000-8000-000000000002").folder).toMatchObject({ number: 3, name: "第三批" });
+    for (const [number, name] of [[10, "第十批"], [12, "第十二批"], [101, "第一百零一批"]] as const) {
+      expect(addFolder({ ...emptyFiling, nextNumber: number }, folderId).folder.name).toBe(name);
+    }
+    for (const name of ["  ", "a\nb", "a".repeat(61), "未分组"]) expect(() => addFolder(emptyFiling, folderId, name)).toThrow();
+  });
+  it("rejects orphan memberships, reused ordinals and duplicate labels instead of silently unfiling books", () => {
+    const filing = addFolder(emptyFiling, folderId, "夜班").filing;
+    const order = { ...extendLibraryOrder(undefined, [id(1)]), filing: { ...filing, memberships: { [id(1)]: folderId } } };
+    expect(parseLibraryOrder(order)).toEqual(order);
+    const folder = filing.folders[0]!;
+    const bad = [{ ...filing, memberships: { [id(2)]: folderId } }, { ...filing, memberships: { [id(1)]: "missing" } },
+      { ...filing, nextNumber: 1 }, { ...filing, nextNumber: 3, folders: [folder, { ...folder, number: 2, id: "bbbbbbbb-0000-4000-8000-000000000002" }] }];
+    for (const broken of bad) expect(() => parseLibraryOrder({ ...order, filing: broken })).toThrow("文件夹");
   });
 });

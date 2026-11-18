@@ -12,7 +12,7 @@ import { assertTrustedWorkspaceAuthority } from "./workspace-request-trust.js";
 export { registerWorkspaceRoute } from "./workspace-route.js";
 
 export const name = "oh-story";
-export const inject = ["agents", "subagents", "typert", "webServer", "sessionController", "sessions", "workspaceRegistry"];
+export const inject = ["agents", "subagents", "typert", "webServer", "sessionController", "sessions", "workspaceRegistry", "workspaceController"];
 
 interface SettingsPolicyService {
   configure(presentation: { readonly auto?: boolean }, owner?: Context["fiber"]): () => void;

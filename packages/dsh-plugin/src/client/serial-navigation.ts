@@ -13,25 +13,11 @@ export interface SerialWorkspaceRegistration {
   rename(workspaceId: string, title: string): Promise<unknown>;
 }
 
-function workspaceNameConflict(error: unknown): boolean {
-  return error instanceof Error && error.message.startsWith("workspace rename failed: workspace/name-conflict:");
-}
-
 export async function registerSerialWorkspace(workspaces: SerialWorkspaceRegistration, path: string, title: string, sequence?: number): Promise<string> {
   const { workspaceId, title: existingTitle } = await workspaces.create({ path });
-  const numberedTitle = sequence === undefined ? undefined : `${title} · ${String(sequence).padStart(3, "0")}`;
-  if (existingTitle === title || (numberedTitle !== undefined && existingTitle === numberedTitle)) return workspaceId;
-  try {
-    await workspaces.rename(workspaceId, title);
-  } catch (error) {
-    if (numberedTitle === undefined || !workspaceNameConflict(error)) throw error;
-    try {
-      await workspaces.rename(workspaceId, numberedTitle);
-    } catch (secondError) {
-      // The registered directory already has a distinct workspace identity.
-      if (!workspaceNameConflict(secondError)) throw secondError;
-    }
-  }
+  // Only the host knows the current folder. A second window opening an old snapshot
+  // must reuse the numbered book without reverting its newer native display label.
+  if (sequence === undefined && existingTitle !== title) await workspaces.rename(workspaceId, title);
   return workspaceId;
 }
 

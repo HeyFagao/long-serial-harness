@@ -3,30 +3,28 @@ import { describe, expect, it, vi } from "vitest";
 import { openSerialChapterSession, registerSerialWorkspace } from "../src/client/serial-navigation.js";
 
 describe("serial native workspace registration", () => {
-  const conflict = new Error("workspace rename failed: workspace/name-conflict: Workspace name is already in use");
-
-  it("uses the fixed book number to register a usable sidebar row when another book has the same name", async () => {
+  it("registers books by path and leaves their folder labels under the host catalogue's control", async () => {
     const workspaces = {
       create: vi.fn(async () => ({ workspaceId: "registered-book" })),
-      rename: vi.fn(async () => {}).mockRejectedValueOnce(conflict),
+      rename: vi.fn(async () => {}),
     };
     await expect(registerSerialWorkspace(workspaces, "/library/book", "同名书", 12)).resolves.toBe("registered-book");
-    expect(workspaces.rename.mock.calls).toEqual([["registered-book", "同名书"], ["registered-book", "同名书 · 012"]]);
-    workspaces.rename.mockClear();
-    const existing = { ...workspaces, create: async () => ({ workspaceId: "registered-book", title: "同名书 · 012" }) };
+    expect(workspaces.create).toHaveBeenCalledWith({ path: "/library/book" });
+    const existing = { ...workspaces, create: async () => ({ workspaceId: "registered-book", title: "第二批 · 012 · 同名书" }) };
     await expect(registerSerialWorkspace(existing, "/library/book", "同名书", 12)).resolves.toBe("registered-book");
     expect(workspaces.rename).not.toHaveBeenCalled();
   });
 
-  it("keeps a registered directory after two naming conflicts and surfaces unrelated failures", async () => {
+  it("still assigns the library workspace title when needed and propagates failures", async () => {
     const workspaces = {
-      create: vi.fn(async () => ({ workspaceId: "registered-book" })),
-      rename: vi.fn(async () => {}).mockRejectedValue(conflict),
+      create: vi.fn(async () => ({ workspaceId: "library" })),
+      rename: vi.fn(async () => {}),
     };
-    await expect(registerSerialWorkspace(workspaces, "/library/book", "同名书", 12)).resolves.toBe("registered-book");
+    await expect(registerSerialWorkspace(workspaces, "/library", "书库")).resolves.toBe("library");
+    expect(workspaces.rename).toHaveBeenCalledWith("library", "书库");
     const unrelated = new Error("workspace rename failed: gateway/unavailable: connection lost");
-    workspaces.rename.mockRejectedValueOnce(conflict).mockRejectedValueOnce(unrelated);
-    await expect(registerSerialWorkspace(workspaces, "/library/book", "同名书", 12)).rejects.toBe(unrelated);
+    workspaces.rename.mockRejectedValueOnce(unrelated);
+    await expect(registerSerialWorkspace(workspaces, "/library", "书库")).rejects.toBe(unrelated);
   });
 });
 

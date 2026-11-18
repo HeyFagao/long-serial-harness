@@ -6,6 +6,9 @@ import libraryStyles from "./book-library.css?inline";
 import type { SerialModelSelection } from "../serial-model-selection.js";
 import { GenerationModelPicker, describeGenerationSelection, generationModelFields } from "./generation-model-picker.js";
 import { compareLibraryInputFilenames } from "../serial-library-order.js";
+import { UNGROUPED_LIBRARY_LABEL } from "../serial-library-groups.js";
+import { LibraryFolderList, searchLibraryBooks } from "./library-folder-list.js";
+export { searchLibraryBooks } from "./library-folder-list.js";
 
 export interface NativeBookNavigation {
   register(path: string, title: string, sequence?: number): Promise<string>;
@@ -17,7 +20,12 @@ interface SelectedFile extends LibraryInputFile { readonly bytes: number; readon
 interface Registration { readonly workspaceId?: string; readonly error?: string }
 type BookPlacement = "before" | "after";
 type OrderAction = { readonly action: "move"; readonly id: string; readonly targetId: string; readonly position: BookPlacement } | { readonly action: "resetOrder" };
-type ImportPayload = LibrarySnapshot & { readonly results: readonly LibraryImportResult[] };
+type FolderAction =
+  | { readonly action: "createFolder"; readonly name: string }
+  | { readonly action: "renameFolder"; readonly folderId: string; readonly name: string }
+  | { readonly action: "moveToFolder"; readonly folderId: string | null; readonly ids: readonly string[] }
+  | { readonly action: "deleteEmptyFolder"; readonly folderId: string };
+type ImportPayload = LibrarySnapshot & { readonly results: readonly LibraryImportResult[]; readonly importedFolderId?: string };
 const FALLBACK_LIMITS = { maxFiles: 50, maxBytesPerFile: 2_097_152, maxTotalBytes: 33_554_432 };
 const STATUS: Readonly<Record<string, string>> = { ready: "待生成", incomplete: "导入未完成", running: "生成中", pausing: "正在暂停", paused: "已暂停", blocked: "需要处理", stopped: "已停止", completed: "本批完成", archived: "旧版回收站", deleting: "后台删除中" };
 // Shared across session remounts so an old unregister cannot remove an explicitly reimported entry.
@@ -43,11 +51,6 @@ export function libraryImportPreviewOrder<T extends Pick<LibraryInputFile, "file
 /** A book keeps its catalogue number even when other books are hidden or deleted. */
 export function libraryBookNumber(book: Pick<LibraryBook, "sequence">): string | undefined {
   return book.sequence !== undefined && Number.isSafeInteger(book.sequence) && book.sequence > 0 ? String(book.sequence).padStart(3, "0") : undefined;
-}
-
-export function searchLibraryBooks(books: readonly LibraryBook[], query: string): readonly LibraryBook[] {
-  const needle = query.trim().toLocaleLowerCase();
-  return books.filter(book => book.title.toLocaleLowerCase().includes(needle));
 }
 
 /** Register every successful import without navigating away from the multi-book results. */
@@ -170,6 +173,14 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
   const [hiddenBookIds, setHiddenBookIds] = useState<readonly string[]>([]);
   const [manageError, setManageError] = useState<string>();
   const [manageNotice, setManageNotice] = useState<string>();
+  const [importDestination, setImportDestination] = useState("new");
+  const [importFolderName, setImportFolderName] = useState("");
+  const [lastImportFolder, setLastImportFolder] = useState<string>();
+  const [expandedFolder, setExpandedFolder] = useState<{ id: string; revision: number; scroll?: boolean }>();
+  const [moveDestination, setMoveDestination] = useState("");
+  const [folderEditor, setFolderEditor] = useState<{ readonly id?: string; readonly name: string }>();
+  const [folderFeedback, setFolderFeedback] = useState<{ readonly text: string; readonly error?: true }>();
+  const folderPending = useRef(false);
   const [selected, setSelected] = useState<readonly SelectedFile[]>([]);
   const [results, setResults] = useState<readonly LibraryImportResult[]>([]);
   const [registrations, setRegistrations] = useState<Readonly<Record<string, Registration>>>({});
@@ -254,7 +265,8 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
     const signature = JSON.stringify([
       snapshot.libraryPath,
       sidebarOrderRetry,
-      books.map(book => [book.id, book.absolutePath, registrations[book.id]?.workspaceId])
+      snapshot.folders?.map(folder => [folder.id, folder.name]),
+      books.map(book => [book.id, book.folderId, book.absolutePath, book.sequence, registrations[book.id]?.workspaceId])
     ]);
     if (signature === sidebarOrderAttempt.current) return;
     sidebarOrderAttempt.current = signature;
@@ -289,6 +301,7 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
     setError(undefined);
     setNotice(undefined);
     setResults([]);
+    setLastImportFolder(undefined);
     if (files.length > limits.maxFiles) { setError(`一次最多导入 ${String(limits.maxFiles)} 本，请分批选择。`); return; }
     if (files.reduce((sum, file) => sum + file.size, 0) > limits.maxTotalBytes) { setError("本批文件超过 32 MB，请分批导入。"); return; }
     setPending("read");
@@ -308,6 +321,13 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
       } catch (reason: unknown) { failures.push({ filename: file.name, status: "failed", error: reason instanceof Error ? reason.message : "无法读取文本，请另存为 UTF-8 后重试。" }); }
     }
     if (!mounted.current) return;
+    const retryingFiles = lastImportFolder !== undefined && selected.length > 0
+      && files.some(file => selected.some(failed => failed.filename === file.name))
+      && files.every(file => results.some(result => result.filename === file.name));
+    if (!retryingFiles) {
+      setImportDestination("new");
+      setImportFolderName("");
+    }
     setSelected(libraryImportPreviewOrder(next));
     setResults(failures);
     setPending(undefined);
@@ -348,12 +368,21 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
     registrationLane.current = register.catch(() => {});
     await register;
   }
+  const revealFolder = (id: string, scroll = false): void => {
+    setBookSearch("");
+    setExpandedFolder(current => ({ id, revision: (current?.revision ?? 0) + 1, scroll }));
+  };
   const importFiles = async (): Promise<void> => {
-    if (pending !== undefined || selected.length === 0) return;
+    if (pending !== undefined || selected.length === 0 || folderPending.current) return;
+    folderPending.current = true;
     revision.current += 1;
     setPending("import"); setError(undefined); setNotice(undefined);
     try {
-      const value = await responseJson<ImportPayload>(await fetch(endpoint("library", sessionId), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ files: selected.map(({ filename, text, title }) => ({ filename, text, ...(title?.trim() ? { title: title.trim() } : {}) })) }) }));
+      const destination = importDestination === "new" ? { folderName: importFolderName.trim() || undefined } : { folderId: importDestination };
+      const files = selected.map(({ filename, text, title }) => ({ filename, text, ...(title?.trim() ? { title: title.trim() } : {}) }));
+      const value = await responseJson<ImportPayload>(await fetch(endpoint("library", sessionId), {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...destination, files })
+      }));
       if (!mounted.current) return;
       setSnapshot(value);
       setResults(value.results);
@@ -361,8 +390,15 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
       setSelected(current => current.filter(file => failedNames.has(file.filename)));
       setPending("register");
       const importedBooks = value.results.flatMap(result => result.status !== "failed" && result.book !== undefined ? [result.book] : []);
-      const newBooks = value.results.flatMap(result => result.status === "imported" && result.book !== undefined ? [result.book] : []);
-      setCheckedBooks(importedBooks.map(book => book.id));
+      const newBooks = value.results.flatMap(result => result.status === "imported" && !result.resumed && result.book !== undefined ? [result.book] : []);
+      setCheckedBooks([...new Set(newBooks.map(book => book.id))]);
+      const destinationFolder = value.folders?.find(folder => folder.id === value.importedFolderId);
+      setLastImportFolder(destinationFolder?.id);
+      if (destinationFolder !== undefined) {
+        revealFolder(destinationFolder.id);
+        // Files kept in the retry list belong to the same import, including a partially successful one.
+        if (failedNames.size > 0) setImportDestination(destinationFolder.id);
+      }
       setGenerationScope("selected");
       // Explicitly importing a deleted book again authorizes a new native project entry.
       for (const book of importedBooks) {
@@ -372,14 +408,49 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
       setHiddenBookIds(current => current.filter(id => !importedBooks.some(book => book.id === id)));
       await registerBooks(importedBooks);
       if (!mounted.current) return;
-      const imported = value.results.filter(result => result.status === "imported").length;
+      const resumed = value.results.filter(result => result.resumed).length;
       const existing = value.results.filter(result => result.status === "existing").length;
       const failed = value.results.filter(result => result.status === "failed").length;
       const numbers = newBooks.map(libraryBookNumber).filter((number): number is string => number !== undefined);
-      setNotice(`新建 ${String(imported)} 本，已有 ${String(existing)} 本${failed > 0 ? `，失败 ${String(failed)} 本` : ""}。${numbers.length === 0 ? "" : `本批新建书号 ${numbers.join("、")}。`}`);
+      const destinationText = destinationFolder === undefined ? "" : `本批文件夹「${destinationFolder.name}」。`;
+      setNotice(`新建 ${String(newBooks.length)} 本，已有 ${String(existing)} 本${resumed > 0 ? `，补全旧项目 ${String(resumed)} 本（保留原文件夹）` : ""}${failed > 0 ? `，失败 ${String(failed)} 本` : ""}。${destinationText}${numbers.length === 0 ? "" : `本批新建书号 ${numbers.join("、")}。`}${existing > 0 ? "重复书保留在原文件夹。" : ""}`);
       onImported();
     } catch (reason: unknown) { if (mounted.current) setError(reason instanceof Error ? reason.message : String(reason)); }
-    finally { revision.current += 1; if (mounted.current) { setPending(undefined); refreshing(); } }
+    finally { folderPending.current = false; revision.current += 1; if (mounted.current) { setPending(undefined); refreshing(); } }
+  };
+  const saveFolder = async (action: FolderAction): Promise<void> => {
+    if (pending !== undefined || folderPending.current) return;
+    folderPending.current = true;
+    revision.current += 1;
+    setPending("folder"); setFolderFeedback(undefined);
+    try {
+      const value = await responseJson<LibrarySnapshot & { createdFolderId?: string }>(await fetch(endpoint("library", sessionId), {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(action)
+      }));
+      if (!mounted.current) return;
+      setSnapshot(value);
+      setFolderEditor(undefined);
+      if (action.action === "moveToFolder") {
+        const name = value.folders?.find(folder => folder.id === action.folderId)?.name ?? UNGROUPED_LIBRARY_LABEL;
+        revealFolder(action.folderId ?? "ungrouped");
+        setMoveDestination("");
+        setFolderFeedback({ text: `已将所选 ${String(action.ids.length)} 本书移至「${name}」。` });
+      } else if (action.action === "createFolder" && value.createdFolderId !== undefined) {
+        revealFolder(value.createdFolderId);
+        setMoveDestination(value.createdFolderId);
+        setFolderFeedback({ text: `已创建「${action.name}」。` });
+      } else if (action.action === "renameFolder") {
+        setFolderFeedback({ text: `文件夹已改名为「${action.name}」。` });
+      } else if (action.action === "deleteEmptyFolder") {
+        setFolderFeedback({ text: "已删除空文件夹。" });
+      }
+    } catch (reason: unknown) {
+      if (mounted.current) setFolderFeedback({ text: reason instanceof Error ? reason.message : "文件夹保存失败，请重试。", error: true });
+    } finally {
+      folderPending.current = false;
+      revision.current += 1;
+      if (mounted.current) { setPending(undefined); refreshing(); }
+    }
   };
   const saveBookOrder = async (action: OrderAction): Promise<void> => {
     if (!arranging || pending !== undefined || orderPending.current) return;
@@ -494,7 +565,10 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
         const blob = await response.blob();
         if (!mounted.current) return;
         const url = URL.createObjectURL(blob);
-        const link = document.createElement("a"); link.href = url; link.download = "小说正文_TXT合集.zip";
+        const link = document.createElement("a");
+        link.href = url;
+        const encodedName = response.headers.get("content-disposition")?.match(/filename\*=UTF-8''([^;]+)/iu)?.[1];
+        link.download = encodedName === undefined ? "小说正文_TXT合集.zip" : decodeURIComponent(encodedName);
         document.body.appendChild(link); link.click(); link.remove(); setTimeout(() => { URL.revokeObjectURL(url); }, 60_000);
         setManageNotice("TXT合集已交给 Harness 下载。每本书一个ZIP，里面每章一个TXT；未完结和跳过的书请查看ZIP内的导出说明。原稿保留。");
       } else {
@@ -546,6 +620,10 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
   const hiddenFilenames = new Set([...(snapshot?.books ?? []), ...(snapshot?.archivedBooks ?? [])].filter(book => hiddenIds.has(book.id)).map(book => book.filename));
   const visibleResults = results.filter(result => !hiddenFilenames.has(result.filename) && (result.book === undefined || !hiddenIds.has(result.book.id)));
   const visibleTaskBooks = task?.books.filter(book => !hiddenIds.has(book.id)) ?? [];
+  const folders = snapshot?.folders ?? [];
+  const occupiedFolderIds = new Set([...(snapshot?.books ?? []), ...(snapshot?.archivedBooks ?? []), ...(snapshot?.deletingBooks ?? [])]
+    .flatMap(book => book.folderId === undefined ? [] : [book.folderId]));
+  const validImportDestination = importDestination === "new" || folders.some(folder => folder.id === importDestination);
   const busy = pending !== undefined;
   const queueControls = libraryQueueControls(task, sessionId);
   const differentOwner = queueControls.differentOwner;
@@ -553,6 +631,9 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
   const doneBooks = visibleTaskBooks.filter(book => book.status === "completed" || book.status === "skipped").length;
   const controlsForBook = (book: LibraryBook) => libraryBookControls(book, visibleTaskBooks.find(item => item.id === book.id), task?.status);
   const normalSelectedIds = visibleSelectedIds.filter(id => visibleBooks.some(book => book.id === id));
+  const canMoveSelected = normalSelectedIds.length > 0 && normalSelectedIds.length === visibleSelectedIds.length
+    && (moveDestination === "ungrouped" || folders.some(folder => folder.id === moveDestination))
+    && visibleBooks.some(book => normalSelectedIds.includes(book.id) && (book.folderId ?? "ungrouped") !== moveDestination);
   const startSelection = libraryStartSelection(visibleBooks, normalSelectedIds, generationScope, task);
   const currentOwner = task === undefined || task === null || !differentOwner;
   const controlsAllowed = task !== undefined && task !== null && currentOwner;
@@ -569,12 +650,13 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
   const selectedOutsideSearch = normalSelectedIds.filter(id => !searchedBooks.some(book => book.id === id)).length;
   const generationPrefix = generationScope === "all" ? "全部" : "所选";
   const startLabel = `${generationPrefix} ${String(startSelection.ids.length)} 本${generationCount === "all" ? "写至完本" : `各新增 ${String(generationCount)} 章`}`;
-  const renderBook = (book: LibraryBook, index: number) => {
+  const renderBook = (book: LibraryBook, index: number, siblings: readonly LibraryBook[]) => {
     const controls = controlsForBook(book);
     const reservation = visibleTaskBooks.find(item => item.id === book.id);
     const number = libraryBookNumber(book);
-    const previous = visibleBooks[index - 1];
-    const next = visibleBooks[index + 1];
+    const previous = siblings[index - 1];
+    const next = siblings[index + 1];
+    const canDropHere = (id: string | undefined): id is string => !busy && id !== undefined && id !== book.id && siblings.some(sibling => sibling.id === id);
     const moveNear = (targetId: string, position: BookPlacement) => {
       void saveBookOrder({ action: "move", id: book.id, targetId, position });
     };
@@ -582,11 +664,12 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
       key={book.id}
       role="listitem"
       className="book-library-book"
+      data-book-id={book.id}
       data-selected={checkedBooks.includes(book.id) ? "true" : "false"}
       data-state={reservation?.status ?? book.status}
       data-drop-position={dropTarget?.id === book.id ? dropTarget.position : undefined}
       onDragOver={arranging ? event => {
-        if (busy || draggedBookId.current === undefined || draggedBookId.current === book.id) return;
+        if (!canDropHere(draggedBookId.current)) return;
         event.preventDefault();
         event.dataTransfer.dropEffect = "move";
         const position = positionOverBook(event);
@@ -598,10 +681,10 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
       } : undefined}
       onDrop={arranging ? event => {
         const id = draggedBookId.current;
-        if (id === undefined) return;
-        event.preventDefault();
         clearBookDrag();
-        if (id !== book.id) void saveBookOrder({ action: "move", id, targetId: book.id, position: positionOverBook(event) });
+        if (!canDropHere(id)) return;
+        event.preventDefault();
+        void saveBookOrder({ action: "move", id, targetId: book.id, position: positionOverBook(event) });
       } : undefined}
     >
       {!snapshot?.isBookProject && (arranging
@@ -626,9 +709,26 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
       {registrations[book.id]?.error !== undefined && <div className="book-library-error">文件已保存，Harness 项目登记未完成：{registrations[book.id]?.error}<button type="button" disabled={busy || !canOpenLibraryBook(book)} onClick={() => { void retryRegister(book); }}>重试登记项目</button></div>}
     </article>;
   };
+  const folderEditorForm = folderEditor === undefined || arranging ? undefined : <form className="book-library-folder-editor" onSubmit={event => {
+      event.preventDefault();
+      const name = folderEditor.name.trim();
+      if (name === "") return;
+      void saveFolder(folderEditor.id === undefined ? { action: "createFolder", name } : { action: "renameFolder", folderId: folderEditor.id, name });
+    }}>
+      <label>文件夹名称<input aria-label="文件夹名称" autoFocus value={folderEditor.name} disabled={busy} onChange={event => { setFolderEditor({ ...folderEditor, name: event.target.value }); }} /></label>
+      <button type="submit" disabled={busy || folderEditor.name.trim() === ""}>{folderEditor.id === undefined ? "创建文件夹" : "保存名称"}</button>
+      <button type="button" disabled={busy} onClick={() => { setFolderEditor(undefined); setFolderFeedback(undefined); }}>取消</button>
+      {folderFeedback?.error && <span className="book-library-error" role="alert">{folderFeedback.text}</span>}
+    </form>;
   return <section className="book-library-panel" aria-label="小说书库">
     <style>{libraryStyles}</style>
-    <header className="book-library-heading"><h2>{snapshot?.isBookProject ? "当前书项目" : "小说书库"}</h2><button type="button" disabled={busy} onClick={refreshing}>刷新</button></header>
+    <header className="book-library-heading"><h2>{snapshot?.isBookProject ? "当前书项目" : "小说书库"}</h2>
+      {snapshot !== undefined && !snapshot.isBookProject && folders.length > 0 && <select className="book-library-folder-jump" aria-label="跳到文件夹" value="" onChange={event => { if (event.target.value !== "") revealFolder(event.target.value, true); }}>
+        <option value="">跳到文件夹…</option>
+        {[...folders].reverse().map(folder => <option key={folder.id} value={folder.id}>{folder.name}</option>)}
+        {visibleBooks.some(book => book.folderId === undefined) && <option value="ungrouped">{UNGROUPED_LIBRARY_LABEL}</option>}
+      </select>}
+      <button type="button" disabled={busy} onClick={refreshing}>刷新</button></header>
     {(error !== undefined || loadError !== undefined) && <p className="book-library-error" role="alert">{error ?? loadError}</p>}
     {snapshot === undefined && loadError === undefined && <p className="book-library-note">正在读取书项目…</p>}
     {snapshot?.isBookProject ? <>
@@ -637,12 +737,27 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
     </> : <>
       <p className="book-library-note">一次选择多份“最终输出”，每个文件创建一本小说、一个独立项目。</p>
       <label className="book-library-upload"><input type="file" accept=".txt,.md,text/plain,text/markdown" multiple disabled={busy} aria-label="批量选择最终输出文件" onChange={event => { void chooseFiles(event); }} /><span>{pending === "read" ? "正在读取…" : "批量选择 TXT / Markdown"}</span><small>可一次导入 10 本，每次最多 {limits.maxFiles} 本</small></label>
-      {selected.length > 0 && <div className="book-library-selection"><strong>待导入 {selected.length} 本</strong><p className="book-library-note">本批按文件名顺序导入，数字按 1、2、10 排列；新书接在已有书之后。</p><ul>{selected.map(file => <li key={file.key}><span title={file.filename}>{file.filename}</span><input value={file.title ?? ""} maxLength={120} placeholder="书名（留空自动识别）" aria-label={`${file.filename} 书名`} disabled={busy} onChange={event => { const title = event.target.value; setSelected(current => current.map(item => item.key === file.key ? { ...item, title } : item)); }} /><button type="button" disabled={busy} aria-label={`移除 ${file.filename}`} onClick={() => { setSelected(current => current.filter(item => item.key !== file.key)); }}>移除</button></li>)}</ul><button className="book-library-primary" type="button" disabled={busy} onClick={() => { void importFiles(); }}>{pending === "import" ? "正在拆解各本小说…" : pending === "register" ? "正在添加 Harness 项目…" : `导入并创建 ${String(selected.length)} 本小说`}</button></div>}
+      {selected.length > 0 && <div className="book-library-selection">
+        <strong>待导入 {selected.length} 本</strong>
+        <div className="book-library-folder-controls">
+          <label>导入到文件夹<select aria-label="导入到文件夹" disabled={busy} value={importDestination} onChange={event => { setImportDestination(event.target.value); }}>
+            <option value="new">新批次（自动新建）</option>
+            {folders.map(folder => <option key={folder.id} value={folder.id}>{folder.name}</option>)}
+          </select></label>
+          {importDestination === "new" && <label>本批文件夹名称<input aria-label="本批文件夹名称" placeholder="留空自动命名，如第一批、第二批" value={importFolderName} disabled={busy} onChange={event => { setImportFolderName(event.target.value); }} /></label>}
+        </div>
+        <p className="book-library-note">每次导入默认建一个文件夹。本批按文件名中的数字依次排列。</p>
+        <ul>{selected.map(file => <li key={file.key}><span title={file.filename}>{file.filename}</span><input value={file.title ?? ""} maxLength={120} placeholder="书名（留空自动识别）" aria-label={`${file.filename} 书名`} disabled={busy} onChange={event => { const title = event.target.value; setSelected(current => current.map(item => item.key === file.key ? { ...item, title } : item)); }} /><button type="button" disabled={busy} aria-label={`移除 ${file.filename}`} onClick={() => { setSelected(current => current.filter(item => item.key !== file.key)); }}>移除</button></li>)}</ul>
+        <button className="book-library-primary" type="button" disabled={busy || !validImportDestination} onClick={() => { void importFiles(); }}>{pending === "import" ? "正在拆解各本小说…" : pending === "register" ? "正在添加 Harness 项目…" : `导入并创建 ${String(selected.length)} 本小说`}</button>
+        {!validImportDestination && <p className="book-library-error" role="alert">所选文件夹已移除，请重新选择导入位置。</p>}
+      </div>}
     </>}
-    {notice !== undefined && <p className="book-library-notice" role="status">{notice}</p>}
+    {notice !== undefined && <div className="book-library-notice" role="status">{notice}
+      {lastImportFolder !== undefined && folders.some(folder => folder.id === lastImportFolder) && <button type="button" onClick={() => { revealFolder(lastImportFolder, true); }}>查看本批文件夹</button>}
+    </div>}
     {visibleResults.some(result => result.status === "failed") && <details className="book-library-results" open><summary>导入问题 · {visibleResults.filter(result => result.status === "failed").length} 项</summary><ul>{visibleResults.filter(result => result.status === "failed").map((result, index) => <li key={`${result.filename}:${String(index)}`}><strong>{result.filename}</strong><span>{result.error}</span></li>)}</ul></details>}
     {snapshot !== undefined && !snapshot.isBookProject && <section className="book-library-batch" aria-label="书库批量生成">
-      <div className="book-library-batch-heading"><div><h3>{arranging ? "调整书库顺序" : "选择书籍与生成"}</h3><p className="book-library-note">{arranging ? "拖动或使用上移、下移，每次移动自动保存。" : `${snapshot.orderCustomized === true ? "手动顺序" : "导入顺序"} · 新书依次接在末尾`}</p></div>
+      <div className="book-library-batch-heading"><div><h3>{arranging ? "调整书库顺序" : "选择书籍与生成"}</h3><p className="book-library-note">{arranging ? "在同一文件夹内拖动，或使用上移、下移。每次调整自动保存。" : `文件夹按创建先后排列，夹内按${snapshot.orderCustomized === true ? "手动顺序" : "导入顺序"}显示。`}</p></div>
         {!arranging && <strong className="book-library-selected-count" aria-live="polite">已选 {visibleSelectedIds.length} 本</strong>}
       </div>
       {!arranging && <div className="book-library-selection-dock">
@@ -675,20 +790,38 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
         {(activeOtherOwner || selectionNeedsOwner) && navigation.openSession !== undefined && <button type="button" disabled={busy} onClick={() => { void openQueueOwner(); }}>回到书库任务会话</button>}
         <div aria-live="polite">{generationNotice !== undefined && <p className="book-library-notice" role="status">{generationNotice}</p>}{(generationError !== undefined || queueError !== undefined) && <p className="book-library-error" role="alert">{generationError ?? queueError}</p>}</div>
       </div>}
-      {visibleBooks.length > 0 && <div className="book-library-order-toolbar">
-        <button type="button" disabled={busy || (!arranging && visibleBooks.length < 2 && snapshot.orderCustomized !== true)} onClick={() => {
-          if (!arranging) setBookSearch("");
-          setOrderFeedback(undefined);
-          clearBookDrag();
-          setArranging(!arranging);
-        }}>{arranging ? "完成整理" : "整理顺序"}</button>
-        {arranging && snapshot.orderCustomized === true && <button type="button" disabled={busy} onClick={() => { void saveBookOrder({ action: "resetOrder" }); }}>恢复导入顺序</button>}
-        {pending === "order" && <span role="status">正在保存顺序…</span>}
-        {orderFeedback !== undefined && <span className={orderFeedback.error ? "book-library-error" : undefined} role={orderFeedback.error ? "alert" : "status"}>{orderFeedback.text}</span>}
-        {sidebarOrderError && <><span role="status">左侧工作区顺序未同步。</span><button type="button" disabled={busy} onClick={() => { setSidebarOrderRetry(current => current + 1); }}>重试同步</button></>}
+      <div className="book-library-order-toolbar">
+        {!arranging && <button type="button" disabled={busy} onClick={() => { setFolderEditor({ name: "" }); setFolderFeedback(undefined); }}>新建文件夹</button>}
+        {visibleBooks.length > 0 && <>
+          <button type="button" disabled={busy || (!arranging && visibleBooks.length < 2 && snapshot.orderCustomized !== true)} onClick={() => {
+            if (!arranging) { setBookSearch(""); setFolderEditor(undefined); }
+            setOrderFeedback(undefined);
+            clearBookDrag();
+            setArranging(!arranging);
+          }}>{arranging ? "完成整理" : "整理顺序"}</button>
+          {arranging && snapshot.orderCustomized === true && <button type="button" disabled={busy} onClick={() => { void saveBookOrder({ action: "resetOrder" }); }}>恢复导入顺序</button>}
+          {pending === "order" && <span role="status">正在保存顺序…</span>}
+          {orderFeedback !== undefined && <span className={orderFeedback.error ? "book-library-error" : undefined} role={orderFeedback.error ? "alert" : "status"}>{orderFeedback.text}</span>}
+          {sidebarOrderError && <><span role="status">左侧工作区顺序未同步。</span><button type="button" disabled={busy} onClick={() => { setSidebarOrderRetry(current => current + 1); }}>重试同步</button></>}
+        </>}
+      </div>
+      {folderEditor?.id === undefined && folderEditorForm}
+      {!arranging && normalSelectedIds.length > 0 && <div className="book-library-folder-controls">
+        <label>将所选书移至<select aria-label="将所选书移至" disabled={busy} value={moveDestination} onChange={event => { setMoveDestination(event.target.value); }}>
+          <option value="">选择目标文件夹</option>
+          <option value="ungrouped">{UNGROUPED_LIBRARY_LABEL}</option>
+          {folders.map(folder => <option key={folder.id} value={folder.id}>{folder.name}</option>)}
+        </select></label>
+        <button type="button" disabled={busy || !canMoveSelected} onClick={() => { void saveFolder({ action: "moveToFolder", folderId: moveDestination === "ungrouped" ? null : moveDestination, ids: normalSelectedIds }); }}>移动所选书</button>
       </div>}
-      <div className="book-library-books" role="list" aria-label="小说项目列表" data-arranging={arranging || undefined}>{(arranging ? visibleBooks : searchedBooks).map(renderBook)}</div>
-      {searchedBooks.length === 0 && <p className="book-library-empty">{visibleBooks.length === 0 ? "这里还没有书项目。批量导入后，每本书会出现在这里和 Harness 工作区列表中。" : "没有匹配的书名。清空搜索可查看全部书籍。"}</p>}
+      {folderFeedback !== undefined && (!folderFeedback.error || folderEditor === undefined) && <p role={folderFeedback.error ? "alert" : "status"} className={folderFeedback.error ? "book-library-error" : "book-library-notice"}>{folderFeedback.text}</p>}
+      <LibraryFolderList books={visibleBooks} folders={folders} occupiedFolderIds={occupiedFolderIds} checkedIds={visibleSelectedIds} query={bookSearch} arranging={arranging} busy={busy}
+        expandedFolder={expandedFolder} renderBook={renderBook}
+        renameEditor={folderEditor?.id === undefined ? undefined : { id: folderEditor.id, content: folderEditorForm }}
+        onSelect={ids => { setCheckedBooks(ids); setGenerationScope("selected"); }}
+        onRename={(id, name) => { setFolderEditor({ id, name }); setFolderFeedback(undefined); }}
+        onDeleteEmpty={folderId => { void saveFolder({ action: "deleteEmptyFolder", folderId }); }} />
+      {searchedBooks.length === 0 && (bookSearch.trim() !== "" || folders.length === 0) && <p className="book-library-empty">{visibleBooks.length === 0 ? "这里还没有书项目。批量导入后，每本书会出现在这里和 Harness 工作区列表中。" : "没有匹配的书名。清空搜索可查看全部书籍。"}</p>}
       {task !== undefined && task !== null && visibleTaskBooks.length > 0 && <details className="book-library-queue" data-status={task.status} open={task.status === "blocked"}>
         <summary><strong>{STATUS[task.status] ?? task.status}</strong> · 本批 {doneBooks} / {visibleTaskBooks.length} 本完成{failedBooks > 0 ? ` · ${String(failedBooks)} 本待处理` : ""} · 查看本批进度</summary>
         <p className="book-library-note">本批并发：{task.concurrency === "all" ? "全部项目" : task.concurrency ?? 1} · 生成中 {visibleTaskBooks.filter(book => book.status === "running").length} 本 · 单独暂停 {visibleTaskBooks.filter(book => book.status === "paused" || book.status === "pausing").length} 本</p>

@@ -34,7 +34,7 @@ const selectionAccepted: Readonly<Record<string, number>> = { SMOKEBOOK13: 10, S
 const baseChapters = 152;
 const selectedChapters = 15;
 const totalAcceptedChapters = baseChapters + selectedChapters;
-const totalFor = (key: string): number => orderMode && orderKeys.includes(key as typeof orderKeys[number]) ? 1
+const totalFor = (key: string): number => orderMode && (key === keys[8] || orderKeys.includes(key as typeof orderKeys[number])) ? 1
   : process.env.LIBRARY_MODEL_ONLY === "1" && key === keys[1] ? 2
   : process.env.LIBRARY_MODEL_ONLY === "1" && key === keys[2] ? 1
   : selectionTotals[key] ?? (keys.includes(key) && keys.indexOf(key) < 2 ? 32 : 11);
@@ -357,7 +357,8 @@ async function main(): Promise<void> {
     }
     model = await startModel();
     const env = { ...process.env, COREPACK_ENABLE_PROJECT_SPEC: "0", DSH_HOME: home, DSH_AGENTS_HOME: join(temporary, "agents"), DSH_TELEMETRY_DISABLED: "1", DEEPSEEK_API_KEY: "library-local-fixture", DEEPSEEK_BASE_URL: model.baseURL };
-    command(process.execPath, [bin, "plugin", "--profile", "web", "add", tarball], env);
+    const previousTarball = orderMode ? process.env.SERIAL_PREVIOUS_PLUGIN_TARBALL : undefined;
+    command(process.execPath, [bin, "plugin", "--profile", "web", "add", previousTarball === undefined ? tarball : resolve(previousTarball)], env);
     await isolateFirstUseWorkspace(home, join(temporary, "documents"));
     const patch = join(home, "profiles/web/cordis.patch.yml"); await writeFile(patch, `${await readFile(patch, "utf8")}\n- id: permission\n  config:\n    defaultPreset: danger-full-access\n`);
     const origin = `http://127.0.0.1:${String(await freePort())}`;
@@ -378,19 +379,7 @@ async function main(): Promise<void> {
     browser = await chromium.launch({ channel: process.env.DSH_SMOKE_BROWSER_CHANNEL ?? "chrome", headless: true });
     const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } }); page.on("pageerror", error => pageErrors.push(error.message));
     const registered = new Map<string, string>(); const registrations: Promise<void>[] = [];
-    const renameConflicts = new Map<string, number>();
     const observeRegistration = (response: BrowserResponse): void => {
-      if (orderMode && response.url().endsWith("/api/workspace/rename")) {
-        registrations.push((async () => {
-          const input = response.request().postDataJSON() as { readonly payload: { readonly args: { readonly request: { readonly workspaceId: string } } } };
-          const reply = await response.json() as { readonly result: { readonly ok: boolean; readonly error?: { readonly code?: string } } };
-          if (!reply.result.ok && reply.result.error?.code === "workspace/name-conflict") {
-            const id = input.payload.args.request.workspaceId;
-            renameConflicts.set(id, (renameConflicts.get(id) ?? 0) + 1);
-          }
-        })());
-        return;
-      }
       if (!response.url().endsWith("/api/workspace/create")) return;
       registrations.push((async () => {
         const input = response.request().postDataJSON() as { readonly payload: { readonly args: { readonly request: { readonly path: string } } } };
@@ -442,7 +431,8 @@ async function main(): Promise<void> {
       const secondSentinel = await createOrderSentinel("无关工作区乙");
       const workspaceRows = (targetPage: Page) => targetPage.locator("[role='treeitem'][data-row-key^='workspace:']");
       const workspaceIds = async (targetPage: Page): Promise<string[]> => workspaceRows(targetPage).evaluateAll(rows => rows.map(row => row.getAttribute("data-row-key")?.slice("workspace:".length) ?? ""));
-      const assertVisibleOrder = async (targetPage: Page, books: readonly LibraryBook[]): Promise<void> => {
+      const assertVisibleOrder = async (targetPage: Page, records: LibrarySnapshot): Promise<void> => {
+        const books = [undefined, ...(records.folders ?? []).map(folder => folder.id)].flatMap(folderId => records.books.filter(book => book.folderId === folderId));
         const numbers = books.map(book => String(book.sequence).padStart(3, "0"));
         const cards = targetPage.getByRole("list", { name: "小说项目列表" }).getByRole("listitem");
         const expectedWorkspaces = await Promise.all(books.map(async book => {
@@ -479,12 +469,16 @@ async function main(): Promise<void> {
         if (await open.isVisible()) await open.click();
         return targetPage;
       };
-      const importOrderBatch = async (targetPage: Page, files: readonly { readonly filename: string; readonly text: string }[], created: number, existing: number, preview?: readonly string[]) => {
+      const importOrderBatch = async (targetPage: Page, files: readonly { readonly filename: string; readonly text: string }[], created: number, existing: number, preview?: readonly string[], target?: { id: string } | { name: string }) => {
         await targetPage.getByLabel("批量选择最终输出文件", { exact: true }).setInputFiles(files.map(file => ({ name: file.filename, mimeType: "text/plain", buffer: Buffer.from(file.text) })));
         const start = targetPage.getByRole("button", { name: `导入并创建 ${String(files.length)} 本小说`, exact: true });
         await start.waitFor({ state: "visible" });
+        if (target !== undefined) {
+          if ("id" in target) await targetPage.getByLabel("导入到文件夹", { exact: true }).selectOption(target.id);
+          else await targetPage.getByLabel("本批文件夹名称", { exact: true }).fill(target.name);
+        }
         if (preview !== undefined) assert.deepEqual(await targetPage.locator(".book-library-selection li > span").allTextContents(), preview);
-        const response = targetPage.waitForResponse(item => item.url().includes("/oh-story/library?") && item.request().method() === "POST", { timeout: 60_000 });
+        const response = targetPage.waitForResponse(item => item.url().includes("/oh-story/library?") && item.request().method() === "POST" && Array.isArray((item.request().postDataJSON() as { files?: unknown }).files), { timeout: 60_000 });
         await start.click();
         const uploaded = await response;
         assert.equal(uploaded.status(), 200);
@@ -492,26 +486,36 @@ async function main(): Promise<void> {
         await Promise.all(registrations);
         return await uploaded.json() as LibrarySnapshot & { readonly results: readonly { readonly status: string; readonly filename: string; readonly book?: LibraryBook }[] };
       };
-      await assertVisibleOrder(page, snapshot.books);
+      await assertVisibleOrder(page, snapshot);
       const sentinelIds = [firstSentinel!, workspace.workspace.workspaceId, secondSentinel];
       await waitFor(async () => (await workspaceIds(page)).filter(id => sentinelIds.includes(id)).length === sentinelIds.length, "library and unrelated native workspaces visible");
       const unrelatedOrder = (await workspaceIds(page)).filter(id => sentinelIds.includes(id));
       const assertUnrelatedOrder = async (targetPage: Page): Promise<void> => {
         assert.deepEqual((await workspaceIds(targetPage)).filter(id => sentinelIds.includes(id)), unrelatedOrder, "Book ordering moved unrelated native workspaces relative to each other");
       };
+      // A previous-version book has real saved prose, chapter titles and ledger data before upgrade.
+      const writingHistory = model.books.get(keys[8]!)!;
+      await queue(origin, sessionId, { action: "start", count: 10, concurrency: "all", ids: [writingHistory.id] });
+      const oldDone = await waitQueue(origin, sessionId, task => task.status === "completed");
+      assert.equal(oldDone.books[0]?.completedChapters, 1);
+      const savedFiles = ["正文/第001章.md", "追踪/公众号标题/第001章.json", "追踪/_tracking-state.json"];
+      const savedDigests = await Promise.all(savedFiles.map(async file => digest(await readFile(join(writingHistory.absolutePath, file)))));
       const oldReceipts = new Map(await Promise.all(keys.map(async key => {
         const book = model!.books.get(key)!;
         return [book.id, await readFile(join(book.absolutePath, "追踪/书项目.json"), "utf8")] as const;
       })));
       await browser.close(); browser = undefined; await stopDshProcess(child); child = undefined;
-      // Only the isolated fixtures are downgraded: old releases had receipts but
-      // no central order ledger. Merely viewing legacy books must stay read-only.
-      await rm(orderFile, { force: true });
+      // Use the previous frozen release when available. The alternative also
+      // covers receipts predating the first numbering ledger.
+      const previousOrderFile = previousTarball === undefined ? undefined : await readFile(orderFile, "utf8");
+      if (previousTarball === undefined) await rm(orderFile, { force: true });
+      else command(process.execPath, [bin, "plugin", "--profile", "web", "add", tarball], env);
       logs.length = 0; child = launch(); tokenURL = await authorizeDsh(origin, logs);
       const legacy = await api<LibrarySnapshot>(origin, "library", sessionId);
       assert.deepEqual(legacy.books.map(book => book.id), oldIds);
       assert.deepEqual(legacy.books.map(book => book.sequence), Array.from({ length: 10 }, (_, index) => index + 1));
-      assert(await absent(orderFile), "A read-only legacy library view unexpectedly wrote a numbering ledger");
+      assert(legacy.books.every(book => book.folderId === undefined));
+      assert.equal(legacy.folders?.length ?? 0, 0);
       // Recreate a legacy registry split, with one book ahead of its library.
       const movedWorkspaceId = registered.get(await realpath(legacy.books[9]!.absolutePath));
       assert(movedWorkspaceId !== undefined);
@@ -519,12 +523,17 @@ async function main(): Promise<void> {
       assert(scrambled.workspaceIds.indexOf(movedWorkspaceId) < scrambled.workspaceIds.indexOf(workspace.workspace.workspaceId));
       browser = await chromium.launch({ channel: process.env.DSH_SMOKE_BROWSER_CHANNEL ?? "chrome", headless: true });
       const importPage = await openOrderPage(browser, tokenURL);
-      await assertVisibleOrder(importPage, legacy.books);
+      await assertVisibleOrder(importPage, legacy);
       await assertUnrelatedOrder(importPage);
       await api<LibrarySnapshot>(origin, "library", sessionId);
-      await assertVisibleOrder(importPage, legacy.books);
+      await assertVisibleOrder(importPage, legacy);
       await assertUnrelatedOrder(importPage);
-      assert(await absent(orderFile), "Opening the old library created an unnecessary numbering ledger");
+      if (previousOrderFile === undefined) assert(await absent(orderFile), "Opening an old library wrote a numbering ledger");
+      else assert.equal(await readFile(orderFile, "utf8"), previousOrderFile, "Opening a serial.10 library rewrote its numbering ledger");
+      const folderSection = (targetPage: Page, name: string) => targetPage.getByRole("region", { name: `文件夹 ${name}`, exact: true });
+      const folderNumbers = async (targetPage: Page, name: string): Promise<string[]> =>
+        await folderSection(targetPage, name).getByRole("listitem").locator(".book-library-book-number").allTextContents();
+      assert.equal((await folderNumbers(importPage, "未分组")).length, 10);
       const uploads = [
         { filename: "10_追加十.txt", text: sourceFor(orderKeys[2]) },
         { filename: "2_追加二.txt", text: sourceFor(orderKeys[1]) },
@@ -539,32 +548,34 @@ async function main(): Promise<void> {
         assert(book !== undefined); assert.equal(book.sequence, index + 11); assert.equal(book.title, titleFor(key));
         model.books.set(key, book);
       }
-      await assertVisibleOrder(importPage, imported.books);
+      await assertVisibleOrder(importPage, imported);
+      const firstFolder = imported.folders?.find(folder => folder.name === "第一批");
+      assert(firstFolder !== undefined);
+      assert.deepEqual(await folderNumbers(importPage, firstFolder.name), ["011", "012", "013"]);
+      assert.equal((await folderNumbers(importPage, "未分组")).length, 10);
       await assertUnrelatedOrder(importPage);
       const duplicateTitle = titleFor(orderKeys[0]);
       const duplicateCards = (targetPage: Page) => targetPage.getByRole("list", { name: "小说项目列表" }).getByRole("listitem")
         .filter({ has: targetPage.getByRole("checkbox", { name: `选择 ${duplicateTitle}`, exact: true }) });
       const duplicateNativeIds = await Promise.all([orderKeys[0], orderKeys[1]].map(async key => registered.get(await realpath(model!.books.get(key)!.absolutePath))!));
-      const assertDuplicateLabels = async (targetPage: Page): Promise<void> => {
+      const assertDuplicateLabels = async (targetPage: Page, name: string): Promise<void> => {
         const cards = duplicateCards(targetPage);
         assert.equal(await cards.count(), 2);
         assert.equal(await cards.getByText(/Harness 项目登记未完成/u).count(), 0, "Same-title books should remain registered without warnings");
         for (const card of await cards.all()) assert(await card.getByRole("button", { name: "打开", exact: true }).isEnabled());
         const originalRow = targetPage.locator(`[role='treeitem'][data-row-key='workspace:${duplicateNativeIds[0]}']`);
-        assert.equal(await originalRow.getByText(duplicateTitle, { exact: true }).count(), 1);
+        await originalRow.getByText(`${name} · 011 · ${duplicateTitle}`, { exact: true }).waitFor({ state: "visible" });
         const numberedRow = targetPage.locator(`[role='treeitem'][data-row-key='workspace:${duplicateNativeIds[1]}']`);
-        await numberedRow.getByText(`${duplicateTitle} · 012`, { exact: true }).waitFor({ state: "visible" });
+        await numberedRow.getByText(`${name} · 012 · ${duplicateTitle}`, { exact: true }).waitFor({ state: "visible" });
       };
-      await assertDuplicateLabels(importPage);
-      const initialConflicts = renameConflicts.get(duplicateNativeIds[1]!) ?? 0;
-      assert.equal(initialConflicts, 1, "The same-title import should resolve a native name conflict using its fixed number");
+      await assertDuplicateLabels(importPage, firstFolder.name);
       const duplicates = await importOrderBatch(importPage, [...uploads].reverse(), 0, 3);
       assert(duplicates.results.every(result => result.status === "existing"));
       const identity = (books: readonly LibraryBook[]) => books.map(book => [book.id, book.sequence] as const);
       assert.deepEqual(identity(duplicates.books), identity(imported.books), "A duplicate import renumbered or moved existing books");
-      await assertVisibleOrder(importPage, duplicates.books);
-      await assertDuplicateLabels(importPage);
-      assert.equal(renameConflicts.get(duplicateNativeIds[1]!) ?? 0, initialConflicts, "Reimport repeated a known native name conflict");
+      await assertVisibleOrder(importPage, duplicates);
+      await assertDuplicateLabels(importPage, firstFolder.name);
+      assert.deepEqual(duplicates.folders, imported.folders, "A duplicates-only import created an empty folder");
       const deleteFromOrderPage = async (book: LibraryBook): Promise<void> => {
         const oldWorkspaceId = registered.get(await realpath(book.absolutePath));
         assert(oldWorkspaceId !== undefined);
@@ -580,10 +591,11 @@ async function main(): Promise<void> {
       await queue(origin, sessionId, { action: "start", count: 10, concurrency: "all", ids: exportBooks.map(book => book.id) });
       const done = await waitQueue(origin, sessionId, task => task.status === "completed");
       assert(done.books.every(book => book.status === "completed" && book.completedChapters === 1));
-      assert.equal(model.answers.length, 2); assert.equal(model.titles.length, 2); assert.equal(model.failures.length, 0, model.failures.join("\n"));
-      await checkNativeChildren(home, model, 2);
+      assert.equal(model.answers.length, 3); assert.equal(model.titles.length, 3); assert.equal(model.failures.length, 0, model.failures.join("\n"));
+      await checkNativeChildren(home, model, 3);
       const exportResponse = await dshFetch(`${origin}/oh-story/library?sessionId=${encodeURIComponent(sessionId)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "export", ids: exportBooks.map(book => book.id) }) });
       assert.equal(exportResponse.status, 200);
+      assert.match(decodeURIComponent(exportResponse.headers.get("content-disposition") ?? ""), /第一批_小说正文_TXT合集\.zip/u);
       const exportBytes = new Uint8Array(await exportResponse.arrayBuffer()); const exported = unzipSync(exportBytes);
       const exportedNames = Object.keys(exported).filter(name => name.endsWith(".zip"));
       assert.equal(exportedNames.length, 2);
@@ -599,29 +611,95 @@ async function main(): Promise<void> {
       await deleteFromOrderPage(deleted);
       const afterDelete = await api<LibrarySnapshot>(origin, "library", sessionId);
       assert.deepEqual(identity(afterDelete.books), beforeDelete.filter(([id]) => id !== deleted.id), "Deleting a book renumbered its neighbors");
-      const next = await importOrderBatch(importPage, [{ filename: "下一本14.txt", text: sourceFor(orderKeys[3]) }], 1, 0);
+      const next = await importOrderBatch(importPage, [{ filename: "下一本14.txt", text: sourceFor(orderKeys[3]) }, uploads[2]!], 1, 1);
+      const secondFolder = next.folders?.find(folder => folder.name === "第二批");
+      assert(secondFolder !== undefined);
+      assert.deepEqual(await folderNumbers(importPage, secondFolder.name), ["014"]);
+      assert.deepEqual(await folderNumbers(importPage, firstFolder.name), ["011", "012", "013"]);
+      assert.equal(await folderSection(importPage, firstFolder.name).getByRole("listitem").getByRole("checkbox", { checked: true }).count(), 0);
+      assert.equal(await folderSection(importPage, secondFolder.name).getByRole("listitem").getByRole("checkbox", { checked: true }).count(), 1);
       const fourteenth = next.books.find(book => book.title === titleFor(orderKeys[3])); assert(fourteenth !== undefined); assert.equal(fourteenth.sequence, 14);
       // Deleting the highest assigned number must not rewind the allocator.
       await deleteFromOrderPage(fourteenth);
-      const fifteenth = await importOrderBatch(importPage, [{ filename: "下一本15.txt", text: sourceFor(orderKeys[4]) }], 1, 0);
+      const fifteenth = await importOrderBatch(importPage, [{ filename: "下一本15.txt", text: sourceFor(orderKeys[4]) }], 1, 0, undefined, { id: secondFolder.id });
+      assert.equal(fifteenth.folders?.length, 2, "Appending to an existing folder created a third batch");
+      assert.equal(fifteenth.books.find(book => book.sequence === 15)?.folderId, secondFolder.id);
       assert.equal(fifteenth.books.find(book => book.title === titleFor(orderKeys[4]))?.sequence, 15, "Deleting the high-water book reused its assigned number");
       await waitFor(async () => !(await api<LibrarySnapshot>(origin, "library", sessionId)).deletingBooks?.some(book => book.id === deleted.id), "deleted old identity cleanup completed before reimport");
       const nextBeforeReimport = (JSON.parse(await readFile(orderFile, "utf8")) as { readonly nextSequence: number }).nextSequence;
-      const reimported = await importOrderBatch(importPage, [{ filename: `${keys[1]!}.txt`, text: sourceFor(keys[1]!) }], 1, 0);
+      const reimported = await importOrderBatch(importPage, [{ filename: `${keys[1]!}.txt`, text: sourceFor(keys[1]!) }], 1, 0, undefined, { name: "回补批次" });
+      assert.equal(reimported.folders?.find(folder => folder.name === "回补批次")?.number, 3);
       assert.equal(reimported.books.find(book => book.id === deleted.id)?.sequence, 2, "Reimporting the same old identity assigned it a different number");
       assert.equal(reimported.books.find(book => book.title === titleFor(orderKeys[4]))?.sequence, 15);
       assert.equal((JSON.parse(await readFile(orderFile, "utf8")) as { readonly nextSequence: number }).nextSequence, nextBeforeReimport, "Reimporting an already numbered identity advanced the allocator");
-      await assertVisibleOrder(importPage, reimported.books);
+      await assertVisibleOrder(importPage, reimported);
+      const refresh = async (): Promise<LibrarySnapshot> => await api<LibrarySnapshot>(origin, "library", sessionId);
+      const action = async (label: string, method: string): Promise<LibrarySnapshot> => {
+        const response = importPage.waitForResponse(reply => reply.url().includes("/oh-story/library?") && reply.request().method() === "POST"
+          && (reply.request().postDataJSON() as { action?: string }).action === method);
+        await importPage.getByRole("button", { name: label, exact: true }).click();
+        const result = await response; assert.equal(result.status(), 200);
+        return await result.json() as LibrarySnapshot;
+      };
+      const renamedFolder = "主线连载";
+      await importPage.getByRole("button", { name: `重命名 ${firstFolder.name}`, exact: true }).click();
+      await importPage.getByLabel("文件夹名称", { exact: true }).fill(renamedFolder);
+      const renamed = await action("保存名称", "renameFolder");
+      assert.equal(renamed.folders?.find(folder => folder.id === firstFolder.id)?.name, renamedFolder);
+      await assertDuplicateLabels(importPage, renamedFolder);
+      await importPage.getByRole("button", { name: "新建文件夹", exact: true }).click();
+      await importPage.getByLabel("文件夹名称", { exact: true }).fill("历史连载");
+      const createdFolder = (await action("创建文件夹", "createFolder")).folders?.find(folder => folder.name === "历史连载");
+      assert(createdFolder !== undefined);
+      await importPage.getByRole("button", { name: "取消选择", exact: true }).click();
+      for (const key of [keys[0]!, keys[8]!]) await folderSection(importPage, "未分组").getByRole("checkbox", { name: `选择 ${titleFor(key)}`, exact: true }).check();
+      await importPage.getByLabel("将所选书移至", { exact: true }).selectOption(createdFolder.id);
+      const grouped = await action("移动所选书", "moveToFolder");
+      await assertVisibleOrder(importPage, grouped);
+      assert.deepEqual(await folderNumbers(importPage, createdFolder.name), ["001", "009"]);
+      for (const book of grouped.books) {
+        const unchanged = reimported.books.find(prior => prior.id === book.id)!;
+        assert.equal(book.absolutePath, unchanged.absolutePath);
+        assert.equal(book.sequence, unchanged.sequence);
+      }
+      await importPage.getByRole("button", { name: "新建文件夹", exact: true }).click();
+      await importPage.getByLabel("文件夹名称", { exact: true }).fill("临时空批");
+      await action("创建文件夹", "createFolder");
+      const emptyRemoved = await action("删除空文件夹 临时空批", "deleteEmptyFolder");
+      assert.deepEqual(emptyRemoved.folders, grouped.folders);
+      assert.equal(await folderSection(importPage, createdFolder.name).getByRole("button", { name: /删除空文件夹/u }).count(), 0);
+      await folderSection(importPage, renamedFolder).getByRole("button", { name: "只选本批", exact: true }).click();
+      assert(await importPage.getByRole("checkbox", { name: `选择文件夹 ${renamedFolder} 中的书`, exact: true }).isChecked());
+      assert.equal(await folderSection(importPage, renamedFolder).getByRole("listitem").getByRole("checkbox", { checked: true }).count(), 3);
+      assert.equal(await importPage.locator("[data-book-id]").getByRole("checkbox", { checked: true }).count(), 3);
+      const downloadPromise = importPage.waitForEvent("download");
+      await importPage.getByRole("button", { name: "批量导出 TXT", exact: true }).click();
+      const folderDownload = await downloadPromise;
+      assert.equal(folderDownload.suggestedFilename(), `${renamedFolder}_小说正文_TXT合集.zip`);
+      const folderExport = join(evidence, "folder-selected-export.zip");
+      await folderDownload.saveAs(folderExport);
+      assert.deepEqual(Object.keys(unzipSync(await readFile(folderExport))).filter(name => name.endsWith(".zip")), exportedNames);
+      const crossGroupExport = await dshFetch(`${origin}/oh-story/library?sessionId=${encodeURIComponent(sessionId)}`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "export", ids: [exportBooks[0]!.id, grouped.books[0]!.id] })
+      });
+      assert.equal(crossGroupExport.status, 200);
+      assert.match(decodeURIComponent(crossGroupExport.headers.get("content-disposition") ?? ""), /filename\*=UTF-8''小说正文_TXT合集\.zip/u);
+      await crossGroupExport.arrayBuffer();
+      await importPage.getByRole("button", { name: `收起 ${renamedFolder}`, exact: true }).click();
+      assert.equal((await folderNumbers(importPage, renamedFolder)).length, 0);
+      await importPage.getByLabel("跳到文件夹", { exact: true }).selectOption(firstFolder.id);
+      await importPage.getByRole("button", { name: `收起 ${renamedFolder}`, exact: true }).waitFor({ state: "visible" });
+      assert.deepEqual(await folderNumbers(importPage, renamedFolder), ["011", "012", "013"]);
       const otherSession = await rpc<{ readonly sessionId: string }>(origin, "session/create", { request: { workspaceId: workspace.workspace.workspaceId, sessionId: crypto.randomUUID() } });
       const oldSessionView = await api<LibrarySnapshot>(origin, "library", otherSession.sessionId);
       await importPage.getByRole("button", { name: "整理顺序", exact: true }).click();
       await importPage.getByRole("button", { name: `上移 ${titleFor(orderKeys[2])}`, exact: true }).click();
-      const moved = [...reimported.books];
-      [moved[11], moved[12]] = [moved[12]!, moved[11]!];
-      await assertVisibleOrder(importPage, moved);
+      await waitFor(async () => (await folderNumbers(importPage, renamedFolder)).join() === "011,013,012", "within-folder up arrow persisted");
+      await assertVisibleOrder(importPage, await refresh());
       const dragTarget = importPage.getByRole("list", { name: "小说项目列表" }).getByRole("listitem").filter({ has: importPage.getByLabel("书籍编号 011", { exact: true }) });
       await importPage.getByRole("button", { name: `拖动 ${titleFor(orderKeys[2])}`, exact: true }).dragTo(dragTarget, { targetPosition: { x: 30, y: 3 } });
-      [moved[10], moved[11]] = [moved[11]!, moved[10]!];
+      await waitFor(async () => (await folderNumbers(importPage, renamedFolder)).join() === "013,011,012", "within-folder drag persisted");
+      const moved = await refresh();
       await assertVisibleOrder(importPage, moved);
       await api<unknown>(origin, "library", otherSession.sessionId, {
         action: "syncSidebarOrder", orderedIds: oldSessionView.books.map(book => book.id), bookPaths: oldSessionView.books.map(book => book.absolutePath)
@@ -629,7 +707,7 @@ async function main(): Promise<void> {
       await assertVisibleOrder(importPage, moved);
       await assertUnrelatedOrder(importPage);
       await importPage.getByRole("button", { name: "完成整理", exact: true }).click();
-      const beforeRestart = identity(moved);
+      const beforeRestart = identity(moved.books);
       for (const key of keys.filter(key => model!.books.get(key)!.id !== deleted.id)) {
         const book: LibraryBook = model.books.get(key)!;
         assert.equal(await readFile(join(book.absolutePath, "追踪/书项目.json"), "utf8"), oldReceipts.get(book.id), "Ordering migration rewrote an old book receipt");
@@ -640,26 +718,50 @@ async function main(): Promise<void> {
       const restored = await api<LibrarySnapshot>(origin, "library", sessionId); assert.deepEqual(identity(restored.books), beforeRestart);
       browser = await chromium.launch({ channel: process.env.DSH_SMOKE_BROWSER_CHANNEL ?? "chrome", headless: true });
       const orderPage = await openOrderPage(browser, tokenURL);
-      await assertVisibleOrder(orderPage, restored.books);
+      await assertVisibleOrder(orderPage, restored);
+      assert.deepEqual(restored.folders, moved.folders);
+      assert.deepEqual(restored.books.map(book => book.folderId ?? null), moved.books.map(book => book.folderId ?? null));
+      assert.deepEqual(await folderNumbers(orderPage, createdFolder.name), ["001", "009"]);
+      assert.equal(restored.books.find(book => book.id === writingHistory.id)?.completedChapters, 1);
+      assert.deepEqual(await Promise.all(savedFiles.map(async file => digest(await readFile(join(writingHistory.absolutePath, file))))), savedDigests);
+      assert.deepEqual(await folderNumbers(orderPage, renamedFolder), ["013", "011", "012"]);
       await assertUnrelatedOrder(orderPage);
-      await assertDuplicateLabels(orderPage);
-      const cards = orderPage.getByRole("list", { name: "小说项目列表" }).getByRole("listitem");
-      for (const [index, book] of restored.books.entries()) assert.equal(await cards.nth(index).getByRole("checkbox", { name: `选择 ${book.title}`, exact: true }).count(), 1);
+      await assertDuplicateLabels(orderPage, renamedFolder);
+      for (const book of restored.books) {
+        const card = orderPage.locator(`[data-book-id="${book.id}"]`);
+        assert.equal(await card.getByRole("checkbox", { name: `选择 ${book.title}`, exact: true }).count(), 1);
+        const id = registered.get(await realpath(book.absolutePath));
+        const name = restored.folders?.find(folder => folder.id === book.folderId)?.name ?? "未分组";
+        const label = `${name} · ${String(book.sequence).padStart(3, "0")} · ${book.title}`;
+        await orderPage.locator(`[role='treeitem'][data-row-key='workspace:${id}']`).getByText(label, { exact: true }).waitFor({ state: "visible" });
+      }
       await orderPage.getByRole("button", { name: "整理顺序", exact: true }).click();
       await orderPage.getByRole("button", { name: `拖动 ${titleFor(orderKeys[2])}`, exact: true }).scrollIntoViewIfNeeded();
       await orderPage.screenshot({ path: join(evidence, "manual-book-order.png"), animations: "disabled" });
       await orderPage.getByRole("button", { name: "恢复导入顺序", exact: true }).click();
-      await assertVisibleOrder(orderPage, reimported.books);
+      await assertVisibleOrder(orderPage, grouped);
       await assertUnrelatedOrder(orderPage);
-      assert.deepEqual(identity((await api<LibrarySnapshot>(origin, "library", sessionId)).books), identity(reimported.books));
+      assert.deepEqual(identity((await api<LibrarySnapshot>(origin, "library", sessionId)).books), identity(grouped.books));
       await orderPage.getByRole("button", { name: "完成整理", exact: true }).click();
       await orderPage.getByRole("list", { name: "小说项目列表" }).scrollIntoViewIfNeeded();
       await orderPage.screenshot({ path: join(evidence, "stable-book-order.png"), animations: "disabled" });
+      await orderPage.getByRole("button", { name: "收起 未分组", exact: true }).click();
+      await folderSection(orderPage, renamedFolder).scrollIntoViewIfNeeded();
+      await orderPage.screenshot({ path: join(evidence, "library-folders.png"), animations: "disabled" });
       assert.equal(pageErrors.length, 0, pageErrors.join("\n"));
       const report = {
-        ok: true, phase: "stable-import-order", dshVersion: version, pluginVersion: pluginMetadata.version, pluginSha256,
+        ok: true, phase: "library-folders-and-order",
+        upgradeFrom: previousTarball ? JSON.parse(command("tar", ["-xOf", resolve(previousTarball), "package/package.json"])).version as string : "legacy-without-ledger",
+        ...(previousTarball ? { upgradeFromSha256: digest(await readFile(resolve(previousTarball))) } : {}),
+        legacyView: "all-10-in-ungrouped-until-owner-files-them",
+        batchImports: "separate-first-and-second-files-with-mixed-duplicates-and-deduplicated-selection",
+        folders: "named-on-import-existing-target-create-empty-rename-move-two-legacy-books",
+        folderControls: "only-select-one-folder-collapse-jump-reopen-delete-empty-folder-browser-download-with-renamed-folder-in-filename",
+        persistence: "names-membership-and-folder-local-manual-order-after-native-and-browser-restart",
+        nativeFolderVisibility: "every-row-shows-its-folder-fixed-number-and-title",
+        dshVersion: version, pluginVersion: pluginMetadata.version, pluginSha256,
         provider: "local-deterministic-text-fixture", realPaidModel: false,
-        legacyBooks: 10, legacyReadOnlyView: "passed-original-title-order-without-ledger-write", migration: "passed-first-import-persists-old-order-before-new-book-allocation",
+        legacyBooks: 10, legacyReadOnlyView: "passed-original-order-without-ledger-write", migration: "passed-original-sequence-preserved",
         scrambledImportFilenames: uploads.map(file => file.filename), appendSequences: [11, 12, 13], naturalBatchOrder: "passed-1-2-10", alphabeticallyEarlierTitles: "appended-after-existing-books",
         actualUiImports: "passed-first-and-second-batch-plus-reimports", sameTitleBooks: "distinct-workspace-ids-and-readable-labels-without-registration-errors",
         nativeSidebarOrdering: "passed-contiguous-after-library-and-ordered-like-book-cards", upgradeSidebarRepair: "passed-mixed-registry-order-repaired-on-opening-library",
@@ -668,10 +770,10 @@ async function main(): Promise<void> {
         duplicateImport: "preserved-original-ids-and-numbers", subsetExport: "passed-global-011-and-013-prefixes-instead-of-subset-renumbering", reverseSelectedIds: "did-not-change-export-order",
         deletion: "passed-neighbor-numbers-unchanged", sameIdentityReimport: "passed-restored-002-without-renumbering", nextImportAfterDeletion: 14, highestNumberDeletion: "passed-next-number-15-not-reused", restartOrdering: "unchanged",
         uiBookNumbers: "passed-matched-export-numbers", checkboxLabels: "unchanged", oldBookReceiptsAndSources: "preserved-byte-for-byte",
-        acceptedChapters: 2, freshNativeChapterSessions: 2, independentTitleSessions: 2, exportedBookPrefixes: exportedNames.map(name => name.slice(0, 3)),
-        finalOrder: reimported.books.map(book => ({ title: book.title, sequence: book.sequence })), modelToolCalls: 0, literaryQuality: "not assessed"
+        acceptedChapters: 3, freshNativeChapterSessions: 3, independentTitleSessions: 3, legacyChapterTitleProseAndState: "byte-identical-after-upgrade-move-and-restart", exportedBookPrefixes: exportedNames.map(name => name.slice(0, 3)),
+        finalFolders: (grouped.folders ?? []).map(folder => ({ name: folder.name, numbers: grouped.books.filter(book => book.folderId === folder.id).map(book => book.sequence) })), modelToolCalls: 0, literaryQuality: "not assessed"
       };
-      await writeFile(join(evidence, "order-import-smoke.json"), `${JSON.stringify(report, null, 2)}\n`);
+      await writeFile(join(evidence, "folder-import-smoke.json"), `${JSON.stringify(report, null, 2)}\n`);
       process.stdout.write(`${JSON.stringify(report)}\n`); passed = true; return;
     }
     if (process.env.LIBRARY_MODEL_ONLY === "1") {

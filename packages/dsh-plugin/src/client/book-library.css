@@ -88,3 +88,40 @@
   .book-library-chapter-options label { flex-basis:calc(50% - 4px); }
   .book-library-generation-actions>button:not(.book-library-primary) { flex:1; }
 }
+
+.book-library-folder-list { display:grid; gap:14px; margin-block:12px; }
+.book-library-folder { min-width:0; border:1px solid var(--dsw-alias-border-l2,#d9e1dc); border-radius:9px; background:var(--dsw-alias-bg-base,#fff); }
+.book-library-folder-heading { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:6px 14px; padding:9px 12px; border-radius:inherit; background:#2786680b; }
+.book-library-folder-info,.book-library-folder-actions { display:flex; align-items:center; flex-wrap:wrap; gap:5px 10px; min-width:0; }
+.book-library-folder-info h4 { min-width:0; max-width:100%; margin:0; font-size:14px; }
+.book-library-folder-info .book-library-folder-toggle { display:flex; align-items:center; gap:9px; max-width:100%; min-height:30px; padding:2px 0; border:0; background:transparent; color:var(--dsw-alias-label-primary,#23352d); font:inherit; font-weight:650; text-align:start; }
+.book-library-folder-toggle span:last-child { min-width:0; overflow-wrap:anywhere; }
+.book-library-folder-toggle:disabled { opacity:1; }
+.book-library-folder-caret { flex:none; width:6px; height:6px; margin-inline:2px; border-right:1.5px solid currentColor; border-bottom:1.5px solid currentColor; transform:rotate(-45deg); }
+.book-library-folder-toggle[aria-expanded=true] .book-library-folder-caret { transform:translateY(-2px) rotate(45deg); }
+.book-library-folder-icon { position:relative; flex:none; width:16px; height:11px; box-sizing:border-box; border:1.5px solid #278668; border-radius:2px; background:#27866812; }
+.book-library-folder-icon::before { content:""; position:absolute; width:7px; height:3px; top:-4px; inset-inline-start:-1.5px; border:1.5px solid #278668; border-bottom:0; border-start-start-radius:2px; border-start-end-radius:2px; background:var(--dsw-alias-bg-base,#fff); }
+.book-library-folder-count,.book-library-folder-date { color:var(--dsw-alias-label-secondary,#65756c); font-size:11px; white-space:nowrap; font-variant-numeric:tabular-nums; }
+.book-library-folder-actions { gap:5px; }
+.book-library-folder-actions button,.book-library-folder-controls button,.book-library-folder-editor button { font-size:12px; padding:4px 8px; }
+.book-library-folder-select { display:inline-flex; align-items:center; gap:5px; margin-inline-end:4px; font-size:12px; cursor:pointer; }
+.book-library-folder-select input { width:15px; height:15px; margin:0; accent-color:#278668; }
+.book-library-folder-content { padding:10px 12px 12px; border-top:1px solid var(--dsw-alias-border-l2,#d9e1dc); }
+.book-library-folder-content .book-library-books { margin:0; }
+.book-library-folder-content>.book-library-note,.book-library-folder-content>.book-library-empty { margin:0; }
+.book-library-folder-content>.book-library-note+.book-library-books { margin-top:8px; }
+.book-library-folder-controls,.book-library-folder-editor { display:flex; align-items:center; flex-wrap:wrap; gap:7px 10px; margin-block:9px; min-width:0; }
+.book-library-folder-controls label,.book-library-folder-editor label { display:inline-flex; align-items:center; flex-wrap:wrap; gap:5px; max-width:100%; font-size:12px; }
+.book-library-folder-controls :is(select,input),.book-library-folder-editor :is(select,input) { box-sizing:border-box; max-width:100%; min-width:0; padding:5px 8px; min-height:32px; border:1px solid var(--dsw-alias-border-l2,#d9e1dc); border-radius:5px; background:var(--dsw-alias-bg-base,#fff); color:var(--dsw-alias-label-primary,#23352d); font:12px/1.5 var(--dsw-font-family,system-ui,sans-serif); }
+.book-library-folder-controls select { max-width:min(100%,260px); }
+.book-library-folder-editor input { width:min(235px,100%); }
+@media (max-width:700px) {
+  .book-library-folder-heading { gap:6px; padding:8px 9px; }
+  .book-library-folder-content { padding:8px; }
+  .book-library-folder-info { column-gap:7px; }
+}
+.book-library-folder-jump { display:inline-flex; align-items:center; gap:6px; margin-inline-start:auto; min-width:0; max-width:55%; font-size:12px; }
+.book-library-folder-jump select,select.book-library-folder-jump { box-sizing:border-box; min-height:30px; min-width:0; max-width:min(100%,230px); padding:4px 6px; border:1px solid var(--dsw-alias-border-l2,#d9e1dc); border-radius:5px; color:var(--dsw-alias-label-primary,#23352d); background:var(--dsw-alias-bg-base,#fff); font:inherit; }
+select.book-library-folder-jump { max-width:min(55%,230px); }
+.book-library-notice > button { margin-inline-start:7px; }
+.book-library-folder > .book-library-folder-editor { margin:0; padding:9px 12px; border-top:1px solid var(--dsw-alias-border-l2,#d9e1dc); }
