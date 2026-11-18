@@ -1,0 +1,109 @@
+{
+  "ok": true,
+  "phase": "stable-import-order",
+  "dshVersion": "0.2.2-rc.3",
+  "pluginVersion": "0.1.26-serial.10",
+  "pluginSha256": "b15297127ca22ff65bead1683afd926f45936e1bccf4221690ce773ed3e46f2f",
+  "provider": "local-deterministic-text-fixture",
+  "realPaidModel": false,
+  "legacyBooks": 10,
+  "legacyReadOnlyView": "passed-original-title-order-without-ledger-write",
+  "migration": "passed-first-import-persists-old-order-before-new-book-allocation",
+  "scrambledImportFilenames": [
+    "10_追加十.txt",
+    "2_追加二.txt",
+    "1_追加一.txt"
+  ],
+  "appendSequences": [
+    11,
+    12,
+    13
+  ],
+  "naturalBatchOrder": "passed-1-2-10",
+  "alphabeticallyEarlierTitles": "appended-after-existing-books",
+  "actualUiImports": "passed-first-and-second-batch-plus-reimports",
+  "sameTitleBooks": "distinct-workspace-ids-and-readable-labels-without-registration-errors",
+  "nativeSidebarOrdering": "passed-contiguous-after-library-and-ordered-like-book-cards",
+  "upgradeSidebarRepair": "passed-mixed-registry-order-repaired-on-opening-library",
+  "unrelatedWorkspaces": "relative-order-preserved",
+  "manualOrdering": "passed-up-button-drag-cold-restart-and-reset",
+  "staleSessionSync": "passed-old-window-sync-uses-current-saved-order",
+  "duplicateImport": "preserved-original-ids-and-numbers",
+  "subsetExport": "passed-global-011-and-013-prefixes-instead-of-subset-renumbering",
+  "reverseSelectedIds": "did-not-change-export-order",
+  "deletion": "passed-neighbor-numbers-unchanged",
+  "sameIdentityReimport": "passed-restored-002-without-renumbering",
+  "nextImportAfterDeletion": 14,
+  "highestNumberDeletion": "passed-next-number-15-not-reused",
+  "restartOrdering": "unchanged",
+  "uiBookNumbers": "passed-matched-export-numbers",
+  "checkboxLabels": "unchanged",
+  "oldBookReceiptsAndSources": "preserved-byte-for-byte",
+  "acceptedChapters": 2,
+  "freshNativeChapterSessions": 2,
+  "independentTitleSessions": 2,
+  "exportedBookPrefixes": [
+    "011",
+    "013"
+  ],
+  "finalOrder": [
+    {
+      "title": "回归小说01",
+      "sequence": 1
+    },
+    {
+      "title": "回归小说02",
+      "sequence": 2
+    },
+    {
+      "title": "回归小说03",
+      "sequence": 3
+    },
+    {
+      "title": "回归小说04",
+      "sequence": 4
+    },
+    {
+      "title": "回归小说05",
+      "sequence": 5
+    },
+    {
+      "title": "回归小说06",
+      "sequence": 6
+    },
+    {
+      "title": "回归小说07",
+      "sequence": 7
+    },
+    {
+      "title": "回归小说08",
+      "sequence": 8
+    },
+    {
+      "title": "回归小说09",
+      "sequence": 9
+    },
+    {
+      "title": "回归小说10",
+      "sequence": 10
+    },
+    {
+      "title": "阿同名追加",
+      "sequence": 11
+    },
+    {
+      "title": "阿同名追加",
+      "sequence": 12
+    },
+    {
+      "title": "阿追加十",
+      "sequence": 13
+    },
+    {
+      "title": "阿再补十五",
+      "sequence": 15
+    }
+  ],
+  "modelToolCalls": 0,
+  "literaryQuality": "not assessed"
+}

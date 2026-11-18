@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ChangeEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type ChangeEvent, type DragEvent } from "react";
 import type { LibraryBook, LibraryImportResult, LibraryInputFile, LibrarySnapshot } from "../serial-library.js";
 import type { LibraryCount, LibraryQueueBook, LibraryTask } from "../serial-library-runtime.js";
 import { endpoint } from "./workbench-ui.js";
@@ -8,13 +8,15 @@ import { GenerationModelPicker, describeGenerationSelection, generationModelFiel
 import { compareLibraryInputFilenames } from "../serial-library-order.js";
 
 export interface NativeBookNavigation {
-  register(path: string, title: string): Promise<string>;
+  register(path: string, title: string, sequence?: number): Promise<string>;
   open(workspaceId: string): Promise<void>;
   unregister?(workspaceId: string): Promise<void>;
   openSession?(sessionId: string): Promise<void>;
 }
 interface SelectedFile extends LibraryInputFile { readonly bytes: number; readonly key: string }
 interface Registration { readonly workspaceId?: string; readonly error?: string }
+type BookPlacement = "before" | "after";
+type OrderAction = { readonly action: "move"; readonly id: string; readonly targetId: string; readonly position: BookPlacement } | { readonly action: "resetOrder" };
 type ImportPayload = LibrarySnapshot & { readonly results: readonly LibraryImportResult[] };
 const FALLBACK_LIMITS = { maxFiles: 50, maxBytesPerFile: 2_097_152, maxTotalBytes: 33_554_432 };
 const STATUS: Readonly<Record<string, string>> = { ready: "待生成", incomplete: "导入未完成", running: "生成中", pausing: "正在暂停", paused: "已暂停", blocked: "需要处理", stopped: "已停止", completed: "本批完成", archived: "旧版回收站", deleting: "后台删除中" };
@@ -127,7 +129,9 @@ async function registerBookWorkspace(navigation: NativeBookNavigation, book: Lib
   if (cleanup !== undefined && !await waitForWorkspaceCleanup(cleanup)) throw new Error("书项目正在准备中，请稍后重试登记。");
   // Another late registration can have queued more cleanup while the first one was finishing.
   if (workspaceCleanup.has(book.absolutePath)) return registerBookWorkspace(navigation, book);
-  return navigation.register(book.absolutePath, book.title);
+  return book.sequence === undefined
+    ? navigation.register(book.absolutePath, book.title)
+    : navigation.register(book.absolutePath, book.title, book.sequence);
 }
 
 /** A historic task never owns a new batch, but only its original session can resume it. */
@@ -181,6 +185,11 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
   const [generationError, setGenerationError] = useState<string>();
   const [generationNotice, setGenerationNotice] = useState<string>();
   const [bookSearch, setBookSearch] = useState("");
+  const [arranging, setArranging] = useState(false);
+  const [orderFeedback, setOrderFeedback] = useState<{ readonly text: string; readonly error?: true }>();
+  const [dropTarget, setDropTarget] = useState<{ readonly id: string; readonly position: BookPlacement }>();
+  const [sidebarOrderError, setSidebarOrderError] = useState(false);
+  const [sidebarOrderRetry, setSidebarOrderRetry] = useState(0);
   const [task, setTask] = useState<LibraryTask | null>();
   const [pending, setPending] = useState<string>();
   const [notice, setNotice] = useState<string>();
@@ -190,11 +199,15 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
   const loadSequence = useRef(0);
   const queueRevision = useRef(0);
   const registrationAttempted = useRef(new Set<string>());
+  const registrationLane = useRef(Promise.resolve());
   const suppressedRegistrations = useRef(new Map<string, string>());
   const pendingDeletionSubmission = useRef(new Set<string>());
   const registrationsRef = useRef<Readonly<Record<string, Registration>>>({});
   const registrationGeneration = useRef(new Map<string, number>());
   const managementPending = useRef(false);
+  const orderPending = useRef(false);
+  const draggedBookId = useRef<string>();
+  const sidebarOrderAttempt = useRef<string>();
   const refreshing = useCallback(() => { setRefresh(current => current + 1); }, []);
   const limits = snapshot?.limits ?? FALLBACK_LIMITS;
   const currentBookDeleted = snapshot?.isBookProject === true && (["deleting", "delete_failed"].includes(snapshot.books[0]?.status ?? "") || (snapshot.deletingBooks?.length ?? 0) > 0);
@@ -227,6 +240,35 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
     for (const book of books) registrationAttempted.current.add(book.id);
     void registerBooks(books);
   }, [navigation, pending, registrations, snapshot]);
+  useEffect(() => {
+    if (snapshot === undefined || snapshot.isBookProject || pending !== undefined) return;
+    const books = snapshot.books.filter(book => canOpenLibraryBook(book) && !registrationSuppressed(book));
+    if (books.length === 0) {
+      sidebarOrderAttempt.current = undefined;
+      setSidebarOrderError(false);
+      return;
+    }
+    // A native workspace added halfway through an import would appear in its
+    // default position. Apply the order only after this batch has registered.
+    if (books.some(book => registrations[book.id] === undefined)) return;
+    const signature = JSON.stringify([
+      snapshot.libraryPath,
+      sidebarOrderRetry,
+      books.map(book => [book.id, book.absolutePath, registrations[book.id]?.workspaceId])
+    ]);
+    if (signature === sidebarOrderAttempt.current) return;
+    sidebarOrderAttempt.current = signature;
+    setSidebarOrderError(false);
+    // The host reloads the current order before touching the sidebar. An older
+    // browser tab therefore cannot roll back a more recent arrangement.
+    void fetch(endpoint("library", sessionId), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ action: "syncSidebarOrder" })
+    }).then(responseJson<{ readonly ok: true }>).catch(() => {
+      if (mounted.current && sidebarOrderAttempt.current === signature) setSidebarOrderError(true);
+    });
+  }, [pending, registrations, sessionId, sidebarOrderRetry, snapshot]);
   useEffect(() => {
     if (snapshot === undefined || snapshot.isBookProject) return;
     const controller = new AbortController();
@@ -292,15 +334,19 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
     return true;
   }
   async function registerBooks(books: readonly LibraryBook[]): Promise<void> {
-    const registered = new Set<string>();
-    for (const book of books) {
-      if (!mounted.current) return;
-      if (!canOpenLibraryBook(book) || registrationSuppressed(book) || registered.has(book.id)) continue;
-      registered.add(book.id);
-      const generation = registrationGeneration.current.get(book.id) ?? 0;
-      try { recordRegistration(book, { workspaceId: await registerBookWorkspace(navigation, book) }, generation); }
-      catch (reason: unknown) { recordRegistration(book, { error: reason instanceof Error ? reason.message : String(reason) }, generation); }
-    }
+    const register = registrationLane.current.then(async () => {
+      const attempted = new Set<string>();
+      for (const book of books) {
+        if (!mounted.current) return;
+        if (!canOpenLibraryBook(book) || registrationSuppressed(book) || attempted.has(book.id) || registrationsRef.current[book.id]?.workspaceId !== undefined) continue;
+        attempted.add(book.id);
+        const generation = registrationGeneration.current.get(book.id) ?? 0;
+        try { recordRegistration(book, { workspaceId: await registerBookWorkspace(navigation, book) }, generation); }
+        catch (reason: unknown) { recordRegistration(book, { error: reason instanceof Error ? reason.message : String(reason) }, generation); }
+      }
+    });
+    registrationLane.current = register.catch(() => {});
+    await register;
   }
   const importFiles = async (): Promise<void> => {
     if (pending !== undefined || selected.length === 0) return;
@@ -315,6 +361,7 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
       setSelected(current => current.filter(file => failedNames.has(file.filename)));
       setPending("register");
       const importedBooks = value.results.flatMap(result => result.status !== "failed" && result.book !== undefined ? [result.book] : []);
+      const newBooks = value.results.flatMap(result => result.status === "imported" && result.book !== undefined ? [result.book] : []);
       setCheckedBooks(importedBooks.map(book => book.id));
       setGenerationScope("selected");
       // Explicitly importing a deleted book again authorizes a new native project entry.
@@ -328,10 +375,42 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
       const imported = value.results.filter(result => result.status === "imported").length;
       const existing = value.results.filter(result => result.status === "existing").length;
       const failed = value.results.filter(result => result.status === "failed").length;
-      setNotice(`新建 ${String(imported)} 本，已有 ${String(existing)} 本${failed > 0 ? `，失败 ${String(failed)} 本` : ""}。每本书独立保存，可从下方打开。`);
+      const numbers = newBooks.map(libraryBookNumber).filter((number): number is string => number !== undefined);
+      setNotice(`新建 ${String(imported)} 本，已有 ${String(existing)} 本${failed > 0 ? `，失败 ${String(failed)} 本` : ""}。${numbers.length === 0 ? "" : `本批新建书号 ${numbers.join("、")}。`}`);
       onImported();
     } catch (reason: unknown) { if (mounted.current) setError(reason instanceof Error ? reason.message : String(reason)); }
     finally { revision.current += 1; if (mounted.current) { setPending(undefined); refreshing(); } }
+  };
+  const saveBookOrder = async (action: OrderAction): Promise<void> => {
+    if (!arranging || pending !== undefined || orderPending.current) return;
+    orderPending.current = true;
+    revision.current += 1;
+    setPending("order");
+    setOrderFeedback(undefined);
+    try {
+      const value = await responseJson<LibrarySnapshot>(await fetch(endpoint("library", sessionId), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(action)
+      }));
+      if (!mounted.current) return;
+      setSnapshot(value);
+      setOrderFeedback({ text: action.action === "resetOrder" ? "已恢复导入顺序。" : "已保存书库顺序。" });
+    } catch (reason: unknown) {
+      if (mounted.current) setOrderFeedback({ text: reason instanceof Error ? reason.message : "未能保存书库顺序。", error: true });
+    } finally {
+      orderPending.current = false;
+      revision.current += 1;
+      if (mounted.current) { setPending(undefined); refreshing(); }
+    }
+  };
+  const clearBookDrag = (): void => {
+    draggedBookId.current = undefined;
+    setDropTarget(undefined);
+  };
+  const positionOverBook = (event: DragEvent<HTMLElement>): BookPlacement => {
+    const card = event.currentTarget.getBoundingClientRect();
+    return event.clientY < card.top + card.height / 2 ? "before" : "after";
   };
   const openBook = async (book: LibraryBook): Promise<void> => {
     if (pending !== undefined || !canOpenLibraryBook(book) || registrationSuppressed(book)) return;
@@ -490,21 +569,59 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
   const selectedOutsideSearch = normalSelectedIds.filter(id => !searchedBooks.some(book => book.id === id)).length;
   const generationPrefix = generationScope === "all" ? "全部" : "所选";
   const startLabel = `${generationPrefix} ${String(startSelection.ids.length)} 本${generationCount === "all" ? "写至完本" : `各新增 ${String(generationCount)} 章`}`;
-  const renderBook = (book: LibraryBook) => {
+  const renderBook = (book: LibraryBook, index: number) => {
     const controls = controlsForBook(book);
     const reservation = visibleTaskBooks.find(item => item.id === book.id);
     const number = libraryBookNumber(book);
-    return <article key={book.id} role="listitem" className="book-library-book" data-selected={checkedBooks.includes(book.id) ? "true" : "false"} data-state={reservation?.status ?? book.status}>
-      {!snapshot?.isBookProject && <input type="checkbox" aria-label={`选择 ${book.title}`} checked={checkedBooks.includes(book.id)} disabled={busy} onChange={event => { const checked = event.target.checked; setGenerationScope("selected"); setCheckedBooks(current => checked ? [...new Set([...current, book.id])] : current.filter(id => id !== book.id)); }} />}
+    const previous = visibleBooks[index - 1];
+    const next = visibleBooks[index + 1];
+    const moveNear = (targetId: string, position: BookPlacement) => {
+      void saveBookOrder({ action: "move", id: book.id, targetId, position });
+    };
+    return <article
+      key={book.id}
+      role="listitem"
+      className="book-library-book"
+      data-selected={checkedBooks.includes(book.id) ? "true" : "false"}
+      data-state={reservation?.status ?? book.status}
+      data-drop-position={dropTarget?.id === book.id ? dropTarget.position : undefined}
+      onDragOver={arranging ? event => {
+        if (busy || draggedBookId.current === undefined || draggedBookId.current === book.id) return;
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "move";
+        const position = positionOverBook(event);
+        setDropTarget(current => current?.id === book.id && current.position === position ? current : { id: book.id, position });
+      } : undefined}
+      onDragLeave={arranging ? event => {
+        if (event.relatedTarget instanceof Node && event.currentTarget.contains(event.relatedTarget)) return;
+        setDropTarget(current => current?.id === book.id ? undefined : current);
+      } : undefined}
+      onDrop={arranging ? event => {
+        const id = draggedBookId.current;
+        if (id === undefined) return;
+        event.preventDefault();
+        clearBookDrag();
+        if (id !== book.id) void saveBookOrder({ action: "move", id, targetId: book.id, position: positionOverBook(event) });
+      } : undefined}
+    >
+      {!snapshot?.isBookProject && (arranging
+        ? <button type="button" className="book-library-drag-handle" draggable={!busy} disabled={busy}
+            aria-label={`拖动 ${book.title}`} title="拖动调整顺序"
+            onDragStart={event => { draggedBookId.current = book.id; event.dataTransfer.setData("text/plain", book.id); event.dataTransfer.effectAllowed = "move"; }}
+            onDragEnd={clearBookDrag}>⋮⋮</button>
+        : <input type="checkbox" aria-label={`选择 ${book.title}`} checked={checkedBooks.includes(book.id)} disabled={busy} onChange={event => { const checked = event.target.checked; setGenerationScope("selected"); setCheckedBooks(current => checked ? [...new Set([...current, book.id])] : current.filter(id => id !== book.id)); }} />)}
       <div className="book-library-book-copy"><div className="book-library-book-heading">{number !== undefined && <span className="book-library-book-number" aria-label={`书籍编号 ${number}`}>{number}</span>}<strong title={book.title}>{book.title}</strong></div><span>{book.completedChapters} / {book.totalChapters} 章 · {controls.label}</span>
         {reservation !== undefined && !["completed", "skipped"].includes(reservation.status) && <span>原批目标：第 {reservation.targetChapter} 章</span>}
         {reservation?.generation?.modelSelection !== undefined && <span className="generation-model-snapshot">{describeGenerationSelection(reservation.generation.modelSelection)}</span>}
       </div>
-      {!snapshot?.isBookProject && <div className="book-library-book-actions">
+      {!snapshot?.isBookProject && (arranging ? <div className="book-library-order-actions">
+        <button type="button" aria-label={`上移 ${book.title}`} disabled={busy || previous === undefined} onClick={() => { if (previous !== undefined) moveNear(previous.id, "before"); }}>上移</button>
+        <button type="button" aria-label={`下移 ${book.title}`} disabled={busy || next === undefined} onClick={() => { if (next !== undefined) moveNear(next.id, "after"); }}>下移</button>
+      </div> : <div className="book-library-book-actions">
         {controls.canPause && controlsAllowed && <button type="button" aria-label={`暂停 ${book.title}`} disabled={busy} onClick={() => { void queueAction("pauseBooks", undefined, [book.id]); }}>暂停</button>}
         {controls.canResume && controlsAllowed && <button type="button" aria-label={`继续 ${book.title}`} disabled={busy} onClick={() => { void queueAction("resumeBooks", undefined, [book.id]); }}>继续</button>}
         <button type="button" disabled={busy || !canOpenLibraryBook(book)} onClick={() => { void openBook(book); }}>{pending === book.id ? "正在打开…" : "打开"}</button>
-      </div>}
+      </div>)}
       {book.error !== undefined && <details className="book-library-book-error"><summary>查看本书提示</summary><p className="book-library-error">{book.error}</p></details>}
       {registrations[book.id]?.error !== undefined && <div className="book-library-error">文件已保存，Harness 项目登记未完成：{registrations[book.id]?.error}<button type="button" disabled={busy || !canOpenLibraryBook(book)} onClick={() => { void retryRegister(book); }}>重试登记项目</button></div>}
     </article>;
@@ -525,8 +642,10 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
     {notice !== undefined && <p className="book-library-notice" role="status">{notice}</p>}
     {visibleResults.some(result => result.status === "failed") && <details className="book-library-results" open><summary>导入问题 · {visibleResults.filter(result => result.status === "failed").length} 项</summary><ul>{visibleResults.filter(result => result.status === "failed").map((result, index) => <li key={`${result.filename}:${String(index)}`}><strong>{result.filename}</strong><span>{result.error}</span></li>)}</ul></details>}
     {snapshot !== undefined && !snapshot.isBookProject && <section className="book-library-batch" aria-label="书库批量生成">
-      <div className="book-library-batch-heading"><div><h3>选择书籍与生成</h3><p className="book-library-note">勾选需要更新的书，再选择每本新增章数。暂停和继续只影响所选书，其他书照常生成。</p><p className="book-library-note">按固定编号排列，新书接在末尾；编号与导出一致。</p></div><strong className="book-library-selected-count" aria-live="polite">已选 {visibleSelectedIds.length} 本</strong></div>
-      <div className="book-library-selection-dock">
+      <div className="book-library-batch-heading"><div><h3>{arranging ? "调整书库顺序" : "选择书籍与生成"}</h3><p className="book-library-note">{arranging ? "拖动或使用上移、下移，每次移动自动保存。" : `${snapshot.orderCustomized === true ? "手动顺序" : "导入顺序"} · 新书依次接在末尾`}</p></div>
+        {!arranging && <strong className="book-library-selected-count" aria-live="polite">已选 {visibleSelectedIds.length} 本</strong>}
+      </div>
+      {!arranging && <div className="book-library-selection-dock">
         <div className="book-library-selection-tools">
           <input type="search" aria-label="搜索书名" placeholder="搜索书名" value={bookSearch} onChange={event => { setBookSearch(event.target.value); }} />
           <div className="book-library-queue-actions">
@@ -555,8 +674,20 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
         {selectionNeedsOwner && !activeOtherOwner && <p className="book-library-note">所选书的原批属于另一会话，请返回任务会话继续。</p>}
         {(activeOtherOwner || selectionNeedsOwner) && navigation.openSession !== undefined && <button type="button" disabled={busy} onClick={() => { void openQueueOwner(); }}>回到书库任务会话</button>}
         <div aria-live="polite">{generationNotice !== undefined && <p className="book-library-notice" role="status">{generationNotice}</p>}{(generationError !== undefined || queueError !== undefined) && <p className="book-library-error" role="alert">{generationError ?? queueError}</p>}</div>
-      </div>
-      <div className="book-library-books" role="list" aria-label="小说项目列表">{searchedBooks.map(renderBook)}</div>
+      </div>}
+      {visibleBooks.length > 0 && <div className="book-library-order-toolbar">
+        <button type="button" disabled={busy || (!arranging && visibleBooks.length < 2 && snapshot.orderCustomized !== true)} onClick={() => {
+          if (!arranging) setBookSearch("");
+          setOrderFeedback(undefined);
+          clearBookDrag();
+          setArranging(!arranging);
+        }}>{arranging ? "完成整理" : "整理顺序"}</button>
+        {arranging && snapshot.orderCustomized === true && <button type="button" disabled={busy} onClick={() => { void saveBookOrder({ action: "resetOrder" }); }}>恢复导入顺序</button>}
+        {pending === "order" && <span role="status">正在保存顺序…</span>}
+        {orderFeedback !== undefined && <span className={orderFeedback.error ? "book-library-error" : undefined} role={orderFeedback.error ? "alert" : "status"}>{orderFeedback.text}</span>}
+        {sidebarOrderError && <><span role="status">左侧工作区顺序未同步。</span><button type="button" disabled={busy} onClick={() => { setSidebarOrderRetry(current => current + 1); }}>重试同步</button></>}
+      </div>}
+      <div className="book-library-books" role="list" aria-label="小说项目列表" data-arranging={arranging || undefined}>{(arranging ? visibleBooks : searchedBooks).map(renderBook)}</div>
       {searchedBooks.length === 0 && <p className="book-library-empty">{visibleBooks.length === 0 ? "这里还没有书项目。批量导入后，每本书会出现在这里和 Harness 工作区列表中。" : "没有匹配的书名。清空搜索可查看全部书籍。"}</p>}
       {task !== undefined && task !== null && visibleTaskBooks.length > 0 && <details className="book-library-queue" data-status={task.status} open={task.status === "blocked"}>
         <summary><strong>{STATUS[task.status] ?? task.status}</strong> · 本批 {doneBooks} / {visibleTaskBooks.length} 本完成{failedBooks > 0 ? ` · ${String(failedBooks)} 本待处理` : ""} · 查看本批进度</summary>

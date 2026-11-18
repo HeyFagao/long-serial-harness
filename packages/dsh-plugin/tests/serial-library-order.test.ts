@@ -19,8 +19,10 @@ describe("persistent library sequence helpers", () => {
   it("rejects damaged sequence bindings instead of silently renumbering", () => {
     const good = { schemaVersion: 1, nextSequence: 3, sequences: { [id(1)]: 1, [id(2)]: 2 } };
     expect(parseLibraryOrder(good)).toEqual(good);
+    expect(parseLibraryOrder({ ...good, displayOrder: [id(2), id(1)] }).displayOrder).toEqual([id(2), id(1)]);
     const invalid = [null, {}, { ...good, nextSequence: 2 }, { ...good, nextSequence: Number.MAX_SAFE_INTEGER + 1 },
-      { ...good, sequences: { [id(1)]: 1, [id(2)]: 1 } }, { ...good, sequences: { [id(1)]: 0 } }, { ...good, sequences: { notAnIdentity: 1 } }];
+      { ...good, sequences: { [id(1)]: 1, [id(2)]: 1 } }, { ...good, sequences: { [id(1)]: 0 } }, { ...good, sequences: { notAnIdentity: 1 } },
+      { ...good, displayOrder: [id(1)] }, { ...good, displayOrder: [id(1), id(1)] }, { ...good, displayOrder: [id(1), id(3)] }];
     for (const value of invalid) expect(() => parseLibraryOrder(value)).toThrow("未重新编号");
   });
 });

@@ -6,6 +6,7 @@
 - 勾选后直接删除，书立即从列表消失；后台自动停止选中书的生成并清理目录，其他书继续运行。
 - 批量导入多份最终输出；每份建立一本书、一个独立原生工作区。
 - 每个书库的新书按导入批次追加并固定编号 001、002……；卡片与导出书包使用同一编号，筛选、删除或只导出部分书都不重新编号。
+- 导入或打开书库时同步 Harness 侧栏顺序；在「整理顺序」中拖动或上移／下移，也可「恢复导入顺序」，调整后立即保存，书号与 ZIP 编号保持不变。
 - 单本一键续写 10／20／50 章或全本。
 - 书间默认全部同时生成，也可自定义正整数并发数，不设固定上限；同书逐章串行。
 - 正文超过1500字即可通过字数验收，无上限；首次失败后自动重试5次。
@@ -24,13 +25,13 @@
 2. 在 Harness「插件 → 添加插件 → 包名或地址」粘贴下面的公开插件安装直链：
 
 ```text
-https://github.com/HeyFagao/long-serial-harness/releases/download/v0.1.26-serial.9/oh-story-dsh-0.1.26-serial.9.tgz
+https://github.com/HeyFagao/long-serial-harness/releases/download/v0.1.26-serial.10/oh-story-dsh-0.1.26-serial.10.tgz
 ```
 
 3. 安装后保存当前工作并重新打开 Harness。在「设置 → 模型」添加自己的中转站和模型；在工作台「写作模型」选择本批模型与适用的思考强度。
 4. 添加一个空文件夹工作区作为书库，打开长篇工作台并批量选择最终输出文件，然后开始生成。
 
-仓库和发布附件均已公开，无需 GitHub 登录。网络无法直接安装时，从 [v0.1.26-serial.9 发布页](https://github.com/HeyFagao/long-serial-harness/releases/tag/v0.1.26-serial.9) 下载 `long-serial-partner-0.1.26-serial.9.zip` 并解压，按包内说明运行安装脚本或使用本地 `.tgz` 完整路径。不要把源码仓库根目录当作插件安装包。
+仓库和发布附件均已公开，无需 GitHub 登录。网络无法直接安装时，从 [v0.1.26-serial.10 发布页](https://github.com/HeyFagao/long-serial-harness/releases/tag/v0.1.26-serial.10) 下载 `long-serial-partner-0.1.26-serial.10.zip` 并解压，按包内说明运行安装脚本或使用本地 `.tgz` 完整路径。不要把源码仓库根目录当作插件安装包。
 
 ## 使用与验证
 

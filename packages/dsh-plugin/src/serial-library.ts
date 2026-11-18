@@ -10,7 +10,8 @@ import { jsonBody, mapFsError, readVersionedFile, send, workspaceRealmForSession
 import { isTrustedWorkspaceRequest } from "./workspace-request-trust.js";
 import { DELETION_JOURNAL, deletionJobs, enqueueBookDeletion, resumeBookDeletions } from "./serial-library-deletion-jobs.js";
 import { withLibraryOperation } from "./serial-library-operations.js";
-import { assignLibraryOrder, compareLibraryInputFilenames, extendLibraryOrder, LIBRARY_ORDER_PATH, parseLibraryOrder, type LibraryOrder } from "./serial-library-order.js";
+import { syncNativeLibrarySidebarOrder } from "./serial-sidebar-order.js";
+import { assignLibraryOrder, compareLibraryInputFilenames, extendLibraryOrder, LIBRARY_ORDER_PATH, moveLibraryDisplayOrder, parseLibraryOrder, resetLibraryDisplayOrder, type LibraryBookMove, type LibraryOrder } from "./serial-library-order.js";
 
 export const LIBRARY_DIRECTORY = "小说项目";
 const BOOK_RECEIPT = "追踪/书项目.json";
@@ -48,6 +49,7 @@ export interface LibrarySnapshot {
   readonly isBookProject: boolean;
   readonly books: readonly LibraryBook[];
   readonly limits: typeof LIBRARY_LIMITS;
+  readonly orderCustomized?: true;
   readonly archivedBooks?: readonly LibraryBook[];
   readonly deletingBooks?: readonly LibraryBook[];
 }
@@ -97,16 +99,24 @@ async function readLibraryOrder(realm: WorkspaceRealm): Promise<{ readonly order
   } catch { throw new WorkspaceHttpError(409, "书库顺序记录损坏或无法读取，已保留原文件，未重新编号。"); }
 }
 
+async function writeLibraryOrder(realm: WorkspaceRealm, order: LibraryOrder, version: FsVersion | undefined): Promise<void> {
+  await realm.fs.writeText(await containedTarget(realm, LIBRARY_ORDER_PATH), `${JSON.stringify(order, null, 2)}\n`,
+    version === undefined ? { kind: "createIfAbsent" } : { kind: "replaceIfVersion", version }, undefined, realm.sandboxPolicy.resolve({ session: realm.agent.session }));
+}
+
+function allLibraryBooks(snapshot: LibrarySnapshot): LibraryBook[] {
+  return [...snapshot.books, ...(snapshot.archivedBooks ?? []), ...(snapshot.deletingBooks ?? [])];
+}
+
 /** Called inside the library mutation lock, before adding, hiding or removing catalogue identities. */
 export async function ensureLibraryOrder(realm: WorkspaceRealm, reserveIds: readonly string[] = []): Promise<LibraryOrder> {
   const snapshot = await listLibraryBooks(realm);
   if (snapshot.isBookProject) throw new WorkspaceHttpError(409, "请回到书库总览管理书籍顺序。");
   const stored = await readLibraryOrder(realm);
-  const all = [...snapshot.books, ...(snapshot.archivedBooks ?? []), ...(snapshot.deletingBooks ?? [])];
-  const derived = assignLibraryOrder(all, stored?.order).order;
+  const derived = assignLibraryOrder(allLibraryBooks(snapshot), stored?.order).order;
   const next = extendLibraryOrder(derived, reserveIds);
   if ((stored === undefined && Object.keys(next.sequences).length > 0) || (stored !== undefined && next.nextSequence !== stored.order.nextSequence)) {
-    await realm.fs.writeText(await containedTarget(realm, LIBRARY_ORDER_PATH), `${JSON.stringify(next, null, 2)}\n`, stored === undefined ? { kind: "createIfAbsent" } : { kind: "replaceIfVersion", version: stored.version }, undefined, realm.sandboxPolicy.resolve({ session: realm.agent.session }));
+    await writeLibraryOrder(realm, next, stored?.version);
   }
   return next;
 }
@@ -115,7 +125,22 @@ async function reserveLibrarySequence(realm: WorkspaceRealm, id: string): Promis
   const stored = await readLibraryOrder(realm);
   if (stored?.order.sequences[id] !== undefined) return;
   const next = extendLibraryOrder(stored?.order, [id]);
-  await realm.fs.writeText(await containedTarget(realm, LIBRARY_ORDER_PATH), `${JSON.stringify(next, null, 2)}\n`, stored === undefined ? { kind: "createIfAbsent" } : { kind: "replaceIfVersion", version: stored.version }, undefined, realm.sandboxPolicy.resolve({ session: realm.agent.session }));
+  await writeLibraryOrder(realm, next, stored?.version);
+}
+
+/** Display edits leave the assigned book numbers and export order intact. */
+export async function changeLibraryBookOrder(realm: WorkspaceRealm, move?: LibraryBookMove): Promise<LibrarySnapshot> {
+  const snapshot = await listLibraryBooks(realm);
+  if (snapshot.isBookProject) throw new WorkspaceHttpError(409, "请回到书库总览调整顺序。");
+  if (move !== undefined && [move.id, move.targetId].some(id => !snapshot.books.some(book => book.id === id))) {
+    throw new WorkspaceHttpError(409, "要调整的书不在当前书库列表中，请刷新后重试。");
+  }
+  const stored = await readLibraryOrder(realm);
+  const current = assignLibraryOrder(allLibraryBooks(snapshot), stored?.order).order;
+  const next = move === undefined ? resetLibraryDisplayOrder(current) : moveLibraryDisplayOrder(current, move);
+  if (next === current) return snapshot;
+  await writeLibraryOrder(realm, next, stored?.version);
+  return listLibraryBooks(realm);
 }
 
 export async function realmForLibraryBook(library: WorkspaceRealm, relativePath: string): Promise<WorkspaceRealm> {
@@ -153,15 +178,14 @@ export async function listLibraryBooks(realm: WorkspaceRealm): Promise<LibrarySn
     return { libraryPath: realm.cwd, parentLibraryPath: receipt.libraryPath, isBookProject: true, books: [await bookView(realm, receipt)], limits: LIBRARY_LIMITS };
   }
   const directory = await containedTarget(realm, LIBRARY_DIRECTORY);
-  const order = await readLibraryOrder(realm);
   const journal = await readJson(realm, DELETION_JOURNAL);
   const deletingBooks: LibraryBook[] = journal === undefined ? [] : deletionJobs(journal.value).map(job => ({ ...job.book, status: "deleting" }));
   const hiddenPaths = new Set(deletingBooks.map(book => book.relativePath));
   const stat = await realm.fs.stat(directory);
-  if (stat === undefined) return { libraryPath: realm.cwd, isBookProject: false, books: [], deletingBooks: assignLibraryOrder(deletingBooks, order?.order).books, limits: LIBRARY_LIMITS };
-  if (stat.type !== "directory") throw new WorkspaceHttpError(409, "小说项目不是目录，请先处理同名文件。");
+  if (stat !== undefined && stat.type !== "directory") throw new WorkspaceHttpError(409, "小说项目不是目录，请先处理同名文件。");
+  const entries = stat === undefined ? [] : await realm.fs.listDir(directory);
   const books: LibraryBook[] = [];
-  for (const entry of await realm.fs.listDir(directory)) {
+  for (const entry of entries) {
     if (entry.type !== "directory") continue;
     if (hiddenPaths.has(`${LIBRARY_DIRECTORY}/${entry.name}`)) continue;
     if (!realm.fs.contains(realm.root, entry.target)) continue;
@@ -180,8 +204,19 @@ export async function listLibraryBooks(realm: WorkspaceRealm): Promise<LibrarySn
         error: error instanceof Error ? error.message : "本书记录不可读，请先处理此项目。" });
     }
   }
+  // Imports save the assigned number before creating a receipt. Read the order last
+  // so a view that discovers new receipts cannot temporarily invent a different order.
+  const order = await readLibraryOrder(realm);
   const ordered = assignLibraryOrder([...books, ...deletingBooks], order?.order).books;
-  return { libraryPath: realm.cwd, isBookProject: false, books: ordered.filter(book => book.status !== "archived" && book.status !== "deleting"), archivedBooks: ordered.filter(book => book.status === "archived"), deletingBooks: ordered.filter(book => book.status === "deleting"), limits: LIBRARY_LIMITS };
+  return {
+    libraryPath: realm.cwd,
+    isBookProject: false,
+    books: ordered.filter(book => book.status !== "archived" && book.status !== "deleting"),
+    ...(stat === undefined ? {} : { archivedBooks: ordered.filter(book => book.status === "archived") }),
+    deletingBooks: ordered.filter(book => book.status === "deleting"),
+    limits: LIBRARY_LIMITS,
+    ...(order?.order.displayOrder === undefined ? {} : { orderCustomized: true })
+  };
 }
 
 export function validateLibraryInputs(value: unknown): readonly LibraryInputFile[] {
@@ -345,6 +380,19 @@ export function registerLibraryRoute(context: Context, options: { readonly trust
       if (input.action === "delete") { send(response, 200, await enqueueBookDeletion(context, realm, selectedLibraryIds(input.ids))); return; }
       const result = await withLibraryOperation(context, realm.root.targetKey, async () => {
         if (files !== undefined) return importLibraryBooks(realm, files);
+        if (input.action === "syncSidebarOrder") {
+          await syncNativeLibrarySidebarOrder(context, await listLibraryBooks(realm), realm.fs.processPath(realm.root));
+          return { ok: true };
+        }
+        if (input.action === "resetOrder") return changeLibraryBookOrder(realm);
+        if (input.action === "move") {
+          const { id, targetId, position } = input;
+          selectedLibraryIds([id, targetId]);
+          if (typeof id !== "string" || typeof targetId !== "string" || (position !== "before" && position !== "after")) {
+            throw new WorkspaceHttpError(400, "请指定要移动的书和放置位置。");
+          }
+          return changeLibraryBookOrder(realm, { id, targetId, position });
+        }
         const ids = selectedLibraryIds(input.ids);
         if (input.action === "export") return exportLibraryBooks(realm, ids);
         if (input.action === "archive" || input.action === "restore") return recycleLibraryBooks(realm, ids, input.action === "restore");

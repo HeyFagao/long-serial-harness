@@ -16,7 +16,7 @@ import { SERIAL_PLUGIN_VERSION } from "../plugin-version.js";
 import { chapterTitlePreview, chapterTitleRecordPath, proseChapterNumber, type ChapterTitlePreview } from "./chapter-title-preview.js";
 import { SerialPanel } from "./serial-panel.js";
 import { BookLibraryPanel, type NativeBookNavigation } from "./book-library-panel.js";
-import { openSerialChapterSession, type SerialWorkspaceNavigation } from "./serial-navigation.js";
+import { openSerialChapterSession, registerSerialWorkspace, type SerialWorkspaceNavigation, type SerialWorkspaceRegistration } from "./serial-navigation.js";
 import serialStyles from "./serial-panel.css?inline";
 import styles from "./novel-workbench.css?inline";
 
@@ -214,12 +214,10 @@ export function apply(context: ClientContext): void {
           await workspaces.delete(workspaceId);
         },
         openSession: (sessionId: string): Promise<void> => openSerialChapterSession(context.sessions as unknown as ISessions, context.get("uiWorkspace") as SerialWorkspaceNavigation | undefined, sessionId, sessionId),
-        register: async (path: string, title: string): Promise<string> => {
-          const workspaces = context.get("workspaces") as { create(input: { path: string }): Promise<{ workspaceId: string }>; rename(id: string, title: string): Promise<unknown> } | undefined;
+        register: async (path: string, title: string, sequence?: number): Promise<string> => {
+          const workspaces = context.get("workspaces") as SerialWorkspaceRegistration | undefined;
           if (workspaces === undefined) throw new Error("Harness 项目列表尚未就绪，请稍后重试。");
-          const workspace = await workspaces.create({ path });
-          await workspaces.rename(workspace.workspaceId, title);
-          return workspace.workspaceId;
+          return registerSerialWorkspace(workspaces, path, title, sequence);
         },
         open: async (workspaceId: string): Promise<void> => {
           const navigation = context.get("uiWorkspace") as { openWorkspace(id: string): Promise<void> } | undefined;

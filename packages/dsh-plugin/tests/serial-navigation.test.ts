@@ -1,6 +1,34 @@
 import { SessionId } from "@deepseek-ai/dsh-session/types";
 import { describe, expect, it, vi } from "vitest";
-import { openSerialChapterSession } from "../src/client/serial-navigation.js";
+import { openSerialChapterSession, registerSerialWorkspace } from "../src/client/serial-navigation.js";
+
+describe("serial native workspace registration", () => {
+  const conflict = new Error("workspace rename failed: workspace/name-conflict: Workspace name is already in use");
+
+  it("uses the fixed book number to register a usable sidebar row when another book has the same name", async () => {
+    const workspaces = {
+      create: vi.fn(async () => ({ workspaceId: "registered-book" })),
+      rename: vi.fn(async () => {}).mockRejectedValueOnce(conflict),
+    };
+    await expect(registerSerialWorkspace(workspaces, "/library/book", "同名书", 12)).resolves.toBe("registered-book");
+    expect(workspaces.rename.mock.calls).toEqual([["registered-book", "同名书"], ["registered-book", "同名书 · 012"]]);
+    workspaces.rename.mockClear();
+    const existing = { ...workspaces, create: async () => ({ workspaceId: "registered-book", title: "同名书 · 012" }) };
+    await expect(registerSerialWorkspace(existing, "/library/book", "同名书", 12)).resolves.toBe("registered-book");
+    expect(workspaces.rename).not.toHaveBeenCalled();
+  });
+
+  it("keeps a registered directory after two naming conflicts and surfaces unrelated failures", async () => {
+    const workspaces = {
+      create: vi.fn(async () => ({ workspaceId: "registered-book" })),
+      rename: vi.fn(async () => {}).mockRejectedValue(conflict),
+    };
+    await expect(registerSerialWorkspace(workspaces, "/library/book", "同名书", 12)).resolves.toBe("registered-book");
+    const unrelated = new Error("workspace rename failed: gateway/unavailable: connection lost");
+    workspaces.rename.mockRejectedValueOnce(conflict).mockRejectedValueOnce(unrelated);
+    await expect(registerSerialWorkspace(workspaces, "/library/book", "同名书", 12)).rejects.toBe(unrelated);
+  });
+});
 
 describe("serial chapter native navigation", () => {
   it("refreshes the owner catalog and uses the authoritative child address", async () => {

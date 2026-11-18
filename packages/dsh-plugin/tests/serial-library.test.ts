@@ -2,7 +2,7 @@ import { posix } from "node:path";
 import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import { unzipSync, strFromU8 } from "fflate";
-import { exportLibraryBooks, importLibraryBooks, listLibraryBooks, recycleLibraryBooks, realmForLibraryBook, selectedLibraryIds, validateLibraryInputs, type LibraryBook, type LibraryInputFile } from "../src/serial-library.js";
+import { changeLibraryBookOrder, exportLibraryBooks, importLibraryBooks, listLibraryBooks, recycleLibraryBooks, realmForLibraryBook, selectedLibraryIds, validateLibraryInputs, type LibraryBook, type LibraryInputFile } from "../src/serial-library.js";
 import { commitOriginalOutput } from "../src/serial-output.js";
 import { exportSerialChapters } from "../src/serial-route.js";
 import type { WorkspaceRealm } from "../src/workspace-route.js";
@@ -260,6 +260,59 @@ describe("independent multi-book import", () => {
 });
 
 describe("fixed library numbering", () => {
+  it("keeps the saved filename order when an import finishes while a refresh is scanning the directory", async () => {
+    const test = library();
+    await importLibraryBooks(test.realm, [source(1)]);
+    const listDir = test.realm.fs.listDir.bind(test.realm.fs);
+    const interleaved = vi.spyOn(test.realm.fs, "listDir").mockImplementationOnce(async (...args) => {
+      await importLibraryBooks(test.realm, [
+        { ...source(2), filename: "1_新书.txt", title: "ZZZ" },
+        { ...source(3), filename: "2_新书.txt", title: "AAA" }
+      ]);
+      return listDir(...args);
+    });
+    const refreshed = await listLibraryBooks(test.realm);
+    interleaved.mockRestore();
+    expect(refreshed.books.map(book => [book.title, book.sequence])).toEqual([["第1本书", 1], ["ZZZ", 2], ["AAA", 3]]);
+    expect((await listLibraryBooks(test.realm)).books).toEqual(refreshed.books);
+  });
+
+  it("persists a drag order on a legacy library, appends new books, and retains the fixed export numbers", async () => {
+    const test = library();
+    await importLibraryBooks(test.realm, [source(1), source(2), source(3)]);
+    test.files.delete(`/books/${LIBRARY_ORDER_PATH}`);
+    const [first, second, third] = (await listLibraryBooks(test.realm)).books;
+    if (first === undefined || second === undefined || third === undefined) throw new Error("Three fixture books were expected.");
+    const reordered = await changeLibraryBookOrder(test.realm, { id: third.id, targetId: first.id, position: "before" });
+    expect(reordered.orderCustomized).toBe(true);
+    expect(reordered.books.map(book => [book.id, book.sequence])).toEqual([[third.id, 3], [first.id, 1], [second.id, 2]]);
+    const appended = await importLibraryBooks(test.realm, [source(4), source(1)]);
+    expect(appended.books.map(book => book.sequence)).toEqual([3, 1, 2, 4]);
+    expect(await listLibraryBooks(test.realm)).toEqual({ ...reordered, books: appended.books });
+    await writeChapter(test, first);
+    await writeChapter(test, third);
+    const zip = unzipSync(await exportLibraryBooks(test.realm, [third.id, first.id]));
+    expect(Object.keys(zip).filter(name => name.endsWith(".zip"))).toEqual([expect.stringMatching(/^001_/u), expect.stringMatching(/^003_/u)]);
+    const restored = await changeLibraryBookOrder(test.realm);
+    expect(restored.orderCustomized).toBeUndefined();
+    expect(restored.books.map(book => book.sequence)).toEqual([1, 2, 3, 4]);
+  });
+
+  it("rejects moves across ignored or archived books and preserves an archived book's number and slot", async () => {
+    const test = library();
+    const [first, second, third] = (await importLibraryBooks(test.realm, [source(1), source(2), source(3)])).books;
+    if (first === undefined || second === undefined || third === undefined) throw new Error("Three fixture books were expected.");
+    await changeLibraryBookOrder(test.realm, { id: first.id, targetId: third.id, position: "after" });
+    const hidden = await recycleLibraryBooks(test.realm, [third.id]);
+    expect(hidden.books.map(book => book.sequence)).toEqual([2, 1]);
+    const before = test.files.get(`/books/${LIBRARY_ORDER_PATH}`);
+    await expect(changeLibraryBookOrder(test.realm, { id: first.id, targetId: third.id, position: "before" })).rejects.toThrow("不在当前书库列表");
+    await expect(changeLibraryBookOrder(test.realm, { id: "d".repeat(64), targetId: second.id, position: "before" })).rejects.toThrow("不在当前书库列表");
+    expect(test.files.get(`/books/${LIBRARY_ORDER_PATH}`)).toBe(before);
+    const restored = await recycleLibraryBooks(test.realm, [third.id], true);
+    expect(restored.books.map(book => book.sequence)).toEqual([2, 3, 1]);
+  });
+
   it("appends each naturally sorted import batch and keeps numbers after reload and duplicate import", async () => {
     const test = library();
     const first = await importLibraryBooks(test.realm, [{ ...source(1), filename: "2_旧书.txt", title: "乙旧书" }, { ...source(2), filename: "1_旧书.txt", title: "丁旧书" }]);
