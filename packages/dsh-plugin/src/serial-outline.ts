@@ -329,7 +329,11 @@ export function buildSerialChapterPrompt(options: SerialChapterPromptOptions): s
     chapter === 1 ? "本章是首章，没有历史正文；不编造前文。" : `本章同时关联第 ${firstRecent}–${chapter - 1} 章正文全文，按章号阅读；摘要和上一章结尾不能替代这些最近正文的实际读取。更早连续性沿用读档包。`,
     "仍严格按原版输出契约，只返回章节正文（含标题行）与【状态变更】两块，不加说明，不输出工具指令、JSON、任务清单或收尾总结。正文和状态由宿主分别保存、校验和记账。"
   ];
-  if (options.repairIssues?.length) additions.push("本次修订只处理列出的实际问题，保持其余内容、人物与剧情走向不变；修订前的原稿由宿主保留，不动已验收章节。", ...options.repairIssues.map(issue => `- ${issue}`));
+  if (options.repairIssues?.length) additions.push(
+    "本次修订只处理列出的实际问题，保持其余内容、人物与剧情走向不变；修订前的原稿由宿主保留，不动已验收章节。",
+    "回复必须仍是完整章节正文（含标题行）加【状态变更】。不要只写“建议最小修改”“保留前文不动”或局部差异；这类说明不会被当成正文。章尾钩类型不得与上一章相同。",
+    ...options.repairIssues.map(issue => `- ${issue}`)
+  );
   return [system, user, ...additions].join("\n\n***\n\n");
 }
 

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { FsVersion } from "@deepseek-ai/dsh-fs";
 import { countSerialVisibleChars, parseSerialOutline } from "./serial-outline.js";
 import type { SerialActive } from "./serial-runtime.js";
+import { selectChapterDraft, issuesAreLocallyRecoverable, repairChapterDraft, type ChapterDraft } from "./serial-chapter-repair.js";
 import { applyOriginalChange, initializeOriginalState, extractOriginalField, type OriginalState } from "./original-state.js";
 import { normalizeOriginalFbId, parseOriginalChapterPlan } from "./original-outline-plan.js";
 import { creativeTarget, readVersionedFile, WorkspaceHttpError, type WorkspaceRealm } from "./workspace-route.js";
@@ -176,22 +177,30 @@ export async function commitOriginalOutput(realm: WorkspaceRealm, options: Origi
     const ledger = parseLedger(tracking, options);
     if (ledger.last_committed_chapter >= active.chapter) throw new WorkspaceHttpError(409, "本章已经验收，拒绝用其他章节会话覆盖已完成正文。");
     if (ledger.last_committed_chapter !== active.chapter - 1) throw new WorkspaceHttpError(409, "前章尚未验收，不能跳章保存本章输出。");
-    const { prose, change } = splitOriginalOutput(options.text);
-    if (prose === "") throw new WorkspaceHttpError(409, "最终回复只有状态变更，没有正文，未覆盖任何文件。");
-    const chars = countSerialVisibleChars(prose);
     const lastHook = ledger.original_state.recent.at(-1)?.hook_type ?? "";
     const requiredPlants = parseOriginalChapterPlan(options.chapterRaw ?? "").fb_plant;
-    const issues = originalOutputIssues(prose, change, 1501, Number.MAX_SAFE_INTEGER, lastHook, requiredPlants);
     const title = options.title?.trim() || `第${String(active.chapter)}章`;
     const path = await prosePath(realm, active.chapter);
     const suffix = `第${String(active.chapter).padStart(3, "0")}章.md`;
+    const previous = ledger.pending_chapters[String(active.chapter)];
+    if (previous !== undefined && (previous.taskId !== taskId || active.repairIssues === undefined)) throw new WorkspaceHttpError(409, "本章现稿属于另一次待验收输出；只有明确修订轮次可以替换它。");
+    let previousDraft: ChapterDraft | undefined;
+    if (previous?.taskId === taskId && active.repairIssues !== undefined) {
+      const previousProse = await read(realm, previous.prosePath);
+      const previousChange = await read(realm, `追踪/状态变更/${suffix}`);
+      if (previousProse?.sha256 === previous.body_sha256 && previousChange?.sha256 === previous.change_sha256) previousDraft = { prose: previousProse.content, change: previousChange.content };
+    }
+    const selected = selectChapterDraft({ incoming: options.text, ...(previousDraft === undefined ? {} : { previous: previousDraft }), previousHook: lastHook, requiredPlants });
+    const prose = selected.prose;
+    const change = selected.change;
+    const issues = selected.issues;
+    if (prose.trim() === "") throw new WorkspaceHttpError(409, "最终回复只有状态变更，没有正文，未覆盖任何文件。");
+    const chars = countSerialVisibleChars(prose);
     const body = `${prose}\n`;
     const changeText = change === "" ? "" : `${change}\n`;
     const summary = extractOriginalField(change, "本章摘要") || "待补齐本章摘要";
     const pending = extractOriginalField(change, "下一章必须接住的事") || "待补齐下一章承接事项";
     const record = `# 第${String(active.chapter).padStart(3, "0")}章 · ${title}\n\n- 结果：${summary.replace(/\n/gu, " ")}\n- 下一章承诺：${pending.replace(/\n/gu, " ")}\n\n${changeText}`;
-    const previous = ledger.pending_chapters[String(active.chapter)];
-    if (previous !== undefined && (previous.taskId !== taskId || active.repairIssues === undefined)) throw new WorkspaceHttpError(409, "本章现稿属于另一次待验收输出；只有明确修订轮次可以替换它。");
     const proposed = [
       { path, content: body, ownerHash: previous?.body_sha256 },
       { path: `追踪/状态变更/${suffix}`, content: changeText, ownerHash: previous?.change_sha256 },
@@ -224,7 +233,16 @@ export async function commitOriginalOutput(realm: WorkspaceRealm, options: Origi
   const expectedLedger = `${JSON.stringify(transaction.ledger, null, 2)}\n`;
   const existingLedger = await read(realm, TRACKING);
   const alreadyApplied = existingLedger?.content === expectedLedger;
-  if (!alreadyApplied && (existingLedger?.sha256 ?? null) !== transaction.trackingBeforeSha256) throw new WorkspaceHttpError(409, "追踪账本在本章落盘期间已变化，未覆盖正文或进度，请核对后继续。");
+  if (!alreadyApplied && (existingLedger?.sha256 ?? null) !== transaction.trackingBeforeSha256) {
+    let advanced: unknown;
+    try { advanced = existingLedger === undefined ? undefined : JSON.parse(existingLedger.content); } catch { advanced = undefined; }
+    // A later local recovery may already have accepted this chapter. Replaying the
+    // older rejected transaction must not overwrite that accepted manuscript.
+    if (isOriginalTrackingLedger(advanced) && advanced.last_committed_chapter >= transaction.chapter && advanced.wordcount_records[String(transaction.chapter)]?.taskId === transaction.taskId) {
+      return { accepted: true, issues: [], prosePath: transaction.files[0]!.path };
+    }
+    throw new WorkspaceHttpError(409, "追踪账本在本章落盘期间已变化，未覆盖正文或进度，请核对后继续。");
+  }
   // Preflight all outputs before writing the first one. A crash between writes is safe to replay.
   for (const file of transaction.files) {
     if (sha256(file.content) !== file.sha256) throw new WorkspaceHttpError(409, "本章落盘事务内容哈希不一致。");
@@ -240,4 +258,81 @@ export async function commitOriginalOutput(realm: WorkspaceRealm, options: Origi
   }
   if (!alreadyApplied) await write(realm, TRACKING, expectedLedger, existingLedger);
   return { accepted: transaction.issues.length === 0, issues: transaction.issues, prosePath: transaction.files[0]!.path };
+}
+
+function historicalRecoverableDraft(raw: string, chapter: number, taskId: string): ChapterDraft | undefined {
+  let transaction: OutputTransaction;
+  try { transaction = transactionOf(raw); } catch { return undefined; }
+  if (transaction.chapter !== chapter || transaction.taskId !== taskId || !issuesAreLocallyRecoverable(transaction.issues)) return undefined;
+  const prose = transaction.files.find(file => file.path.startsWith("正文/"))?.content;
+  const change = transaction.files.find(file => file.path.includes("/状态变更/"))?.content;
+  if (prose === undefined || change === undefined) return undefined;
+  return { prose, change };
+}
+
+/**
+ * Accept a chapter that is already on disk when its only defects are a repeated
+ * adjacent hook or engineering words. A short edit-note that replaced the chapter
+ * is ignored in favor of an earlier full draft from the same batch.
+ */
+export async function recoverPendingOriginalChapter(realm: WorkspaceRealm, taskId: string, chapter: number): Promise<boolean> {
+  if (!/^[A-Za-z0-9_-]{1,128}$/u.test(taskId) || !Number.isSafeInteger(chapter) || chapter < 1) return false;
+  const tracking = await read(realm, TRACKING);
+  if (tracking === undefined) return false;
+  let ledger: OriginalTrackingLedger;
+  try {
+    const parsed: unknown = JSON.parse(tracking.content);
+    if (!isOriginalTrackingLedger(parsed)) return false;
+    ledger = parsed;
+  } catch { return false; }
+  if (ledger.last_committed_chapter >= chapter) return true;
+  if (ledger.last_committed_chapter !== chapter - 1) return false;
+  const pending = ledger.pending_chapters[String(chapter)];
+  if (pending !== undefined && pending.taskId !== taskId) return false;
+  const suffix = `第${String(chapter).padStart(3, "0")}章.md`;
+  const liveProse = pending === undefined ? undefined : await read(realm, pending.prosePath);
+  const liveChange = pending === undefined ? undefined : await read(realm, `追踪/状态变更/${suffix}`);
+  if (pending !== undefined && (liveProse === undefined || liveChange === undefined || liveProse.sha256 !== pending.body_sha256 || liveChange.sha256 !== pending.change_sha256)) return false;
+  const lastHook = ledger.original_state.recent.at(-1)?.hook_type ?? "";
+  const candidates: ChapterDraft[] = [];
+  if (liveProse !== undefined && liveChange !== undefined && issuesAreLocallyRecoverable(pending?.issues ?? [])) candidates.push({ prose: liveProse.content, change: liveChange.content });
+  if (candidates.length === 0) {
+    const folder = `追踪/连载输出/${taskId}`;
+    const target = await creativeTarget(realm, folder);
+    const info = await realm.fs.stat(target);
+    if (info !== undefined && info.type === "directory") {
+      for (const file of await realm.fs.listDir(target)) {
+        if (file.type !== "file" || !file.name.endsWith(".json") || file.name.includes("/") || file.name.includes("\\") || !realm.fs.contains(realm.root, file.target)) continue;
+        const snapshot = await read(realm, `${folder}/${file.name}`);
+        if (snapshot === undefined) continue;
+        const draft = historicalRecoverableDraft(snapshot.content, chapter, taskId);
+        if (draft !== undefined) candidates.push(draft);
+      }
+    }
+  }
+  let best: { prose: string; change: string; chars: number } | undefined;
+  for (const candidate of candidates) {
+    const repaired = repairChapterDraft(candidate.prose, candidate.change, lastHook);
+    if (repaired.issues.length > 0) continue;
+    const chars = countSerialVisibleChars(repaired.prose);
+    if (best === undefined || chars > best.chars) best = { prose: repaired.prose, change: repaired.change, chars };
+  }
+  if (best === undefined) return false;
+  const headline = /^第\s*0*\d+\s*章[\s：:·、.．-]+(.+)$/u.exec(best.prose.trim().split("\n")[0] ?? "")?.[1]?.trim();
+  try {
+    const result = await commitOriginalOutput(realm, {
+      active: { chapter, sessionId: `recover-ch-${String(chapter)}`, requestId: `recover-req-${String(chapter)}`, attempt: 1, dispatched: true, repairIssues: ["恢复可验收的章节正文"] },
+      taskId, text: `${best.prose.trim()}\n\n${best.change.trim()}`, totalChapters: Math.max(ledger.original_state.total_chapters, chapter),
+      ...(ledger.original_state.title === "" ? {} : { bookTitle: ledger.original_state.title }),
+      ...(headline === undefined || headline === "" ? {} : { title: headline })
+    });
+    return result.accepted;
+  } catch {
+    const current = await read(realm, TRACKING);
+    if (current === undefined) return false;
+    try {
+      const parsed: unknown = JSON.parse(current.content);
+      return isOriginalTrackingLedger(parsed) && parsed.last_committed_chapter >= chapter;
+    } catch { return false; }
+  }
 }

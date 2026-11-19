@@ -36,6 +36,14 @@ describe("legacy serial outline import", () => {
     expect(artifacts.some((file) => file.path.includes("_tracking-state"))).toBe(false);
   });
 
+  it("keeps a blank chapter title in sequence so later chapters can still be written", () => {
+    const outline = parseSerialOutline(`第1章：\n${chapterBody}\n第2章\n${chapterBody}\n第3章：有标题\n${chapterBody}`);
+    expect(outline.chapters.map(chapter => [chapter.number, chapter.title])).toEqual([[1, "第1章"], [2, "第2章"], [3, "有标题"]]);
+    expect(outline.diagnostics.filter(issue => issue.severity === "error")).toEqual([]);
+    expect(outline.diagnostics.filter(issue => issue.code === "missing_title").map(issue => issue.chapter)).toEqual([1, 2]);
+    expect(serialImportArtifacts(outline).map(file => file.path)).toEqual(expect.arrayContaining(["大纲/细纲_第001章.md", "大纲/细纲_第002章.md", "大纲/细纲_第003章.md"]));
+  });
+
   it("accepts Markdown, Arabic, fullwidth and Chinese chapter numbers", () => {
     const outline = parseSerialOutline(`## **第九十八章：标题**\n${chapterBody}\n### 第９９章：尾声\n${chapterBody}\n第 一百 章：新篇\n${chapterBody}`);
     expect(outline.chapters.map((chapter) => chapter.number)).toEqual([98, 99, 100]);

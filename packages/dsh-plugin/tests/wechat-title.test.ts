@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { strFromU8, unzipSync } from "fflate";
-import { buildWechatTitlePrompt, parseWechatTitleOutput } from "../src/wechat-title.js";
+import { buildWechatTitlePrompt, parseWechatTitleOutput, resolveWechatTitleOutput } from "../src/wechat-title.js";
 import { buildSerialChapterPrompt } from "../src/serial-outline.js";
 import { createChapterZip } from "../src/serial-export.js";
 import { AUTHOR_CHAPTER_TITLE_PROMPT } from "../src/wechat-title-author-prompt.js";
@@ -58,6 +58,24 @@ describe("independent WeChat chapter titles", () => {
     expect(() => parseWechatTitleOutput(JSON.stringify({ ...result, evidence: ["丈夫拿出三百万让我离开"] }), prose)).toThrow("本章正文");
     expect(() => parseWechatTitleOutput("只有一个标题没有依据", prose)).toThrow("JSON");
     expect(() => parseWechatTitleOutput(JSON.stringify({ ...result, candidates: ["", ...candidates.slice(1)] }), prose)).toThrow("标题为空");
+  });
+  it("turns an empty author template into five chapter-backed titles instead of stalling", () => {
+    const long = `第1章 验收前一周\n\n许慧盯着项目系统右上角那行红字，鼠标停在成果文件的署名栏上。刚才还写着方案负责人许慧，页面刷新后名字已经变成周明远。她点开版本记录，最上面一条显示周明远于今日提交终稿。`;
+    const blank = "核心爆点：\n标题策略：\n1. 《》\n2. 《》\n3. 《》\n4. 《》\n5. 《》\n前三推荐：\n1. ()\n2. ()\n3. ()\n主分类：XXX\n情节：XXX | XXX\n角色：XXX | XXX\n情绪：XXX\n背景：XXX";
+    const fallback = resolveWechatTitleOutput(blank, long);
+    expect(fallback.origin).toBe("chapter-fallback");
+    expect(fallback.candidates).toHaveLength(5);
+    expect(new Set(fallback.candidates).size).toBe(5);
+    expect(fallback.candidates?.every(title => [...title.replace(/\s/gu, "")].length >= 15 && [...title.replace(/\s/gu, "")].length <= 25)).toBe(true);
+    expect(fallback.evidence.every(item => long.includes(item))).toBe(true);
+    expect(fallback.title).not.toMatch(/XXX|《》/);
+    const filled = ["婆婆逼我交出三年存折，却先拍下那把旧钥匙", "她把旧钥匙拍上桌，开口就要我保管三年的存折", "婆婆突然伸手要存折，桌上的旧钥匙让我停手", "保管三年的存折被婆婆讨要，她却带来旧钥匙", "一把旧钥匙拍上桌，婆婆为何突然要我的存折"];
+    const template = `核心爆点：钥匙\n标题策略：冲突\n${filled.map((title, index) => `${String(index + 1)}. 《${title}》`).join("\n")}\n前三推荐：\n1. 《${filled[4]}》\n2. 《${filled[1]}》\n3. 《${filled[0]}》`;
+    const authored = resolveWechatTitleOutput(template, prose);
+    expect(authored.origin).toBe("author-template");
+    expect(authored.candidates).toEqual(filled);
+    expect(authored.topThree).toEqual([filled[4], filled[1], filled[0]]);
+    expect(resolveWechatTitleOutput(JSON.stringify(proposed()), prose).origin).toBe("model");
   });
   it("retries an old single-title response after upgrade instead of silently accepting fewer than five options", () => {
     expect(() => parseWechatTitleOutput(JSON.stringify({ title: candidates[0], evidence: proposed().evidence }), prose)).toThrow("5个标题");

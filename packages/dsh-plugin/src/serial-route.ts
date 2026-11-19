@@ -1,7 +1,7 @@
 import { basename, dirname } from "node:path";
 import { assertBookNotDeleting, isBookDeleting } from "./serial-library-operations.js";
 import { assertBookDeletionNotQueued } from "./serial-library-deletion-jobs.js";
-import { buildWechatTitlePrompt, parseWechatTitleOutput } from "./wechat-title.js";
+import { buildWechatTitlePrompt, isBoundWechatTitle, resolveWechatTitleOutput } from "./wechat-title.js";
 import { resolveSerialModelSelection } from "./serial-models.js";
 import { createChapterZip, safeExportName, type ExportBook, type ExportChapter } from "./serial-export.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -16,7 +16,7 @@ import { creativeTarget, jsonBody, mapFsError, readVersionedFile, send, workspac
 import { isTrustedWorkspaceRequest } from "./workspace-request-trust.js";
 import { buildOriginalSettingsSlices, renderOriginalDossier } from "./original-context.js";
 import { ORIGINAL_SYSTEM_PROMPT_SHA256, type OriginalChapterContext } from "./original-prompts.js";
-import { commitOriginalOutput, isOriginalTrackingLedger } from "./serial-output.js";
+import { commitOriginalOutput, isOriginalTrackingLedger, recoverPendingOriginalChapter } from "./serial-output.js";
 import { initializeOriginalState } from "./original-state.js";
 
 const TASK_PATH = "追踪/连载任务.json";
@@ -443,6 +443,11 @@ export function createSerialAdapter(context: Context, realm: WorkspaceRealm): Se
       if (result.ok && currentTask !== null) await verifySerialIntegrity(realm, currentTask.id, chapter, false, false, result.sha256);
       return { ok: result.ok, issues: [...result.issues], proseExists: true, repairable };
     },
+    async recoverPending(chapter) {
+      await refresh();
+      if (currentTask === null) return false;
+      return recoverPendingOriginalChapter(realm, currentTask.id, chapter);
+    },
     async prepareRepair(chapter, attempt, issues) {
       await refresh();
       if (currentTask === null) throw new WorkspaceHttpError(409, "缺少当前连载任务，未创建修订备份。");
@@ -454,9 +459,8 @@ export function createSerialAdapter(context: Context, realm: WorkspaceRealm): Se
       const source = await titleSource(chapter);
       const saved = await optionalText(realm, `追踪/公众号标题/第${String(chapter).padStart(3, "0")}章.json`);
       if (saved === undefined) return false;
-      const title = JSON.parse(saved) as { chapter?: number; bodySha256?: string; title?: string };
-      if (title.chapter !== chapter || title.bodySha256 !== source.hash || typeof title.title !== "string" || title.title.trim() === "") throw new WorkspaceHttpError(409, "公众号标题记录与本章正文不一致，已保留原稿，请核对。");
-      return true;
+      // A blank or stale title record is unfinished, not a permanent block. Continue can replace it.
+      return isBoundWechatTitle(saved, chapter, source.hash);
     },
     async dispatchTitle(active) {
       const source = await titleSource(active.chapter);
@@ -465,14 +469,18 @@ export function createSerialAdapter(context: Context, realm: WorkspaceRealm): Se
     async finalizeTitle(active, observation) {
       const source = await titleSource(active.chapter);
       let title;
-      try { title = parseWechatTitleOutput(observation.finalText, source.prose); }
+      try { title = resolveWechatTitleOutput(observation.finalText, source.prose); }
       catch (error) { return { ok: false, issue: error instanceof Error ? error.message : String(error) }; }
       const path = `追踪/公众号标题/第${String(active.chapter).padStart(3, "0")}章.json`;
       const content = `${JSON.stringify({ schemaVersion: 1, chapter: active.chapter, ...title, bodySha256: source.hash, sessionId: active.sessionId }, null, 2)}\n`;
-      const existing = await optionalText(realm, path);
-      if (existing !== undefined) {
-        if (existing !== content) throw new WorkspaceHttpError(409, "本章已有其他标题记录，未覆盖。");
-      } else await realm.fs.writeText(await creativeTarget(realm, path), content, { kind: "createIfAbsent" }, undefined, realm.sandboxPolicy.resolve({ session: realm.agent.session }));
+      const target = await creativeTarget(realm, path);
+      if (await realm.fs.stat(target) === undefined) {
+        await realm.fs.writeText(target, content, { kind: "createIfAbsent" }, undefined, realm.sandboxPolicy.resolve({ session: realm.agent.session }));
+        return { ok: true };
+      }
+      const current = await readVersionedFile(realm.fs, target, MAX_BYTES);
+      if (current.content === content || isBoundWechatTitle(current.content, active.chapter, source.hash)) return { ok: true };
+      await realm.fs.writeText(target, content, { kind: "replaceIfVersion", version: current.version }, undefined, realm.sandboxPolicy.resolve({ session: realm.agent.session }));
       return { ok: true };
     },
     async finalize(active, observation) {

@@ -80,6 +80,11 @@ export interface SerialAdapter {
   state(active?: SerialActive): Promise<SerialObservation>;
   /** Persist a completed plain-text chapter through the host before accepting its receipt. */
   finalize?(active: SerialActive, observation: SerialObservation): Promise<void>;
+  /**
+   * Accept a full chapter that is blocked only by a repeated hook or an engineering word.
+   * Returns true only when the chapter is now committed.
+   */
+  recoverPending?(chapter: number): Promise<boolean>;
   inspectTitle?(chapter: number): Promise<boolean>;
   dispatchTitle?(active: SerialActive): Promise<void>;
   finalizeTitle?(active: SerialActive, observation: SerialObservation): Promise<{ ok: boolean; issue?: string }>;
@@ -243,7 +248,12 @@ export class SerialRuntime {
         }
       } else if (next.active !== undefined) {
         if (observation.lastTurnReason === "completed" && !observation.externalInput) await this.adapter.finalize?.(next.active, observation);
-        const inspected = await this.adapter.inspect(next.active.chapter, next.minChars, next.maxChars);
+        let inspected = await this.adapter.inspect(next.active.chapter, next.minChars, next.maxChars);
+        if (!inspected.ok && inspected.proseExists && inspected.repairable === true && this.adapter.recoverPending !== undefined) {
+          try {
+            if (await this.adapter.recoverPending(next.active.chapter)) inspected = await this.adapter.inspect(next.active.chapter, next.minChars, next.maxChars);
+          } catch { /* Keep the failed inspection and the existing retry path. */ }
+        }
         if (inspected.ok) {
           if (this.adapter.dispatchTitle !== undefined) { next.phase = "title"; next.titleActive = this.reserveTitle(next, observation); }
           else this.acceptChapter(next);
@@ -485,6 +495,7 @@ export class SerialRuntime {
   }
   private async drive(): Promise<void> {
     let operationTaskId: string | undefined;
+    let recoveredRequest: string | undefined;
     try {
       while (!this.disposed && !this.deleting && this.task !== null && RUNNING.has(this.task.status)) {
         const current = this.snapshot()!;
@@ -531,6 +542,16 @@ export class SerialRuntime {
             await this.commit(next);
           });
           continue;
+        }
+        const recoveryKey = current.active?.requestId ?? `chapter-${String(current.nextChapter)}`;
+        if (result.proseExists && result.repairable === true && recoveredRequest !== recoveryKey && this.adapter.recoverPending !== undefined) {
+          recoveredRequest = recoveryKey;
+          let recovered = false;
+          try { recovered = await this.adapter.recoverPending(current.nextChapter); } catch { recovered = false; }
+          if (recovered) {
+            const again = await this.adapter.inspect(current.nextChapter, current.minChars, current.maxChars);
+            if (again.ok) continue;
+          }
         }
         const preparedRepair = current.active !== undefined && !current.active.dispatched && current.active.repairIssues !== undefined;
         if (result.proseExists && !preparedRepair) {

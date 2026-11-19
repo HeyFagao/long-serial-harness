@@ -1,7 +1,7 @@
 {
   "kind": "novel-only-source-distribution",
-  "version": "0.1.26-serial.11",
-  "provenance": "Novel-only serial.11: persist named import folders and book membership, present grouped books in the library and label native workspace entries, preserve legacy workspace paths and stable export numbering.",
+  "version": "0.1.26-serial.12",
+  "provenance": "Novel-only serial.12: keep a repeated chapter-end hook or a blank title from stalling the book, while preserving serial.11 folder order and fixed book numbers.",
   "businessCodeModified": true,
   "originalPromptFileSha256": "e854017110efd7182dc4c5097f37c30a13a594962cfb4e9db2e06f7d29d09e3e",
   "runtimeEntries": [
@@ -34,6 +34,7 @@
     "packages/dsh-plugin/src/original-prompts.ts",
     "packages/dsh-plugin/src/original-state.ts",
     "packages/dsh-plugin/src/plugin-version.ts",
+    "packages/dsh-plugin/src/serial-chapter-repair.ts",
     "packages/dsh-plugin/src/serial-export.ts",
     "packages/dsh-plugin/src/serial-library-delete.ts",
     "packages/dsh-plugin/src/serial-library-deletion-jobs.ts",

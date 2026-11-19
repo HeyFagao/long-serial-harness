@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { commitOriginalOutput, splitOriginalOutput, type OriginalOutputOptions, type OriginalTrackingLedger } from "../src/serial-output.js";
+import { extractOriginalField } from "../src/original-state.js";
+import { commitOriginalOutput, recoverPendingOriginalChapter, splitOriginalOutput, type OriginalOutputOptions, type OriginalTrackingLedger } from "../src/serial-output.js";
 import type { WorkspaceRealm } from "../src/workspace-route.js";
 
 function fixture() {
@@ -147,5 +148,80 @@ describe("original plain-text output host transaction", () => {
     const second = { ...options(2), outlineSource, chapterRaw: "第2章 答案\n写作重点：回收FB001" , text: reply(2).replace("FB001：新埋，发现钥匙柄的编号。", "FB001：未回收，仍不知道编号来源。") };
     await commitOriginalOutput(f.realm, second);
     expect(f.ledger().original_state.fb.FB01?.reap_chapter).toBeNull();
+  });
+
+  it("accepts a full chapter whose only defect is a repeated hook, and does not let an edit note replace it", async () => {
+    const f = fixture();
+    const chapter = (hook: string, body = "她把账本摊开，逐笔核对转出的金额。") => `第1章 金额对不上\n\n${body.repeat(100)}\n\n【状态变更】\n本章摘要：核对转出金额。\n实际字数：2400\n章尾钩类型：${hook}\n人物：\n周桂兰：发现金额对不上。\n伏笔：\n无\n时间：半小时\n与章纲不同的地方及原因：无\n下一章必须接住的事：继续核对那笔转账。`;
+    await commitOriginalOutput(f.realm, { ...options(), text: chapter("隐藏含义") });
+    expect(f.ledger().last_committed_chapter).toBe(1);
+    expect(f.ledger().original_state.recent.at(-1)?.hook_type).toBe("隐藏含义");
+    const repeated = chapter("隐藏含义", "她又把账本摊开，问这笔金额到底差在哪里。").replaceAll("第1章", "第2章");
+    const second = await commitOriginalOutput(f.realm, { ...options(2), text: repeated });
+    expect(second.accepted).toBe(true);
+    expect(f.ledger().last_committed_chapter).toBe(2);
+    expect(f.ledger().original_state.recent.at(-1)?.hook_type).not.toBe("隐藏含义");
+    const saved = f.files.get("正文/第002章.md")!;
+    expect(saved).toContain("她又把账本摊开");
+    expect(saved).toContain("这一步停在做到一半的地方");
+    expect(saved).not.toContain("建议最小修改");
+    const advice = "建议最小修改如下，正文其余内容全部保留：\n\n将章尾三段改为：\n\n她把截图放到桌上。\n\n“你先别关页面。”\n\n他的手停在半空。\n\n状态变更中改为：\n\n- 章尾钩类型：未完成动作\n- 下一章必须接住的事：核对接下来的那一笔。";
+    await expect(commitOriginalOutput(f.realm, { ...options(2, 2), text: advice, active: { ...options(2, 2).active, repairIssues: ["章尾钩类型重复"] } })).rejects.toThrow("已经验收");
+    expect(f.files.get("正文/第002章.md")).toBe(saved);
+  });
+
+  it("keeps the longer draft when a repair returns only an edit note, then recovers it on continue", async () => {
+    const f = fixture();
+    const full = `第2章 金额对不上\n\n${"她把账本摊开，问这笔金额为什么对不上。".repeat(80)}\n\n【状态变更】\n本章摘要：核对转出金额。\n实际字数：2400\n章尾钩类型：隐藏含义\n人物：\n周桂兰：发现金额对不上。\n伏笔：\n无\n时间：半小时\n与章纲不同的地方及原因：无\n下一章必须接住的事：继续核对那笔转账。`;
+    await commitOriginalOutput(f.realm, { ...options(), text: full.replace("第2章", "第1章") });
+    const pending = full;
+    const note = `建议采用“未完成动作”钩子，最小修改上一版结尾三段，保留前文不动：\n\n她看着账本。`;
+    // An older build left the full chapter pending. A new repair must not replace it with the note.
+    const planted = `${pending.split("【状态变更】")[0]!.trim()}\n`;
+    const plantedChange = `【状态变更】\n${pending.split("【状态变更】")[1]!.trim()}\n`;
+    f.files.set("正文/第002章.md", planted);
+    f.files.set("追踪/状态变更/第002章.md", plantedChange);
+    f.files.set("追踪/逐章记录/第002章.md", "# 第002章 · 金额对不上\n\n- 结果：核对转出金额。\n- 下一章承诺：继续核对那笔转账。\n");
+    const plantedLedger = f.ledger();
+    plantedLedger.pending_chapters["2"] = { taskId: "task", childSessionId: "child-2-1", prosePath: "正文/第002章.md",
+      body_sha256: createHash("sha256").update(planted).digest("hex"), change_sha256: createHash("sha256").update(plantedChange).digest("hex"),
+      record_sha256: createHash("sha256").update(f.files.get("追踪/逐章记录/第002章.md")!).digest("hex"), issues: ["章尾钩类型「隐藏含义」与上一章重复，换一种钩子写法与类型。"] };
+    f.files.set("追踪/_tracking-state.json", `${JSON.stringify(plantedLedger, null, 2)}\n`);
+    const stored = await commitOriginalOutput(f.realm, { ...options(2, 2), active: { ...options(2, 2).active, repairIssues: ["章尾钩类型重复"] }, text: note });
+    expect(stored.accepted).toBe(true);
+    expect(f.files.get("正文/第002章.md")).not.toContain("保留前文不动");
+    expect(f.files.get("正文/第002章.md")).toContain("她把账本摊开");
+    expect(extractOriginalField(f.files.get("追踪/状态变更/第002章.md")!, "章尾钩类型")).not.toBe("隐藏含义");
+  });
+
+  it("recovers an older pending chapter that failed only because its hook repeated", async () => {
+    const f = fixture();
+    const full = `第2章 金额对不上\n\n${"她把账本摊开，问这笔金额为什么对不上。".repeat(80)}\n\n【状态变更】\n本章摘要：核对转出金额。\n实际字数：2400\n章尾钩类型：隐藏含义\n人物：\n周桂兰：发现金额对不上。\n伏笔：\n无\n时间：半小时\n与章纲不同的地方及原因：无\n下一章必须接住的事：继续核对那笔转账。`;
+    await commitOriginalOutput(f.realm, { ...options(), text: full.replace("第2章", "第1章") });
+    const prose = `${full.split("【状态变更】")[0]!.trim()}\n`;
+    const change = `【状态变更】\n${full.split("【状态变更】")[1]!.trim()}\n`;
+    f.files.set("正文/第002章.md", prose);
+    f.files.set("追踪/状态变更/第002章.md", change);
+    f.files.set("追踪/逐章记录/第002章.md", "# 第002章 · 金额对不上\n\n- 结果：核对转出金额。\n- 下一章承诺：继续核对那笔转账。\n");
+    const ledger = f.ledger();
+    ledger.pending_chapters["2"] = { taskId: "task", childSessionId: "child-2-1", prosePath: "正文/第002章.md",
+      body_sha256: createHash("sha256").update(prose).digest("hex"), change_sha256: createHash("sha256").update(change).digest("hex"),
+      record_sha256: createHash("sha256").update(f.files.get("追踪/逐章记录/第002章.md")!).digest("hex"), issues: ["章尾钩类型「隐藏含义」与上一章重复，换一种钩子写法与类型。"] };
+    f.files.set("追踪/_tracking-state.json", `${JSON.stringify(ledger, null, 2)}\n`);
+    expect(await recoverPendingOriginalChapter(f.realm, "task", 2)).toBe(true);
+    expect(f.ledger().last_committed_chapter).toBe(2);
+    expect(f.ledger().pending_chapters["2"]).toBeUndefined();
+    expect(extractOriginalField(f.files.get("追踪/状态变更/第002章.md")!, "章尾钩类型")).not.toBe("隐藏含义");
+    expect(f.files.get("正文/第002章.md")).toContain("她把账本摊开");
+    expect(f.files.get("正文/第002章.md")).not.toContain("前文");
+  });
+
+  it("replaces an engineering word instead of blocking an otherwise finished chapter", async () => {
+    const f = fixture();
+    const text = `第1章 旧钥匙\n\n${"她把前文的账目又看了一遍，数字还是对不上。".repeat(80)}\n\n【状态变更】\n本章摘要：再次核对账目。\n实际字数：2400\n章尾钩类型：信息差\n人物：\n周桂兰：仍不接受含糊的说法。\n伏笔：\n无\n时间：片刻\n与章纲不同的地方及原因：无\n下一章必须接住的事：把那笔数字对上。`;
+    const result = await commitOriginalOutput(f.realm, { ...options(), text });
+    expect(result.accepted).toBe(true);
+    expect(f.files.get("正文/第001章.md")).not.toContain("前文");
+    expect(f.files.get("正文/第001章.md")).toContain("先前");
   });
 });

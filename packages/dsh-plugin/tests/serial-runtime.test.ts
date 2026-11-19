@@ -496,6 +496,21 @@ describe("native serial scheduler", () => {
     expect(f.backups[0]!.attempt).toBe(2); runtime.dispose();
   });
 
+  it("accepts a locally recoverable draft without launching another repair", async () => {
+    const f = fixture(1);
+    f.adapter.dispatch = async active => {
+      f.requests.push(active.requestId); f.partial.add(1); f.repairable.add(1);
+      f.state({ running: false, pendingInput: false, lastTurnReason: "completed", requestKnown: true });
+    };
+    f.adapter.recoverPending = async chapter => { f.complete.add(chapter); f.partial.delete(chapter); return true; };
+    const runtime = new SerialRuntime(f.adapter); await runtime.start({ count: 1 });
+    await eventually(() => runtime.snapshot()?.status === "completed");
+    expect(f.requests).toHaveLength(1);
+    expect(f.backups).toHaveLength(0);
+    expect(runtime.snapshot()?.completed).toEqual([1]);
+    runtime.dispose();
+  });
+
   it("stops after five backed-up quality repairs and preserves the last draft", async () => {
     const f = fixture(1); const dispatches: SerialActive[] = [];
     f.adapter.dispatch = async active => {
