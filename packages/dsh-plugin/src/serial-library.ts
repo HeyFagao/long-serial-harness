@@ -412,7 +412,7 @@ async function buildLibraryExport(realm: WorkspaceRealm, ids: readonly string[])
   const library = await listLibraryBooks(realm);
   if (library.isBookProject) throw new WorkspaceHttpError(409, "请回到书库总览批量导出。");
   const entries: Record<string, Uint8Array> = {};
-  const notes = ["批量导出说明", "仅导出已保存并通过校验的章节正文。生成中的后续章节不包含在本次快照中。", "导出不删除原稿。", ""];
+  const notes = ["批量导出说明", "仅导出已保存并通过校验的章节正文。生成中的后续章节不包含在本次快照中。", "导出不删除原稿，也不改故事用词；章节TXT按手机阅读排版。", ""];
   let total = 0;
   let exported = 0;
   const selected = selectedLibraryIds(ids);

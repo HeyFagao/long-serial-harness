@@ -1,6 +1,6 @@
 {
   "name": "oh-story-dsh",
-  "version": "0.1.26-serial.12",
+  "version": "0.1.26-serial.13",
   "private": true,
   "description": "原版提示词驱动的长篇连载工作台：多书导入、独立项目、跨项目续写队列",
   "license": "MIT",

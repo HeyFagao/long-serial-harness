@@ -570,7 +570,7 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
         const encodedName = response.headers.get("content-disposition")?.match(/filename\*=UTF-8''([^;]+)/iu)?.[1];
         link.download = encodedName === undefined ? "小说正文_TXT合集.zip" : decodeURIComponent(encodedName);
         document.body.appendChild(link); link.click(); link.remove(); setTimeout(() => { URL.revokeObjectURL(url); }, 60_000);
-        setManageNotice("TXT合集已交给 Harness 下载。每本书一个ZIP，里面每章一个TXT；未完结和跳过的书请查看ZIP内的导出说明。原稿保留。");
+        setManageNotice("TXT合集已交给 Harness 下载。每本书一个ZIP，里面每章一个TXT，正文按手机阅读排版；未完结和跳过的书请查看ZIP内的导出说明。原稿用词保留。");
       } else {
         const result = await responseJson<LibrarySnapshot & { results: { id: string; ok: boolean; error?: string }[] }>(response);
         for (const item of result.results) if (item.ok && selectedIds.includes(item.id)) accepted.add(item.id);
@@ -846,7 +846,7 @@ function BookLibraryContent({ sessionId, navigation, onImported, onAvailabilityC
         <button type="button" disabled={busy || visibleSelectedIds.length === 0} onClick={() => { void manageBooks("export", visibleSelectedIds); }}>{pending === "export" ? "正在打包正文…" : "批量导出 TXT"}</button>
         <button type="button" disabled={busy || visibleSelectedIds.length === 0} onClick={() => { void manageBooks("delete", visibleSelectedIds); }}>删除所选书</button>
       </div>
-      <p className="book-library-note">每本书一个ZIP，里面每章一个TXT；多本书再合成总包下载。未完结的书导出已保存章节；导出不删除原稿。</p>
+      <p className="book-library-note">每本书一个ZIP，里面每章一个TXT；多本书再合成总包下载。未完结的书导出已保存章节；导出不删除原稿，只把正文排成适合手机阅读的段落。</p>
       <p className="book-library-note">删除后无法恢复，不进入回收站。</p>
       <div className="book-library-manage-feedback" aria-live="polite" aria-atomic="true">
         {pending === "delete" && <p className="book-library-notice" role="status">正在提交删除，所选书已从列表移除…</p>}
